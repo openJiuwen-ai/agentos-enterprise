@@ -1,4 +1,4 @@
-# AgentOS
+# AgentOS for Enterprise
 
 English | [简体中文](README.zh.md)
 
@@ -6,7 +6,7 @@ AgentOS is a one-stop integration and delivery repository for the openJiuwen age
 
 ## Core Features
 
-- **Aggregated components with pinned versions**: four components are pulled in and pinned via Git submodules — agent-runtime (`v0.8.0`), [jiuwenswarm](jiuwenswarm/) (`JiuwenSwarm0.2.2`), [Conch](Conch/), and [agent-protocol](agent-protocol/) — fetched in one command, with traceable versions.
+- **Layered & Decoupled Architecture**: AgentOS consists of four major components — agent-runtime (Distributed Agent Runtime), [jiuwenswarm] (Work/Coding Agents), Conch (Agent Sandbox), and agent-protocol (Agent Access Gateway).
 - **One-command build**: `build/build.sh` supports `daily` / `release` modes and produces the distributable `AgentOS-Client.tgz` (all-platform TUI client) and `AgentOS-Server-<arch>.tgz` (server) packages.
 - **Modular deployment**: `deploy/agentos.sh` orchestrates five modules — moosefs, jiuwenbox, agent-runtime, agent-gateway, and jiuwenswarm — via pluggable hooks; adding a module only requires implementing its hook functions, with no changes to the scheduling engine.
 - **Single-machine and cluster modes**: single-machine deployment works out of the box; multi-machine clusters declare etcd nodes, master nodes, and an ingress VIP in `deploy/config.yaml` with high availability.
@@ -38,13 +38,13 @@ AgentOS is a one-stop integration and delivery repository for the openJiuwen age
 
 ```bash
 # x86_64 (replace with the latest release date path; for aarch64 change x86_64 to aarch64)
-wget https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-os/package/release/dist/20260715/x86_64/AgentOS-Server.tgz
+wget https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agentos-enterprise/package/release/dist/20260715/x86_64/AgentOS-Server.tgz
 ```
 
 **Option 2: Build from source**
 
 ```bash
-git clone --recurse-submodules https://gitcode.com/openJiuwen/agent-os.git
+git clone --recurse-submodules https://gitcode.com/openJiuwen/agentos-enterprise.git
 cd agent-os
 ./build/build.sh release     # or daily; see build/README.zh.md for all options
 ```

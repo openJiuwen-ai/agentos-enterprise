@@ -1,12 +1,12 @@
-# AgentOS
+# AgentOS Enterprise
 
 [English](README.md) | 简体中文
 
-AgentOS 是 openJiuwen 体系的一站式 Agent 基础设施集成交付仓：通过 Git Submodule 聚合 agent-runtime 分布式运行时、jiuwenswarm 网关与客户端、Conch 沙箱引擎和 A2X 注册中心，提供统一构建与一键集群部署能力。
+AgentOS Enterprise是 openJiuwen 体系的一站式 Agent 基础设施集成交付仓：通过 Git Submodule 聚合 agent-runtime 分布式运行时、jiuwenswarm 网关与客户端、Conch 沙箱引擎和 A2X 注册中心，提供统一构建与一键集群部署能力。
 
 ## 核心特性
 
-- **组件聚合、版本固定**：通过 Git Submodule 引入并锁定四大组件——agent-runtime（`v0.8.0`）、[jiuwenswarm](jiuwenswarm/)（`JiuwenSwarm0.2.2`）、[Conch](Conch/)、[agent-protocol](agent-protocol/)，一键拉取、版本可追溯。
+- **分层解耦架构**：AgentOS由四大组件——agent-runtime（`分布式Agent运行时`）、[jiuwenswarm]（`办公/Coding类Agent`）、[Conch](Conch/)(`Agent沙箱`)、[agent-protocol](agent-protocol/)(`Agent接入网关`)构成。
 - **一键构建**：`build/build.sh` 支持 `daily` / `release` 两种模式，产出 `AgentOS-Client.tgz`（全平台 TUI 客户端）与 `AgentOS-Server-<arch>.tgz`（服务端）可分发包。
 - **模块化部署**：`deploy/agentos.sh` 以可插拔钩子编排 moosefs、jiuwenbox、agent-runtime、agent-gateway、jiuwenswarm 五大模块，新增模块只需实现钩子函数，无需改动调度引擎。
 - **单机 / 集群双模式**：默认单机开箱即用；多机通过 `deploy/config.yaml` 声明 etcd 集群、master 节点与 ingress VIP，支持高可用部署。
@@ -18,7 +18,7 @@ AgentOS 是 openJiuwen 体系的一站式 Agent 基础设施集成交付仓：�
 - [示例工程](examples/README.zh.md) ｜ [部署指南](deploy/README.zh.md)
 - [构建说明](build/README.zh.md) ｜ [构建说明 v2（b050 产品线）](build/README-v2.zh.md)
 - [开源软件声明](OPEN_SOURCE_SOFTWARE_NOTICE.md) ｜ [贡献指南](CONTRIBUTING.md)
-- [版本发布记录](https://gitcode.com/openJiuwen/agent-os/releases)
+- [版本发布记录](https://gitcode.com/openJiuwen/agentos-enterprise/releases)
 
 ## 环境要求
 
@@ -38,13 +38,13 @@ AgentOS 是 openJiuwen 体系的一站式 Agent 基础设施集成交付仓：�
 
 ```bash
 # x86_64（请替换为最新发布日期路径；aarch64 将 x86_64 改为 aarch64）
-wget https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-os/package/release/dist/20260715/x86_64/AgentOS-Server.tgz
+wget https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agentos-enterprise/package/release/dist/20260715/x86_64/AgentOS-Server.tgz
 ```
 
 **方式二：源码构建**
 
 ```bash
-git clone --recurse-submodules https://gitcode.com/openJiuwen/agent-os.git
+git clone --recurse-submodules https://gitcode.com/openJiuwen/agentos-enterprise.git
 cd agent-os
 ./build/build.sh release     # 或 daily；全部参数见 build/README.zh.md
 ```
