@@ -181,6 +181,10 @@ parse_args() {
                 CMD="${args[$i]}"
                 i=$((i+1))
                 ;;
+            create-user)
+                CMD="create-user"
+                i=$((i+1))
+                ;;
             --ip)
                 if [ $((i+1)) -ge ${#args[@]} ]; then
                     error "--ip requires a value"
@@ -201,7 +205,7 @@ parse_args() {
     done
 
     if [ -z "${CMD}" ]; then
-        error "Command not specified! Use 'install', 'init', 'up', 'down', 'status', 'deinit', 'uninstall' or 'restart'"
+        error "Command not specified! Use 'install', 'init', 'up', 'down', 'status', 'deinit', 'uninstall', 'restart' or 'create-user'"
     fi
 }
 
@@ -224,6 +228,142 @@ ensure_agentos_user() {
     info "Ensuring agentos user"
     bash -c 'id -u agentos >/dev/null 2>&1 || useradd agentos' \
         || error "Failed to create agentos user"
+}
+
+# ===== create-user: 在 /home/agentos/users 下创建用户家目录并初始化 .jiuwenswarm =====
+# agentos 仓部署关闭用户认证，create-user 仅负责建目录 + 拷模板，不创建 API key。
+AGENTOS_HOME_BASE="${AGENTOS_HOME_BASE:-/home/agentos/users}"
+AGENTOS_SWARM_TEMPLATE_DIR="${AGENTOS_SWARM_TEMPLATE_DIR:-${HOME:-/root}/.jiuwenswarm}"
+AGENTOS_SYS_UID="${AGENTOS_SYS_UID:-1000}"
+AGENTOS_SYS_GID="${AGENTOS_SYS_GID:-1000}"
+
+# 用户名校验：3-32 位小写字母/数字/下划线/连字符（对齐管理面 _validate_username 规则）
+_validate_username() {
+    local username="$1"
+    if ! echo "${username}" | grep -Eq '^[a-z0-9_-]{3,32}$'; then
+        error "用户名格式无效: '${username}'（要求 3-32 位小写字母/数字/下划线/连字符）"
+    fi
+}
+
+# 递归 chown 家目录到 agentos 用户（UID/GID 1000）
+_chown_user_home() {
+    local home_dir="$1"
+    local uid="${AGENTOS_SYS_UID}"
+    local gid="${AGENTOS_SYS_GID}"
+    if ! chown -R "${uid}:${gid}" "${home_dir}" 2>/dev/null; then
+        warning "chown ${home_dir} to ${uid}:${gid} failed (need root?)"
+    fi
+}
+
+# 拷贝 .jiuwenswarm 模板到用户家目录
+# - 模板目录不存在 → 报错引导先 up
+# - .jiuwenswarm 已存在但缺 config/config.yaml → 仅补拷该文件
+# - .jiuwenswarm 整体缺失 → 拷贝整个模板目录
+_copy_jiuwenswarm_template() {
+    local home_dir="$1"
+    local dst="${home_dir}/.jiuwenswarm"
+    local template="${AGENTOS_SWARM_TEMPLATE_DIR}"
+    local config_path="${dst}/config/config.yaml"
+
+    # 已存在且 config.yaml 齐全 → 跳过
+    if [ -f "${config_path}" ]; then
+        return 0
+    fi
+
+    # 模板目录不存在 → 报错
+    if [ ! -d "${template}" ]; then
+        error "模板目录不存在: ${template}\n请先执行 './agentos.sh up' 部署 jiuwenswarm 生成模板，或通过 AGENTOS_SWARM_TEMPLATE_DIR 指定模板源目录"
+    fi
+
+    # .jiuwenswarm 已存在但缺 config.yaml → 仅补拷该文件
+    if [ -d "${dst}" ]; then
+        local src_config="${template}/config/config.yaml"
+        if [ ! -f "${src_config}" ]; then
+            error "模板目录 ${template} 中缺少 config/config.yaml，无法补充"
+        fi
+        mkdir -p "${dst}/config"
+        cp -a "${src_config}" "${config_path}"
+        info "补充 config.yaml 到 ${config_path}"
+        return 0
+    fi
+
+    # .jiuwenswarm 整体缺失 → 拷贝整个模板目录
+    info "拷贝 .jiuwenswarm 模板: ${template} → ${dst}"
+    cp -a "${template}" "${dst}"
+    if [ ! -f "${config_path}" ]; then
+        error "模板拷贝后 ${config_path} 仍不存在，模板不完整"
+    fi
+}
+
+deploy_create_user() {
+    local username=""
+    local force=0
+
+    # 解析参数：第一个非选项参数为 username，--force 强制重建
+    local arg
+    for arg in "${EXTRA_ARGS[@]}"; do
+        case "${arg}" in
+            --force)
+                force=1
+                ;;
+            -*)
+                error "未知选项: ${arg}"
+                ;;
+            *)
+                if [ -z "${username}" ]; then
+                    username="${arg}"
+                else
+                    error "参数过多: ${arg}（只需一个用户名）"
+                fi
+                ;;
+        esac
+    done
+
+    if [ -z "${username}" ]; then
+        error "用法: ./agentos.sh create-user <username> [--force]"
+    fi
+
+    _validate_username "${username}"
+
+    echo ""
+    info "Creating user: ${username}"
+
+    # 确保 agentos 系统用户存在（chown 目标用户）
+    ensure_agentos_user
+
+    local home_dir="${AGENTOS_HOME_BASE}/${username}"
+
+    # 幂等/重建判断
+    if [ -d "${home_dir}" ]; then
+        if [ "${force}" -eq 1 ]; then
+            warning "用户 ${username} 家目录已存在，--force 删除后重建"
+            rm -rf "${home_dir}"
+            if [ -d "${home_dir}" ]; then
+                error "用户 ${username} 家目录删除失败"
+            fi
+        else
+            warning "用户 ${username} 家目录已存在，跳过（使用 --force 强制重建）"
+            return 0
+        fi
+    fi
+
+    # 1. 创建家目录（权限 0700）
+    mkdir -p "${home_dir}"
+    chmod 0700 "${home_dir}"
+
+    # 2. 创建 workspace（权限 0700）
+    local workspace_dir="${home_dir}/workspace"
+    mkdir -p "${workspace_dir}"
+    chmod 0700 "${workspace_dir}"
+
+    # 3. 拷贝 .jiuwenswarm 模板
+    _copy_jiuwenswarm_template "${home_dir}"
+
+    # 4. chown 收尾
+    _chown_user_home "${home_dir}"
+
+    success "用户 ${username} 创建成功: ${home_dir}"
+    info "API key 需用户自行配置: 编辑 ${home_dir}/.jiuwenswarm/config/config.yaml 或 config/.env"
 }
 
 # ===== up 前置检查：etcd 集群必须已就绪 =====
@@ -470,6 +610,14 @@ Commands (Required):
               卸载前建议先 export PATH=<python3.11 的 bin 目录>:$PATH
   status      查询全部组件运行状态（只读探测，不启停服务；含 etcd + MODULES）
   restart     重启全部应用组件（先 down 再 up；不含 init/deinit）
+  create-user <username> [--force]
+              在 /home/agentos/users/<username> 下创建用户家目录并初始化 .jiuwenswarm
+              - 创建家目录（0700）和 workspace（0700）
+              - 拷贝 .jiuwenswarm 模板（源: AGENTOS_SWARM_TEMPLATE_DIR，默认 ~/.jiuwenswarm）
+              - 递归 chown 到 agentos 用户（UID/GID 1000）
+              - 用户名格式: 3-32 位小写字母/数字/下划线/连字符
+              - 已存在默认跳过，--force 删除重建
+              - 不创建 API key，用户需自行编辑 config/config.yaml 或 config/.env 配置
 
 Options:
   --ip IP          指定本机使用的 IP 地址（多网卡环境必用）。
@@ -548,6 +696,17 @@ Examples:
   AGENTOS_SSH_BACKEND_PUBLIC_DIR=/path/my_pub \
   ./agentos.sh up
 
+  # 9. 创建用户（在 /home/agentos/users/ 下建家目录 + .jiuwenswarm 模板）
+  ./agentos.sh create-user alice
+
+  # 10. 强制重建用户（删除旧目录后从模板重建）
+  ./agentos.sh create-user alice --force
+
+  # 11. 自定义用户根目录和模板源
+  AGENTOS_HOME_BASE=/data/users \
+  AGENTOS_SWARM_TEMPLATE_DIR=/opt/jiuwenswarm_template \
+  ./agentos.sh create-user bob
+
 扩展模块:
   新增组件只需两步:
   1. 在 deploy/ 下新建 <module>/ 目录，放入 module.sh（实现 <module>_up/down/install/uninstall/status 钩子）
@@ -568,19 +727,26 @@ main() {
     if [ $# -eq 0 ]; then
         print_help
     fi
-    load_modules
     parse_args "$@"
     [ -n "${BIND_IP}" ] && info "BIND_IP=${BIND_IP}"
     case "${CMD}" in
-        install)   deploy_install ;;
-        init)      deploy_init ;;
-        up)        deploy_up ;;
-        down)      deploy_down ;;
-        deinit)    deploy_deinit ;;
-        uninstall) deploy_uninstall ;;
-        status)    deploy_status ;;
-        restart)   deploy_restart ;;
-        *)         error "Unknown command: ${CMD}" ;;
+        create-user)
+            # create-user 不依赖任何部署模块，无需 load_modules
+            deploy_create_user ;;
+        *)
+            load_modules
+            case "${CMD}" in
+                install)      deploy_install ;;
+                init)         deploy_init ;;
+                up)           deploy_up ;;
+                down)         deploy_down ;;
+                deinit)       deploy_deinit ;;
+                uninstall)    deploy_uninstall ;;
+                status)       deploy_status ;;
+                restart)      deploy_restart ;;
+                *)            error "Unknown command: ${CMD}" ;;
+            esac
+            ;;
     esac
 }
 
