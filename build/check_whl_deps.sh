@@ -74,7 +74,7 @@ REQ_FILE="deploy/requirements.txt"
 pushd "${TARGET_DIR}" >/dev/null
 
 echo "[Step 3] searching *.whl files under . ..."
-WHL_FILES=( $(find . -type f -name "*.whl") )
+WHL_FILES=( $(find . -type f -name "*.whl" -not -name "openyuanrong*.whl") )
 
 if [ ${#WHL_FILES[@]} -eq 0 ]; then
     echo "[Step 3] no .whl files found, nothing to check."
@@ -106,10 +106,20 @@ PIP_CMD+=( ${WHL_ARGS} )
 
 echo "[Step 4] full command: ${PIP_CMD[*]}"
 
-"${PIP_CMD[@]}" || \
+HAS_CONFLICT=0
+if "${PIP_CMD[@]}"; then
+    echo "[Step 4] pip --dry-run succeeded, no dependency conflict detected."
+else
+    HAS_CONFLICT=1
     echo "[WARN] potential dependency conflict detected among the .whl files above"
+fi
 
 popd >/dev/null
 
 echo "[Step 4] all .whl files have been checked."
+
+if [ "${HAS_CONFLICT}" -ne 0 ]; then
+    echo "[Step 4] exit with status 1 due to dependency conflict."
+    exit 1
+fi
 echo "Done."
