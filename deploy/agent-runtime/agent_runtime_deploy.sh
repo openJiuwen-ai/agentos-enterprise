@@ -769,7 +769,7 @@ yr_stop_all() {
 
     info "Stopping openyuanrong services..."
     info "Stopping yr on ${local_ip} (force)..."
-    exec_on_host "${local_ip}" "yr stop --log-dir-prefix '${YR_LOG_DIR_PREFIX}'" 2>/dev/null && \
+    exec_on_host "${local_ip}" "yr stop --no-reschedule --log-dir-prefix '${YR_LOG_DIR_PREFIX}'" 2>/dev/null && \
         success "yr stopped on ${local_ip}" || \
         warning "Failed to stop yr on ${local_ip} (may not be running)"
     # 强制清理残留进程，避免多次 up/down 后进程堆积
@@ -896,7 +896,7 @@ ExecStart=${yr_bin} start --master --log-dir-prefix=${YR_LOG_DIR_PREFIX} \\
     -s 'values.frontend.ssh_authorized_keys="${AGENTOS_SSH_KEY}.pub"' \\
     -s 'values.frontend.ssh_backend_public_key_dir="${AGENTOS_SSH_BACKEND_PUBLIC_DIR}"' \\
     --block=true
-ExecStop=${yr_bin} stop --log-dir-prefix=${YR_LOG_DIR_PREFIX}
+ExecStop=${yr_bin} stop --no-reschedule --log-dir-prefix=${YR_LOG_DIR_PREFIX}
 Restart=on-failure
 RestartSec=5s
 KillMode=mixed
@@ -942,7 +942,7 @@ ExecStart=${yr_bin} start --log-dir-prefix=${YR_LOG_DIR_PREFIX} \\
     -s 'values.frontend.ssh_authorized_keys="${AGENTOS_SSH_KEY}.pub"' \\
     -s 'values.frontend.ssh_backend_public_key_dir="${AGENTOS_SSH_BACKEND_PUBLIC_DIR}"' \\
     --block=true
-ExecStop=${yr_bin} stop --log-dir-prefix=${YR_LOG_DIR_PREFIX}
+ExecStop=${yr_bin} stop --no-reschedule --log-dir-prefix=${YR_LOG_DIR_PREFIX}
 Restart=on-failure
 RestartSec=5s
 KillMode=mixed
