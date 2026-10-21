@@ -5,6 +5,8 @@ set -euo pipefail
 # ============================================================
 # Conch 部署脚本
 # 优先使用 systemd 托管；systemd 不可用时回退直接管理 conchd。
+# RPM 安装方式随操作系统不同（openeuler-2403/2203、ubuntu-2404/2204），
+# 详见 print_help 中 install 命令的说明。
 # 用法:
 #   ./conch_deploy.sh up --ip 192.168.1.1
 #   ./conch_deploy.sh down --ip 192.168.1.1
@@ -21,6 +23,7 @@ CONCH_STOP_TIMEOUT="${CONCH_STOP_TIMEOUT:-90}"
 CONCH_SERVICE="${CONCH_SERVICE:-conchd.service}"
 CMD=""
 BIND_IP="${BIND_IP:-}"
+OS_VARIANT=""
 
 # ===== 日志 =====
 info()    { echo -e "\033[36m=== $* ===\033[0m"; }
@@ -29,14 +32,22 @@ warning() { echo -e "\033[33m⚠️  $*\033[0m"; }
 error()   { echo -e "\033[31m❌ $*\033[0m"; exit 1; }
 
 # ===== Conch 安装函数 =====
+# 在部署包根目录按包名前缀查找最新版本的 RPM（如 find_rpm conch），找不到时返回非 0
+find_rpm() {
+    ls -1 "${AGENTOS_ROOT}/$1"-*.rpm 2>/dev/null | sort -V | tail -n1
+}
+
+# install_rpm <rpm包名> <rpm文件> [rpm额外参数...]
+# 例: install_rpm virtiofsd "${virtiofsd_rpm}" --replacefiles
 install_rpm() {
     local label="$1" rpm_file="$2"
+    shift 2
     if rpm -q "${label}" >/dev/null 2>&1; then
         warning "${label} is already installed, skipping"
         return 0
     fi
     info "Installing ${label}: $(basename "${rpm_file}")"
-    rpm -ivh "${rpm_file}" \
+    rpm -ivh "$@" "${rpm_file}" \
         || error "Failed to install ${label} RPM"
     rpm -q "${label}" >/dev/null 2>&1 || error "${label} RPM installation verification failed"
     success "${label} installed"
@@ -62,6 +73,36 @@ install_conch_wheel() {
     "${python_bin}" -m pip show conch >/dev/null 2>&1 \
         || error "Conch wheel installation verification failed"
     success "Conch wheel installed"
+}
+
+# ===== 操作系统检测 =====
+# 检测当前系统，成功时设置 OS_VARIANT 并返回 0：
+#   openeuler-2403 / openeuler-2203 / ubuntu-2404 / ubuntu-2204
+# Conch 各操作系统的 RPM 安装清单与参数不同（见 conch_install）。
+detect_os_variant() {
+    local os_type="" os_version=""
+    OS_VARIANT=""
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        os_type="${ID:-}"
+        os_version="${VERSION_ID:-}"
+    elif [ -f /etc/openEuler-release ]; then
+        os_type="openEuler"
+        os_version=$(grep -oE '[0-9]+\.[0-9]+' /etc/openEuler-release | head -n1)
+    fi
+    os_type=$(echo "${os_type}" | tr '[:upper:]' '[:lower:]')
+
+    case "${os_type}:${os_version}" in
+        openeuler:24.03*) OS_VARIANT="openeuler-2403" ;;
+        openeuler:22.03*) OS_VARIANT="openeuler-2203" ;;
+        ubuntu:24.04*)    OS_VARIANT="ubuntu-2404" ;;
+        ubuntu:22.04*)    OS_VARIANT="ubuntu-2204" ;;
+        *)
+            warning "Unrecognized OS: ${os_type:-unknown} ${os_version:-unknown}"
+            return 1
+            ;;
+    esac
 }
 
 # ===== 本机 IP 探测 =====
@@ -269,20 +310,49 @@ check_existing() {
 conch_install() {
     command -v rpm >/dev/null 2>&1 || error "rpm command not found"
 
-    local erofs_rpm stratovirt_rpm conch_rpm
-    erofs_rpm=$(ls -1 "${AGENTOS_ROOT}"/erofs-utils-*.rpm 2>/dev/null \
-        | sort -V | tail -n1 || true)
-    [ -n "${erofs_rpm}" ] || error "erofs-utils RPM not found in ${AGENTOS_ROOT}"
-    stratovirt_rpm=$(ls -1 "${AGENTOS_ROOT}"/stratovirt-*.rpm 2>/dev/null \
-        | sort -V | tail -n1 || true)
-    [ -n "${stratovirt_rpm}" ] || error "stratovirt RPM not found in ${AGENTOS_ROOT}"
-    conch_rpm=$(ls -1 "${AGENTOS_ROOT}"/conch-*.rpm 2>/dev/null \
-        | sort -V | tail -n1 || true)
-    [ -n "${conch_rpm}" ] || error "conch RPM not found in ${AGENTOS_ROOT}"
+    detect_os_variant \
+        || error "Unsupported OS for Conch install; supported: openEuler 24.03/22.03, Ubuntu 24.04/22.04"
+    info "Detected OS: ${OS_VARIANT}"
 
-    install_rpm erofs-utils "${erofs_rpm}"
-    install_rpm stratovirt "${stratovirt_rpm}"
-    install_rpm conch "${conch_rpm}"
+    local erofs_rpm stratovirt_rpm virtiofsd_rpm conch_rpm
+    conch_rpm=$(find_rpm conch) || error "conch RPM not found in ${AGENTOS_ROOT}"
+    stratovirt_rpm=$(find_rpm stratovirt) || error "stratovirt RPM not found in ${AGENTOS_ROOT}"
+
+    case "${OS_VARIANT}" in
+        openeuler-2403)
+            # 24.03：依赖齐备，按原有顺序直接安装（保持原有流程不变）
+            erofs_rpm=$(find_rpm erofs-utils) || error "erofs-utils RPM not found in ${AGENTOS_ROOT}"
+            install_rpm erofs-utils "${erofs_rpm}"
+            install_rpm stratovirt "${stratovirt_rpm}"
+            install_rpm conch "${conch_rpm}"
+            ;;
+        openeuler-2203)
+            # 22.03：erofs/stratovirt 可直接安装；conch 依赖 virtiofsd，
+            # 须先用 --replacefiles 安装部署包自带的 virtiofsd RPM（其文件与系统已有包冲突）
+            erofs_rpm=$(find_rpm erofs-utils) || error "erofs-utils RPM not found in ${AGENTOS_ROOT}"
+            virtiofsd_rpm=$(find_rpm virtiofsd) || error "virtiofsd RPM not found in ${AGENTOS_ROOT}"
+            install_rpm erofs-utils "${erofs_rpm}"
+            install_rpm stratovirt "${stratovirt_rpm}"
+            install_rpm virtiofsd "${virtiofsd_rpm}" --replacefiles
+            install_rpm conch "${conch_rpm}"
+            ;;
+        ubuntu-2404)
+            # Ubuntu 24.04：erofs-utils 由 apt 安装（非本脚本 rpm 安装），仅需安装 stratovirt/conch
+            install_rpm stratovirt "${stratovirt_rpm}" --nodeps
+            install_rpm conch "${conch_rpm}" --nodeps
+            ;;
+        ubuntu-2204)
+            # Ubuntu 22.04：erofs-utils/stratovirt/virtiofsd/conch 全部 --nodeps 安装
+            erofs_rpm=$(find_rpm erofs-utils) || error "erofs-utils RPM not found in ${AGENTOS_ROOT}"
+            virtiofsd_rpm=$(find_rpm virtiofsd) || error "virtiofsd RPM not found in ${AGENTOS_ROOT}"
+            install_rpm erofs-utils "${erofs_rpm}" --nodeps
+            install_rpm stratovirt "${stratovirt_rpm}" --nodeps
+            install_rpm virtiofsd "${virtiofsd_rpm}" --nodeps
+            install_rpm conch "${conch_rpm}" --nodeps
+            ;;
+    esac
+
+    # Wheel 安装流程各操作系统一致
     install_conch_wheel
 
     command -v mkfs.erofs >/dev/null 2>&1 || error "mkfs.erofs not found after installation"
@@ -350,8 +420,25 @@ conch_uninstall() {
     else
         warning "${python_bin} not found; skipping Conch wheel uninstall"
     fi
+    # 卸载清单与 conch_install 各操作系统的安装清单保持一致；
+    # 无法识别操作系统时回退默认三包清单
+    if detect_os_variant; then
+        info "Detected OS: ${OS_VARIANT}"
+    else
+        warning "OS not recognized; uninstalling default package list (conch, stratovirt, erofs-utils)"
+    fi
+    local -a packages=(conch stratovirt erofs-utils)
+    case "${OS_VARIANT}" in
+        openeuler-2203|ubuntu-2204)
+            packages=(conch virtiofsd stratovirt erofs-utils)
+            ;;
+        ubuntu-2404)
+            packages=(conch stratovirt)
+            ;;
+    esac
+
     local package
-    for package in conch stratovirt erofs-utils; do
+    for package in "${packages[@]}"; do
         if rpm -q "${package}" >/dev/null 2>&1; then
             rpm -e "${package}" || error "Failed to uninstall ${package}"
             success "${package} uninstalled"
@@ -441,8 +528,12 @@ Environment Variables:
   CONCH_STOP_TIMEOUT  readiness and stop timeout settings
   CONCH_SERVICE  systemd unit name (default: conchd.service)
 
-RPM install order: erofs-utils -> stratovirt -> conch
-RPM uninstall order: conch -> stratovirt -> erofs-utils
+RPM install（自动检测操作系统，Wheel 安装流程各系统一致）:
+  openeuler-2403: erofs-utils -> stratovirt -> conch
+  openeuler-2203: erofs-utils -> stratovirt -> virtiofsd(--replacefiles) -> conch
+  ubuntu-2404:    stratovirt -> conch                                    (--nodeps)
+  ubuntu-2204:    erofs-utils -> stratovirt -> virtiofsd -> conch        (--nodeps)
+RPM uninstall 与各操作系统的安装清单保持一致（逆序卸载）。
 EOF
 }
 

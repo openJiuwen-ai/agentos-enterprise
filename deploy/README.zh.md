@@ -53,7 +53,7 @@ deploy/
 核心机制：**模块注册 + 钩子函数 + 调度引擎**。
 
 1. **模块注册**：`agentos.sh` 顶部的 `MODULES` 数组声明所有模块及其部署顺序：
-   `MODULES=("moosefs" "jiuwenbox" "agent-runtime" "agent-gateway" "jiuwenswarm")`
+   `MODULES=("moosefs" "jiuwenbox" "agent-runtime" "conch" "agent-gateway" "jiuwenswarm")`
 2. **钩子约定**：每个模块在 `deploy/<module>/module.sh` 中实现 5 个钩子函数：
    - `<module>_up` — 启动/部署
    - `<module>_down` — 停止/卸载
@@ -473,7 +473,7 @@ mymodule_status() {
 编辑 `agentos.sh` 顶部的 `MODULES` 数组，按部署顺序添加模块名：
 
 ```bash
-MODULES=("moosefs" "jiuwenbox" "agent-runtime" "agent-gateway" "jiuwenswarm" "mymodule")
+MODULES=("moosefs" "jiuwenbox" "agent-runtime" "conch" "agent-gateway" "jiuwenswarm" "mymodule")
 ```
 
 ### 完成
