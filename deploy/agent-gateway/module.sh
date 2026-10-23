@@ -265,6 +265,8 @@ agent-gateway_install() {
         cat > "${AGENTREGISTRY_UNIT}" <<EOF
 [Unit]
 After=network.target
+After=agentos-etcd.service
+Wants=agentos-etcd.service
 StartLimitIntervalSec=60
 StartLimitBurst=5
 [Service]
