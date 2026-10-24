@@ -7,7 +7,8 @@ set -euo pipefail
 #
 # 支持 openEuler 22.03/24.03 和 Ubuntu 22.04/24.04（x86_64 / aarch64）
 # 安装内容:
-#   1. 系统包: python3.11、iproute/iproute2 (ip)、iptables、curl、fuse3、bwrap、jq
+#   1. 系统包: python3.11、iproute/iproute2 (ip)、iptables、curl、fuse3、bwrap、jq、
+#              NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server)、autofs
 #   2. MooseFS: moosefs-master、moosefs-chunkserver、moosefs-client
 #   3. Python 依赖: deploy/requirements.txt
 #
@@ -154,6 +155,9 @@ install_system_openeuler() {
 
     # iproute 提供 ip 命令（openEuler 包名是 iproute 不是 iproute2）
     # bwrap 是 jiuwenbox 沙箱的前置依赖；jq 是 agent-runtime session.json 解析依赖
+    # nfs-utils 为 workspace-storage 提供 NFS 服务端与客户端（含 exportfs/mount.nfs）；
+    # rpcbind 提供 RPC 端口映射，nfs-server 启动必需（缺失会报 RPC: Program not registered）；
+    # autofs 为 workspace-storage 提供跨节点工作区自动挂载（NFSv4.1）
     local pkgs=(
         "iptables"
         "curl"
@@ -161,6 +165,9 @@ install_system_openeuler() {
         "iproute"
         "bubblewrap"
         "jq"
+        "nfs-utils"
+        "rpcbind"
+        "autofs"
     )
 
     # python3.11: openEuler 22.03 可能需要从 everything 仓库安装
@@ -174,7 +181,7 @@ install_system_openeuler() {
     dnf install -y --disablerepo=moosefs "${pkgs[@]}" || {
         # bubblewrap 可能在某些 openEuler 版本中叫 bwrap
         warning "dnf install failed, trying with bwrap instead of bubblewrap"
-        pkgs=("iptables" "curl" "fuse3" "iproute" "bwrap" "jq")
+        pkgs=("iptables" "curl" "fuse3" "iproute" "bwrap" "jq" "nfs-utils" "rpcbind" "autofs")
         dnf install -y --disablerepo=moosefs "${pkgs[@]}" || error "Failed to install system packages via dnf"
     }
 
@@ -209,6 +216,12 @@ install_system_ubuntu() {
 
     # bwrap 是 jiuwenbox 沙箱的前置依赖；jq 是 agent-runtime session.json 解析依赖
     # gpg 是 MooseFS GPG key 导入依赖
+    # nfs-kernel-server 提供 NFS 服务端（exportfs/rpc.nfsd）；nfs-common 提供客户端工具
+    # （mount.nfs 等，nfs-kernel-server 已依赖它，此处显式列出以便离线收集物料，
+    # 以及仅作挂载端的节点单独安装）；
+    # rpcbind 提供 RPC 端口映射，nfs-server 启动必需（nfs-common 会依赖它，
+    # 此处显式列出以确保离线物料完整）；
+    # autofs 为 workspace-storage 提供跨节点工作区自动挂载（NFSv4.1）
     local pkgs=(
         "iptables"
         "curl"
@@ -217,6 +230,10 @@ install_system_ubuntu() {
         "bubblewrap"
         "jq"
         "gpg"
+        "nfs-kernel-server"
+        "nfs-common"
+        "rpcbind"
+        "autofs"
     )
 
     # python3.11: Ubuntu 22.04 和 24.04 默认仓库均无 python3.11，需要 deadsnakes PPA
@@ -226,7 +243,7 @@ install_system_ubuntu() {
     apt-get install -y "${pkgs[@]}" || {
         # bubblewrap 可能在某些 Ubuntu 版本中叫 bwrap
         warning "apt install failed, trying with bwrap instead of bubblewrap"
-        pkgs=("iptables" "curl" "fuse3" "iproute2" "bwrap" "jq" "gpg")
+        pkgs=("iptables" "curl" "fuse3" "iproute2" "bwrap" "jq" "gpg" "nfs-kernel-server" "nfs-common" "rpcbind" "autofs")
         apt-get install -y "${pkgs[@]}" || error "Failed to install system packages via apt"
     }
 
@@ -434,7 +451,8 @@ Usage: ./$(basename "$0") [OPTIONS]
 注意: 工具脚本仅供参考，有需要请自行修改
 
 安装内容:
-  1. 系统包:   python${YR_PYTHON_VERSION}、ip (iproute/iproute2)、iptables、curl、fuse3、bwrap、jq
+  1. 系统包:   python${YR_PYTHON_VERSION}、ip (iproute/iproute2)、iptables、curl、fuse3、bwrap、jq、
+               NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server + nfs-common)、autofs
   2. MooseFS:  moosefs-master、moosefs-chunkserver、moosefs-client
   3. Python:   deploy/requirements.txt 中的全部依赖
 

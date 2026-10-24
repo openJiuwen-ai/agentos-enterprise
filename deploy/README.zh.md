@@ -226,6 +226,21 @@ bash agentos.sh uninstall
 
 > **注意**：同单机部署，卸载前先在各节点恢复 python3.11 环境（`export PATH=/opt/buildtools/python3.11/bin:$PATH`，按实际安装路径）。
 
+#### 升级（upgrade）
+
+```bash
+# 下载新版本安装包并解压，在【新解压目录】的 deploy/ 下执行
+bash agentos.sh upgrade
+
+# 多机环境：各节点分别执行，须先在 agent 节点执行、master 节点最后执行
+# （master 节点上存在旧 MooseFS master 时会做屏障校验，未全部完成迁移则拒绝拆旧）
+bash agentos.sh upgrade
+```
+
+> **重要**：`upgrade` 必须在**新解压的安装包目录**中执行，**不可在持久化目录 `~/.agentos/deploy` 中执行**。
+> `install` 流程会把 `deploy` 目录持久化到 `~/.agentos/deploy`，其实现是「先删除目标目录，再从脚本所在目录拷贝过去」。若脚本本身就是从 `~/.agentos/deploy` 运行的（即脚本所在目录与持久化目标为同一路径），会先删掉正在运行的部署树、随后的拷贝又因源目录已消失而失败，导致**部署树被清除、升级在 Phase 3（装新）中断**——而此时 Phase 2 已把旧系统拆除。
+> 该约束同样适用于 `install`。`up` / `down` / `status` / `uninstall` 等命令不受影响，仍应（也只能）从 `~/.agentos/deploy` 执行。
+
 #### etcd 数据清理（独立操作）
 
 ```bash
@@ -245,6 +260,7 @@ bash etcd.sh clean
 | `deinit` | 停 etcd + 删 unit（委托 `etcd.sh down`，保留数据） |
 | `uninstall` | 在本机卸载全部组件的 whl 包。**与 install 严格使用同一 Python 环境（默认 python3.11，需在 PATH 中）**：whl 包装在该解释器的 site-packages 下，卸载前请先恢复该环境（如 `export PATH=/opt/buildtools/python3.11/bin:$PATH`）；缺失时不回退其他解释器，所有卸载直接判失败并在结尾汇总告警（不中断、不误报全部成功） |
 | `restart` | 重启全部应用组件（先 down 再 up；不含 init/deinit） |
+| `upgrade` | 一键升级（含数据迁移）：检测迁移标记 → rsync 迁移本节点归属用户 → 拆旧（down/uninstall/deinit，含旧 MooseFS 拆除与 master 屏障）→ 装新（install/init/写 etcd 归属/up）。**须在新解压的安装包目录中执行，不可在 `~/.agentos/deploy` 持久化目录中执行**（原因见上文「升级（upgrade）」） |
 | `--ip IP` | 指定本机使用的 IP 地址（多网卡环境必用）。指定后所有子组件的 IP 探测统一使用该 IP，并校验该 IP 必须是本机真实持有的 IP，否则报错退出。不指定时各组件各自自动探测 |
 | `-h, --help` | 显示帮助信息 |
 
