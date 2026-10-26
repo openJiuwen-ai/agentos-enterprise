@@ -83,22 +83,97 @@ _jwsw_env_value() {
     printf '%s' "${line}"
 }
 
-# 检查工具沙箱镜像是否已存在于本机 docker images 中
-# 当 TOOL_SANDBOX_ENABLE=true 时，install 会检测本地是否已有沙箱镜像
-# docker 命令缺失、守护进程不可达或镜像不存在时，均直接中断安装，要求用户处理后重新执行 install
+# 把 .env.custom 中已有的 KEY= 行改成 KEY="value"；没有该行时追加
+_jiuwenswarm_set_env_value() {
+    local file="$1" key="$2" value="$3"
+    local tmp found=0
+    tmp=$(mktemp)
+    while IFS= read -r line || [ -n "${line}" ]; do
+        if [[ "${line}" == "${key}="* ]]; then
+            printf '%s="%s"\n' "${key}" "${value}"
+            found=1
+        else
+            printf '%s\n' "${line}"
+        fi
+    done < "${file}" > "${tmp}"
+    if [ "${found}" -eq 0 ]; then
+        printf '%s="%s"\n' "${key}" "${value}" >> "${tmp}"
+    fi
+    mv "${tmp}" "${file}"
+}
+
+# 当前机器对应的 Conch 镜像 tag：x86_64 -> latest-amd64，aarch64 -> latest-arm64
+_jiuwenswarm_host_conch_tag() {
+    local arch
+    arch=$(uname -m)
+    case "${arch}" in
+        x86_64|amd64)
+            printf '%s' "latest-amd64"
+            ;;
+        aarch64|arm64)
+            printf '%s' "latest-arm64"
+            ;;
+        *)
+            error "Unsupported architecture '${arch}' for Conch sandbox image tag; expected x86_64 or aarch64."
+            ;;
+    esac
+}
+
+# 镜像最后一段（最后一个 / 之后）是否已经带 tag。registry:port 里的冒号不算 tag。
+_jiuwenswarm_image_has_tag() {
+    local image="$1" leaf
+    leaf="${image##*/}"
+    [[ "${leaf}" == *:* ]]
+}
+
+# 给没有 tag 的镜像补上 Conch tag。调用方需先确认没有 tag。
+# swr.../tool-sandbox -> swr.../tool-sandbox:latest-arm64 / :latest-amd64
+_jiuwenswarm_image_with_conch_tag() {
+    local image="$1" tag="$2"
+    printf '%s:%s' "${image}" "${tag}"
+}
+
+# 检查工具沙箱镜像
+# TOOL_SANDBOX_ENABLE=true 且 TOOL_SANDBOX_EXECUTOR=docker 时，install 检测本地是否已有沙箱镜像。
+# docker 命令缺失、守护进程不可达或镜像不存在时，均直接中断安装。
+# TOOL_SANDBOX_EXECUTOR=conch 时不检查本地镜像。镜像已有 tag 则保持原样；
+# 没有 tag 时按当前架构补上 latest-arm64 / latest-amd64，并写回 .env.custom。
 _jiuwenswarm_check_sandbox_image() {
     local env_file="${JIUWENSWARM_DEPLOY_DIR}/.env.custom"
-    local sandbox_type="" sandbox_enable="" sandbox_image=""
+    local sandbox_type="" sandbox_enable="" sandbox_image="" sandbox_executor=""
 
     # 从 .env.custom 读取工具沙箱配置
     if [ -f "${env_file}" ]; then
         sandbox_type=$(_jwsw_env_value "${env_file}" 'TOOL_SANDBOX_TYPE')
         sandbox_enable=$(_jwsw_env_value "${env_file}" 'TOOL_SANDBOX_ENABLE')
         sandbox_image=$(_jwsw_env_value "${env_file}" 'TOOL_SANDBOX_IMAGE')
+        sandbox_executor=$(_jwsw_env_value "${env_file}" 'TOOL_SANDBOX_EXECUTOR')
     fi
+    sandbox_executor=$(printf '%s' "${sandbox_executor}" | tr '[:upper:]' '[:lower:]')
 
-    # 仅当工具沙箱启用时检查
+    # 仅当工具沙箱启用时处理
     if [ "${sandbox_enable}" = "true" ] && [ -n "${sandbox_image}" ]; then
+        if [ "${sandbox_executor}" = "conch" ]; then
+            if _jiuwenswarm_image_has_tag "${sandbox_image}"; then
+                info "TOOL_SANDBOX_IMAGE already has a tag, leave it unchanged: ${sandbox_image}"
+            else
+                local conch_tag new_image
+                conch_tag=$(_jiuwenswarm_host_conch_tag)
+                new_image=$(_jiuwenswarm_image_with_conch_tag "${sandbox_image}" "${conch_tag}")
+                _jiuwenswarm_set_env_value "${env_file}" "TOOL_SANDBOX_IMAGE" "${new_image}"
+                success "TOOL_SANDBOX_EXECUTOR=conch: TOOL_SANDBOX_IMAGE=${new_image}"
+            fi
+            if [ -n "${sandbox_type}" ]; then
+                info "Current TOOL_SANDBOX_TYPE: ${sandbox_type}"
+            fi
+            return 0
+        fi
+
+        if [ "${sandbox_executor}" != "docker" ]; then
+            info "Skip sandbox image check: TOOL_SANDBOX_EXECUTOR=${sandbox_executor:-<empty>} (image inspect runs only for docker)."
+            return 0
+        fi
+
         # docker 命令不存在：提示后中断（error 会 exit 1，提示需全部先输出）
         if ! command -v docker >/dev/null 2>&1; then
             echo ""
