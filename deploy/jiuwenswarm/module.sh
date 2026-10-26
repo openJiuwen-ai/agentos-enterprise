@@ -8,6 +8,16 @@
 # 构建时已将 jiuwenswarm submodule 中部署相关脚本文件拷贝到当前脚本执行目录中，故 deploy.sh 与 module.sh 同目录
 JIUWENSWARM_DEPLOY_DIR="${SCRIPT_DIR}/jiuwenswarm"
 
+# ===== 用户配置刷新 =====
+# 直接把最新的 root 模板刷给存量用户，不做模板/用户判断。
+# 失败只告警，不影响调用方结果（例如本机没有已初始化用户时脚本返回 1）。
+jiuwenswarm_refresh_users() {
+    AGENTOS_HOME_BASE="${AGENTOS_HOME_BASE:-/home/agentos/users}" \
+    AGENTOS_SWARM_TEMPLATE="${AGENTOS_SWARM_TEMPLATE:-${AGENTOS_SWARM_TEMPLATE_DIR:-${HOME:-/root}/.jiuwenswarm}/config/config.yaml}" \
+        bash "${JIUWENSWARM_DEPLOY_DIR}/refresh-user-config.sh" --all -y \
+        || warning "用户配置刷新未完成，可手动重试: ${JIUWENSWARM_DEPLOY_DIR}/refresh-user-config.sh --all -y"
+}
+
 # ===== up/down: 调用 deploy.sh =====
 # deploy.sh 使用相对路径 source，需在其所在目录下执行
 jiuwenswarm_up() {
@@ -68,6 +78,10 @@ jiuwenswarm_install() {
         warning "No jiuwenswarm whl found at ${AGENTOS_ROOT}/jiuwenswarm-*-py3-none-any.whl, skipping jiuwenswarm install"
         warning "Please place jiuwenswarm-<version>-py3-none-any.whl in ${AGENTOS_ROOT}/ before install"
     fi
+
+    # 安装完成后刷新存量用户配置
+    # 放在 whl 分支之外：无 whl（已装好的环境）时同样可修复用户配置
+    jiuwenswarm_refresh_users
 }
 
 # 读取 env 文件中 KEY=VALUE 的值，兼容值带双引号/单引号/不带引号三种写法
