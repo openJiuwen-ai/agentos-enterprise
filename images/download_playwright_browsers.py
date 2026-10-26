@@ -3,7 +3,7 @@
 """从 npmmirror 下载两个 revision 的 playwright chromium 到标准缓存路径。
 
 node 侧(1200) 与 python 侧(1234) 各用一套, 目录按 revision 隔离互不冲突。
-下载目标: /tmp/ms-playwright/{chromium-<rev>,chromium_headless_shell-<rev>}
+下载目标: /opt/ms-playwright/{chromium-<rev>,chromium_headless_shell-<rev>}
 """
 import logging
 import os
@@ -13,7 +13,7 @@ import urllib.request
 
 logger = logging.getLogger(__name__)
 
-DEST = "/tmp/ms-playwright"
+DEST = "/opt/ms-playwright"
 
 # revision -> 用途说明
 REVISIONS = {
@@ -47,7 +47,7 @@ def main():
                 data = resp.read()
             target = os.path.join(DEST, folder)
             os.makedirs(target, exist_ok=True)
-            zf = os.path.join("/tmp", filename)
+            zf = os.path.join(os.path.dirname(DEST), filename)
             with open(zf, "wb") as f:
                 f.write(data)
             with zipfile.ZipFile(zf) as z:
