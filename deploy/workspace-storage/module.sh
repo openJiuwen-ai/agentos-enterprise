@@ -31,21 +31,11 @@ workspace-storage_status() {
     _ws_run status "$@"
 }
 
-# ===== upgrade 迁移钩子（供 agentos.sh upgrade 调用） =====
-
-# Phase 0 + Phase 1: 检测是否需要迁移 + 数据迁移
-# 前提: 旧集群仍在运行，etcd 可用，/home/agentos/users 可读
-# 输出: 子进程变量无法回传，通过 stdout 协议行传递 ——
-#       WORKSPACE_MIGRATION_NEEDED=yes/no
-#       yes 时同时输出 WORKSPACE_NODE_IPS_FILE=<节点 IP 列表文件>
-#       （由 agentos.sh upgrade 逐行解析）
-workspace-storage-upgrade_migrate() {
-    _ws_run upgrade_migrate "$@"
-}
-
-# Phase 3.3: 写 etcd 归属记录
-# 前提: 新集群 install + init 完成，etcd 可用
-# 输入: WORKSPACE_NODE_IPS_FILE（Phase 1 保存的节点 IP 列表）
-workspace-storage-upgrade_write_etcd() {
-    _ws_run upgrade_write_etcd "$@"
+# ===== migrate 数据迁移钩子（供 agentos.sh migrate 调用） =====
+# 前提: 旧集群仍在运行，etcd 可用，/home/agentos/users 可读（旧 MooseFS 挂载中）
+# 行为: 从 config.yaml 的 cluster_nodes 取节点列表 → HRW 归属 →
+#       rsync 本机归属用户到 ${WORKSPACE_STORAGE_ROOT} → 写 etcd 归属记录
+#       （一次完成，幂等可重跑）
+workspace-storage-migrate() {
+    _ws_run migrate "$@"
 }

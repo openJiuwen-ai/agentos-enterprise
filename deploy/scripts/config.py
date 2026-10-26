@@ -138,6 +138,11 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
         raise ValueError("Invalid config: 'cluster.etcd_nodes' must be a non-empty list")
     if not isinstance(cluster["master_nodes"], list) or not cluster["master_nodes"]:
         raise ValueError("Invalid config: 'cluster.master_nodes' must be a non-empty list")
+    # cluster_nodes 为可选字段：存在则必须是 non-empty list；缺失时不报错，
+    # 以免破坏读取尚未更新的持久化 config.yaml 的其它调用方（如 autofs_program_map.sh）。
+    if "cluster_nodes" in cluster:
+        if not isinstance(cluster["cluster_nodes"], list) or not cluster["cluster_nodes"]:
+            raise ValueError("Invalid config: 'cluster.cluster_nodes' must be a non-empty list when present")
     return cluster
 
 
@@ -269,6 +274,7 @@ def main():
     sub.add_parser("master-ip", help="Print master_nodes[0]")
     sub.add_parser("etcd-advertise-ip", help="Print this host's etcd advertise IP")
     sub.add_parser("etcd-nodes", help="Print all etcd node IPs, space-separated")
+    sub.add_parser("cluster-nodes", help="Print all cluster node IPs (cluster_nodes), space-separated")
     sub.add_parser("ingress-vip", help="Print ingress_virtual_ip")
     sub.add_parser("all", help="Print all derived values as JSON")
 
@@ -305,6 +311,13 @@ def main():
     if args.cmd == "etcd-nodes":
         _LOGGER.info(" ".join(cluster["etcd_nodes"]))
         return
+    if args.cmd == "cluster-nodes":
+        nodes = cluster.get("cluster_nodes")
+        if not nodes:
+            _LOGGER.error("cluster.cluster_nodes is missing or empty in %s", args.config)
+            sys.exit(1)
+        _LOGGER.info(" ".join(nodes))
+        return
     if args.cmd == "ingress-vip":
         _LOGGER.info(cluster["ingress_virtual_ip"])
         return
@@ -322,6 +335,7 @@ def main():
             "ingress_virtual_ip": cluster["ingress_virtual_ip"],
             "etcd_nodes": cluster["etcd_nodes"],
             "master_nodes": cluster["master_nodes"],
+            "cluster_nodes": cluster.get("cluster_nodes", []),
         }
         _LOGGER.info(json.dumps(result, indent=2))
         return

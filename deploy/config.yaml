@@ -6,6 +6,7 @@
 # 配置格式说明：
 #   etcd_nodes: etcd 集群节点列表（单机 1 节点 / 4 机 HA 3 节点）
 #   master_nodes: master 节点列表（单机 1 节点 / 4 机 HA 2 节点）
+#   cluster_nodes: 整个集群的全部节点列表（workspace 亲和 HRW 候选集 / 数据迁移节点来源）
 #   ingress_virtual_ip: 统一入口虚拟 IP，抢占到 VIP 的节点部署 gateway/registry/web-server
 
 cluster:
@@ -15,6 +16,10 @@ cluster:
 
   # master 节点（主备）
   master_nodes:
+    - "127.0.0.1"
+
+  # 整个集群的全部节点（workspace 亲和 HRW 候选集；数据迁移按此列表计算归属）
+  cluster_nodes:
     - "127.0.0.1"
 
   # 统一入口虚拟 IP（抢占成功后启动 gateway/registry/web-server）

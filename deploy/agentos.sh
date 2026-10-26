@@ -24,6 +24,7 @@ set -euo >/dev/null 2>&1
 #   ./agentos.sh down
 #   ./agentos.sh install
 #   ./agentos.sh uninstall
+#   ./agentos.sh migrate
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,7 +35,7 @@ ETCD_SH="${SCRIPT_DIR}/etcd.sh"
 
 # ===== 模块注册（按部署/安装顺序声明，down/uninstall 自动逆序） =====
 # workspace-storage（NFS + autofs）替代旧版 moosefs。
-# 注意: deploy/moosefs/ 目录保留，仅供 upgrade 拆旧集群时动态加载（见 deploy_upgrade），
+# 注意: deploy/moosefs/ 目录保留，仅供 down/uninstall 拆旧集群时动态加载（见 _teardown_legacy_moosefs），
 # 不在 MODULES 中 —— 新部署不再安装/启动 MooseFS。
 MODULES=("workspace-storage" "conch" "jiuwenbox" "agent-runtime" "agent-gateway" "jiuwenswarm")
 
@@ -130,10 +131,6 @@ reverse_modules() {
 # uninstall 时单模块失败不中断：❌ error 记录后继续执行其余模块，
 # 失败模块记入 HOOK_FAILED_MODULES，结尾 _print_summary 统一 ❌ error 汇总并退出非 0。
 HOOK_FAILED_MODULES=()
-# upgrade 期间置 yes：uninstall 失败不立即 exit（否则拆旧后硬中断→半拆状态），
-# 改为记录并在 upgrade 末尾统一以非 0 退出
-AGENTOS_DEFER_UNINSTALL_FAIL="no"
-UPGRADE_HAD_FAILURE="no"
 
 run_hooks() {
     local hook="$1"  # up / down / install / uninstall
@@ -192,8 +189,8 @@ parse_args() {
                 CMD="create-user"
                 i=$((i+1))
                 ;;
-            upgrade)
-                CMD="upgrade"
+            migrate)
+                CMD="migrate"
                 i=$((i+1))
                 ;;
             --ip)
@@ -216,7 +213,7 @@ parse_args() {
     done
 
     if [ -z "${CMD}" ]; then
-        error "Command not specified! Use 'install', 'init', 'up', 'down', 'status', 'deinit', 'uninstall', 'restart', 'create-user' or 'upgrade'"
+        error "Command not specified! Use 'install', 'init', 'up', 'down', 'status', 'deinit', 'uninstall', 'restart', 'create-user' or 'migrate'"
     fi
 }
 
@@ -428,6 +425,7 @@ deploy_down() {
     info "Starting full teardown (down)"
     info "Modules (reverse): $(reverse_modules)"
     run_hooks down
+    _teardown_legacy_moosefs down
     _print_summary down
 }
 
@@ -454,176 +452,55 @@ deploy_uninstall() {
     info "Modules (reverse): $(reverse_modules)"
     info "Python version: ${YR_PYTHON_VERSION}"
     run_hooks uninstall
+    _teardown_legacy_moosefs uninstall
     _print_summary uninstall
 }
 
-# ===== upgrade: 一键升级（含数据迁移） =====
-# 用户下载新安装包后执行 ./agentos.sh upgrade，一条命令完成全部升级。
-#
-# 流程:
-#   Phase 0: 检测 etcd 是否已有 WORKSPACE_ETCD_PREFIX 记录
-#            有 → 跳过迁移    无 → 需要迁移
-#   Phase 1: 数据迁移（旧集群仍在运行，etcd 可用，MooseFS/本地目录可读）
-#            查 etcd discovery 获取全部节点 IP → HRW 计算归属 → rsync 本节点归属用户
-#   Phase 2: 拆旧（检测并拆除旧 MooseFS + 标准流程: down → uninstall → deinit）
-#   Phase 3: 装新（标准流程: install → init → 写 etcd 归属 → up）
-deploy_upgrade() {
+# ===== migrate: 数据迁移（在 down 之前完成） =====
+# 用户下载新安装包解压后，先执行 ./agentos.sh migrate（旧集群仍在运行、旧存储可读），
+# 完成用户数据搬迁 + etcd 归属记录写入；随后再 down → uninstall → install → init → up。
+# 限制: 必须执行新安装包里的脚本（旧包无此命令）。范围为单机 + 简单多机，不考虑混部。
+deploy_migrate() {
     echo ""
-    info "Starting upgrade (with data migration if needed)"
-
-    local migration_needed="no"
-    local node_ips_file=""
-    local pending_nodes=0
-    # 协议行是否提供且为合法数字；未提供/非法时保持 no，
-    # 供 Phase 2.0 master 屏障判定是否可安全拆旧（异常不得静默放行）
-    local pending_nodes_valid="no"
-
-    # ===== Phase 0 + Phase 1: 检测 + 数据迁移 =====
-    # workspace-storage 已在 MODULES 中由 load_modules 加载；此处显式 source 做兜底
-    # （幂等），确保 upgrade 钩子即使 load_modules 行为变更也始终可用。
+    info "Starting workspace data migration (must run before 'down')"
+    ensure_etcd_ready
     local _ws_module_file="${SCRIPT_DIR}/workspace-storage/module.sh"
-    if [ -f "${_ws_module_file}" ]; then
-        # shellcheck source=/dev/null
-        source "${_ws_module_file}"
+    [ -f "${_ws_module_file}" ] \
+        || error "workspace-storage module not found: ${_ws_module_file} (run this from the new package deploy dir)"
+    # shellcheck source=/dev/null
+    source "${_ws_module_file}"
+    declare -f workspace-storage-migrate >/dev/null 2>&1 \
+        || error "workspace-storage-migrate hook not found; refusing to continue without data migration"
+    workspace-storage-migrate || error "workspace data migration failed, aborting"
+    success "Workspace data migration completed"
+}
+
+# ===== 旧 MooseFS 拆旧（升级遗留；MODULES 不含 moosefs） =====
+# MODULES 已替换为 workspace-storage，标准 down/uninstall 不会处理旧 MooseFS。
+# 检测到即拆：down 停服务，uninstall 删 unit/清配置。
+_has_legacy_moosefs() {
+    [ -f "${SCRIPT_DIR}/moosefs/module.sh" ] || return 1
+    if systemctl list-unit-files 2>/dev/null | grep -q '^moosefs-' \
+        || mount 2>/dev/null | grep -q 'mfs#'; then
+        return 0
     fi
-    if declare -f workspace-storage-upgrade_migrate >/dev/null 2>&1; then
-        info "Phase 0 + Phase 1: Migration detection and data migration"
-        local migrate_output
-        # 迁移子进程失败必须中止 upgrade —— 误判"无需迁移"继续升级会丢数据
-        if ! migrate_output=$(workspace-storage-upgrade_migrate 2>&1); then
-            echo "${migrate_output}" >&2
-            error "workspace-storage migration failed, aborting upgrade (resolve the issue and re-run)"
-        fi
-        echo "${migrate_output}" >&2
+    return 1
+}
 
-        # 解析 stdout 协议行（子进程变量无法回传，约定文本协议）
-        local line
-        while IFS= read -r line; do
-            case "${line}" in
-                WORKSPACE_MIGRATION_NEEDED=*)
-                    migration_needed="${line#WORKSPACE_MIGRATION_NEEDED=}"
-                    ;;
-                WORKSPACE_NODE_IPS_FILE=*)
-                    node_ips_file="${line#WORKSPACE_NODE_IPS_FILE=}"
-                    ;;
-                WORKSPACE_PENDING_NODES=*)
-                    # 集群中未完成迁移的节点数（MooseFS master 屏障用）。
-                    # 协议异常（非数字）不得静默按 0 放行 —— 那会让 master
-                    # 屏障失效；此处仅记录合法性，由 Phase 2.0 决定是否中止
-                    pending_nodes="${line#WORKSPACE_PENDING_NODES=}"
-                    case "${pending_nodes}" in
-                        ''|*[!0-9]*) pending_nodes_valid="no" ;;
-                        *) pending_nodes_valid="yes" ;;
-                    esac
-                    ;;
-            esac
-        done <<< "${migrate_output}"
-
-        # 协议行缺失视为协议错误，中止（默认值 no 会导致误判"无需迁移"）
-        if [ "${migration_needed}" != "yes" ] && [ "${migration_needed}" != "no" ]; then
-            error "Migration protocol error: no WORKSPACE_MIGRATION_NEEDED in hook output, aborting upgrade"
-        fi
-
-        if [ "${migration_needed}" = "yes" ]; then
-            success "Data migration completed"
-        else
-            info "No migration needed, proceeding with standard upgrade"
-        fi
-    else
-        # 迁移钩子缺失绝不能静默跳过 —— upgrade 随后会拆掉旧存储，
-        # 未迁移的数据将永久丢失。缺钩子说明部署树异常，必须中止
-        error "workspace-storage-upgrade_migrate hook not found (is deploy/workspace-storage/module.sh present?); refusing to tear down old storage without migration"
+_teardown_legacy_moosefs() {
+    local phase="$1"   # down / uninstall
+    if ! _has_legacy_moosefs; then
+        info "No legacy MooseFS detected, skipping"
+        return 0
     fi
-
-    # ===== Phase 2: 拆旧（标准流程） =====
-    echo ""
-    info "Phase 2: Teardown (old moosefs + down → uninstall → deinit)"
-
-    # Phase 2.0: 拆除旧 MooseFS（MODULES 已不含 moosefs，标准 down 不会停它）。
-    # 检测: moosefs 模块目录存在，且本机有 moosefs 服务/挂载残留。
-    local _mfs_module_file="${SCRIPT_DIR}/moosefs/module.sh"
-    local _mfs_present="no"
-    if [ -f "${_mfs_module_file}" ]; then
-        if systemctl list-unit-files 2>/dev/null | grep -q '^moosefs-' \
-            || mount 2>/dev/null | grep -q 'mfs#'; then
-            _mfs_present="yes"
-        fi
-    fi
-    if [ "${_mfs_present}" = "yes" ]; then
-        # MooseFS master 屏障: 本机承载 moosefs-master 时，若集群还有未完成
-        # workspace 迁移的节点，此刻拆除 master 会让其余节点的 mfsmount 全部
-        # stale，其 Phase 1 读到空目录仅 warning 仍报"迁移完成"→ 数据丢失。
-        # 约束: 承载 master 的节点必须最后 upgrade。
-        # 判定本机是否承载 MooseFS master（决定能否安全拆旧）。
-        # 不能只看 systemd：非 systemd 部署下 unit 不存在，屏障会静默失效，
-        # 从而在其余节点尚未迁移时拆掉 master 导致数据丢失。故补充进程探测兜底
-        local _mfs_master_running="no"
-        if systemctl is-active --quiet moosefs-master 2>/dev/null; then
-            _mfs_master_running="yes"
-        elif command -v pgrep >/dev/null 2>&1 && pgrep -x mfsmaster >/dev/null 2>&1; then
-            _mfs_master_running="yes"
-        fi
-        if [ "${_mfs_master_running}" = "yes" ]; then
-            # 无法确定 pending 节点数时不得放行：拆掉 master 会让其余节点的
-            # mfsmount 全部 stale，其 Phase 1 可能读到空目录而误判迁移完成
-            if [ "${pending_nodes_valid}" != "yes" ]; then
-                error "Cannot determine pending-node count (migration protocol anomaly); refusing to tear down moosefs-master. Re-run upgrade on the other nodes first, then re-run here"
-            fi
-            if [ "${pending_nodes}" -gt 0 ]; then
-                error "This node runs moosefs-master but ${pending_nodes} node(s) have not completed workspace migration; upgrade this node LAST (run upgrade on the other nodes first, then re-run here)"
-            fi
-            info "Master barrier check passed: all nodes completed workspace migration"
-        fi
-        info "Phase 2.0: Tearing down legacy MooseFS (detected on this node)"
-        # shellcheck source=/dev/null
-        source "${_mfs_module_file}"
+    info "Detected legacy MooseFS, tearing down (${phase})"
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/moosefs/module.sh"
+    if [ "${phase}" = "down" ]; then
         moosefs_down 2>&1 || warning "moosefs_down reported errors, continuing"
-        moosefs_uninstall 2>&1 || warning "moosefs_uninstall reported errors, continuing"
-        success "Legacy MooseFS torn down"
     else
-        info "Phase 2.0: No legacy MooseFS detected, skipping"
+        moosefs_uninstall 2>&1 || warning "moosefs_uninstall reported errors, continuing"
     fi
-
-    deploy_down
-    # upgrade 期间容忍 uninstall 单模块失败：记录后继续 Phase 3，
-    # 避免拆旧后被 _print_summary 的 error(exit 1) 硬中断而留下半拆状态
-    AGENTOS_DEFER_UNINSTALL_FAIL="yes"
-    deploy_uninstall
-    AGENTOS_DEFER_UNINSTALL_FAIL="no"
-    deploy_deinit
-
-    # ===== Phase 3: 装新（标准流程） =====
-    echo ""
-    info "Phase 3: Install new (install → init → write etcd → up)"
-    deploy_install
-    deploy_init
-
-    # Phase 3.3: 写 etcd 归属记录（幂等：HRW 确定性 + 已有一致记录自动跳过）
-    # 必须无条件执行，不能仅限 migration_needed=yes：
-    #   master 节点首次 upgrade 在 Phase 2.0 屏障中止，此时 Phase 1 已完成迁移并写入
-    #   marker，但归属记录要到 Phase 3.3 才写；按设计重跑时 marker 命中 →
-    #   migration_needed=no，若跳过 write_etcd，本机已迁移用户的归属记录将永远缺失，
-    #   program_map 查无记录输出空 → autofs ENOENT → 工作区不可访问。
-    #   对"upgrade 前已是 NFS+autofs"的部署同样安全：write_etcd 无 node_ips_file
-    #   时回退 etcd discovery 且只补缺失记录、不覆盖已有记录（discovery 集合在
-    #   upgrade 期间不稳定，覆盖可能因 HRW 漂移把记录改指向错误节点）。
-    if declare -f workspace-storage-upgrade_write_etcd >/dev/null 2>&1; then
-        info "Phase 3.3: Writing etcd ownership records (idempotent)"
-        if [ -n "${node_ips_file}" ]; then
-            export WORKSPACE_NODE_IPS_FILE="${node_ips_file}"
-        fi
-        workspace-storage-upgrade_write_etcd 2>&1 \
-            || warning "write_etcd reported errors; re-run 'upgrade' to retry (idempotent)"
-    fi
-
-    # Phase 3.4: up
-    deploy_up
-
-    echo ""
-    if [ "${UPGRADE_HAD_FAILURE}" = "yes" ]; then
-        error "Upgrade finished with errors: some modules failed to uninstall (see above). New version is installed and services are running, but please re-run 'upgrade' to retry (idempotent)"
-    fi
-    success "Upgrade completed!"
 }
 
 # ===== status: 一键查询各组件状态（只读探测，不启停服务） =====
@@ -746,13 +623,7 @@ _print_summary() {
     local cmd="$1"
     echo ""
     if [ "${cmd}" = "uninstall" ] && [ "${#HOOK_FAILED_MODULES[@]}" -gt 0 ]; then
-        if [ "${AGENTOS_DEFER_UNINSTALL_FAIL}" = "yes" ]; then
-            # upgrade 流程：卸载瑕疵不立即中断，记录后由 deploy_upgrade 末尾统一非 0 退出
-            error_noexit "Full ${cmd} FAILED (modules: ${HOOK_FAILED_MODULES[*]:-})"
-            UPGRADE_HAD_FAILURE="yes"
-        else
-            error "Full ${cmd} FAILED (modules: ${HOOK_FAILED_MODULES[*]:-})"
-        fi
+        error "Full ${cmd} FAILED (modules: ${HOOK_FAILED_MODULES[*]:-})"
     else
         success "Full ${cmd} completed!"
     fi
@@ -796,9 +667,9 @@ Commands (Required):
               卸载前建议先 export PATH=<python3.11 的 bin 目录>:$PATH
   status      查询全部组件运行状态（只读探测，不启停服务；含 etcd + MODULES）
   restart     重启全部应用组件（先 down 再 up；不含 init/deinit）
-  upgrade     一键升级（含数据迁移）
-              检测 etcd 是否已有 workspace 归属记录，无则自动迁移用户数据
-              内部执行: 迁移 → down → uninstall → deinit → install → init → 写 etcd → up
+  migrate     数据迁移（须先于 down 执行，且必须在新安装包目录中执行）
+              从 config.yaml 的 cluster_nodes 取节点 → HRW 归属 → rsync 本节点归属用户
+              → 写 etcd 归属记录（一次完成，幂等可重跑）
   create-user <username> [--force]
               在 /home/agentos/users/<username> 下创建用户家目录并初始化 .jiuwenswarm
               - 创建家目录（0700）和 workspace（0700）
@@ -896,12 +767,13 @@ Examples:
   AGENTOS_SWARM_TEMPLATE_DIR=/opt/jiuwenswarm_template \
   ./agentos.sh create-user bob
 
-  # 12. 一键升级（含数据迁移）
-  # 下载新安装包并解压后，执行新脚本的 upgrade 命令
-  ./agentos.sh upgrade
+  # 12. 数据迁移（升级工作流第 1 步）
+  # 下载新安装包并解压后，在新包目录中执行（旧集群仍在运行、旧存储可读、etcd 可用）
+  ./agentos.sh migrate
+  # 随后依次执行: down → uninstall → install → init → up
 
-  # 指定本机 IP 升级（多网卡环境）
-  ./agentos.sh --ip 192.168.1.1 upgrade
+  # 指定本机 IP 迁移（多网卡环境）
+  ./agentos.sh --ip 192.168.1.1 migrate
 
 扩展模块:
   新增组件只需两步:
@@ -915,7 +787,7 @@ Examples:
   - down 不停 etcd，etcd 作为持久基础设施；拆 etcd 用 deinit（保留数据），彻底清数据用 ./etcd.sh clean
   - init/deinit 委托 deploy/etcd.sh，etcd 逻辑只在 etcd.sh 一处维护
   - gateway 依赖 jiuwenswarm 部署后产生的 FUNCTION_ID/FRONTEND_PORT，同一进程内自动传递
-  - upgrade 自动检测是否需要数据迁移（查 etcd 是否有 workspace 归属记录），无需手动干预
+  - migrate 须使用新安装包里的脚本执行（旧包无此命令），且须先于 down 执行；幂等可重跑
 EOF
     exit 0
 }
@@ -930,9 +802,9 @@ main() {
         create-user)
             # create-user 不依赖任何部署模块，无需 load_modules
             deploy_create_user ;;
-        upgrade)
+        migrate)
             load_modules
-            deploy_upgrade ;;
+            deploy_migrate ;;
         *)
             load_modules
             case "${CMD}" in

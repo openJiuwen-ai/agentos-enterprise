@@ -13,6 +13,7 @@ set -euo >/dev/null 2>&1
 #   ./deploy.sh restart
 #   ./deploy.sh uninstall
 #   ./deploy.sh status
+#   ./deploy.sh migrate --ip 192.168.1.1
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -789,33 +790,6 @@ _ws_etcd_get() {
         get "${key}" --print-value-only 2>/dev/null
 }
 
-# 封装 etcdctl get --prefix: 以 json 输出并解码为 key 列表（每行一个 key）
-# 不再用文本输出的"每两行一组（key+value）"解析 —— value 含多行时必然错位
-_ws_etcd_list_keys() {
-    local prefix="$1"
-    local etcdctl endpoints tls_params python_bin
-    etcdctl=$(_ws_find_etcdctl) || return 1
-    endpoints=$(_ws_etcd_endpoints) || return 1
-    tls_params=$(_ws_etcd_tls_params)
-    python_bin=$(command -v "python${YR_PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || echo python3)
-
-    local json
-    json=$(LD_LIBRARY_PATH="${ETCD_LD_PATH:-}" ETCDCTL_API=3 \
-        timeout 10 "${etcdctl}" ${tls_params} \
-        --endpoints "${endpoints}" \
-        get "${prefix}" --prefix --write-out=json 2>/dev/null) || return 1
-
-    echo "${json}" | "${python_bin}" -c '
-import base64, json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-for kv in d.get("kvs") or []:
-    print(base64.b64decode(kv.get("key", "")).decode("utf-8", "replace"))
-'
-}
-
 # 封装 etcdctl put（endpoints 已含 scheme，TLS 时附加证书参数）
 _ws_etcd_put() {
     local key="$1"
@@ -877,63 +851,24 @@ print(best_ip)
 " "${user}" "${node_ips[@]}"
 }
 
-# ===== 从 etcd discovery 获取全部节点 IP 列表 =====
-# agent 节点通过 datasystem 在 etcd 注册，key 格式: /datasystem/cluster/[ip:port]
-# 也可以从 /sn/instance/ 等业务 key 提取节点 IP
-# 这里优先从 /datasystem/ 前缀提取，回退到 config.yaml 的 etcd_nodes + master_nodes
-_ws_get_node_ips_from_etcd() {
-    local keys ips_found
-    keys=$(_ws_etcd_list_keys "/datasystem/") || true
-
-    if [ -n "${keys}" ]; then
-        # datasystem key 格式: /datasystem/cluster/[ip:port]
-        # _ws_etcd_list_keys 已输出解码后的 key 列表（每行一个），直接提取 IP
-        ips_found=$(echo "${keys}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | cut -d: -f1 | sort -u)
-        if [ -n "${ips_found}" ]; then
-            echo "${ips_found}"
-            return 0
-        fi
-    fi
-
-    # 回退: 从 config.yaml 的 etcd_nodes 获取
+# ===== 从 config.yaml 的 cluster_nodes 获取集群全部节点 IP =====
+# cluster_nodes 代表整个集群的节点信息（HRW 归属计算的候选集）。
+# 显式读取部署目录内的 config.yaml（deploy/config.yaml），保证迁移使用新安装包的拓扑配置。
+_ws_get_cluster_nodes() {
     local config_py="${SCRIPT_DIR}/../scripts/config.py"
+    local ws_config="${SCRIPT_DIR}/../config.yaml"
     local python_bin
     python_bin=$(command -v "python${YR_PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || echo python3)
-    if [ -f "${config_py}" ]; then
-        local nodes
-        if [ -n "${BIND_IP:-}" ]; then
-            nodes=$("${python_bin}" "${config_py}" --ip "${BIND_IP}" etcd-nodes 2>/dev/null || true)
-        else
-            nodes=$("${python_bin}" "${config_py}" etcd-nodes 2>/dev/null || true)
-        fi
-        if [ -n "${nodes}" ]; then
-            echo "${nodes}" | tr ' ' '\n' | sort -u
-            return 0
-        fi
+    [ -f "${config_py}" ] || return 1
+    [ -f "${ws_config}" ] || return 1
+    local nodes
+    if [ -n "${BIND_IP:-}" ]; then
+        nodes=$("${python_bin}" "${config_py}" --config "${ws_config}" --ip "${BIND_IP}" cluster-nodes 2>/dev/null || true)
+    else
+        nodes=$("${python_bin}" "${config_py}" --config "${ws_config}" cluster-nodes 2>/dev/null || true)
     fi
-
-    return 1
-}
-
-# ===== 节点级迁移标记（多节点串行 upgrade 的 Phase 0 判定 + master 屏障） =====
-# 标记 key: ${WORKSPACE_ETCD_PREFIX}/_meta/migrated/<ip>
-# 注意: _meta 含 "/"，autofs program_map 的 key 白名单会拒绝含 "/" 的 key，
-# 故不会被误当作用户名查询；write_etcd 遍历的是本地目录而非 etcd，亦无冲突。
-
-# 写节点级迁移标记（幂等）；成功返回 0
-_ws_write_migrated_marker() {
-    local ip="$1"
-    _ws_etcd_put "${WORKSPACE_ETCD_PREFIX}/_meta/migrated/${ip}" \
-        "$(date +%s 2>/dev/null || echo unknown)" >/dev/null 2>&1
-}
-
-# 写节点级"已禁用"标记（幂等）；成功返回 0
-# 与 migrated 标记区分: 禁用节点未真正迁移数据，日后重新启用仍需要迁移，
-# 故不能用 migrated 标记（否则重新启用会被误判"已迁移"→ 静默不可访问）
-_ws_write_disabled_marker() {
-    local ip="$1"
-    _ws_etcd_put "${WORKSPACE_ETCD_PREFIX}/_meta/disabled/${ip}" \
-        "$(date +%s 2>/dev/null || echo unknown)" >/dev/null 2>&1
+    [ -n "${nodes}" ] || return 1
+    echo "${nodes}" | tr ' ' '\n' | sort -u
 }
 
 # 判断迁移源目录是否为健康的挂载点（旧 MooseFS 存储挂载点）。
@@ -952,124 +887,40 @@ _ws_is_source_mounted() {
     return 1
 }
 
-# 计算集群中未完成迁移标记的节点数（供 agentos.sh Phase 2.0 master 屏障）
-# 输入: 空格分隔的节点 IP 列表；输出: 未迁移节点数
-# 判据: 同时查 migrated 与 disabled 两个标记，二者皆无才算"未处理"（pending）。
-#   禁用节点只写 disabled（不写 migrated），故不会被误计为 pending 卡死 master 屏障；
-#   日后重新启用时 migrated 仍为空，仍会正常执行迁移。
-# 注意: etcd 查询失败（不可达/超时）与"确实无标记"语义不同 —— 前者若按空值
-# 计入 pending 会高估并让 master 屏障永久拦截，故查询失败即 error 中止计数。
-#   本函数经 "$(...)" 在调用方子 shell 中执行，error 只终止子 shell（不终止父
-#   upgrade），输出因此变为非数字 → agentos.sh 判为协议异常 → master 节点拒绝
-#   拆旧（安全）；非 master 节点不受影响，可继续。
-_ws_count_pending_nodes() {
-    local ips="$1"
-    local pending=0 ip mval dval rc
-    for ip in ${ips}; do
-        mval=""
-        rc=0
-        mval=$(_ws_etcd_get "${WORKSPACE_ETCD_PREFIX}/_meta/migrated/${ip}") || rc=$?
-        if [ "${rc}" -ne 0 ]; then
-            error "Failed to query migration marker for node ${ip} from etcd (etcd unreachable?); cannot compute pending-node count safely"
-        fi
-        dval=""
-        rc=0
-        dval=$(_ws_etcd_get "${WORKSPACE_ETCD_PREFIX}/_meta/disabled/${ip}") || rc=$?
-        if [ "${rc}" -ne 0 ]; then
-            error "Failed to query disabled marker for node ${ip} from etcd (etcd unreachable?); cannot compute pending-node count safely"
-        fi
-        if [ -z "${mval}" ] && [ -z "${dval}" ]; then
-            pending=$((pending + 1))
-        fi
-    done
-    echo "${pending}"
-}
+# ===== 数据迁移（须先于 down 执行；须在新安装包目录中执行） =====
+# 1. 从 config.yaml 的 cluster_nodes 取集群全部节点（HRW 候选集）
+# 2. 列出 ${WORKSPACE_ACCESS_ROOT} 下的用户目录（旧 MooseFS 挂载或本地目录）
+# 3. HRW 计算每个用户的归属节点，rsync 本机归属用户 → ${WORKSPACE_STORAGE_ROOT}
+# 4. 写 etcd 归属记录
+deploy_ws_migrate() {
+    info "Checking workspace data migration..."
 
-# ===== Phase 0 + Phase 1: 检测 + 数据迁移 =====
-deploy_ws_upgrade_migrate() {
-    info "Checking if workspace migration is needed..."
-
-    # WORKSPACE_STORAGE_ENABLED=no: 本节点不使用 workspace 存储，与 install/up/
-    # down/uninstall/status 的跳过语义保持一致 —— 不执行任何数据搬迁，也不写归属记录。
-    # 但必须写入"已禁用"标记（disabled，而非 migrated）：否则 _ws_count_pending_nodes
-    # 会把它永久计为"未迁移"，使承载 moosefs-master 的节点被 master 屏障永久拦截
-    # （既拆不了也升级不了）。用 disabled 而非 migrated 是因为禁用节点并未真正迁移数据，
-    # 日后重新启用时 migrated 仍应为空，才会正常触发迁移，避免被误判"已迁移"→ 静默不可访问。
-    # 标记仅表示"本节点当前无需迁移"，不含任何用户归属信息，不会污染归属记录。
+    # WORKSPACE_STORAGE_ENABLED=no: 本节点不使用 workspace 存储，无数据可迁移，
+    # 也不写归属记录（与 install/up/down/uninstall/status 的跳过语义一致）
     if _ws_should_skip; then
         info "Workspace storage disabled (WORKSPACE_STORAGE_ENABLED=no), skipping data migration"
-        local self_ip_disabled
-        self_ip_disabled=$(get_local_ip)
-        if ! _ws_write_disabled_marker "${self_ip_disabled}"; then
-            error "Failed to write disabled marker for node ${self_ip_disabled} (etcd unavailable?); cannot safely continue upgrade"
-        fi
-        # 上报真实 pending 而非硬编码 0：硬编码 0 会让"禁用节点恰好承载 moosefs-master"
-        # 时误放行屏障，拆掉 master 后其余未迁移节点的数据永久丢失
-        local node_ips_disabled
-        node_ips_disabled=$(_ws_get_node_ips_from_etcd 2>/dev/null || true)
-        [ -n "${node_ips_disabled}" ] || node_ips_disabled="${self_ip_disabled}"
-        echo "WORKSPACE_MIGRATION_NEEDED=no"
-        echo "WORKSPACE_PENDING_NODES=$(_ws_count_pending_nodes "${node_ips_disabled}")"
         return 0
     fi
 
-    # Phase 0: 节点级迁移判定
-    # 多节点串行 upgrade 时归属记录（${PREFIX}/<user>）是集群全局的：节点 A 先升级
-    # 写入后，节点 B 若只看"prefix 下有无 key"会误判"已迁移"而跳过自己的用户 →
-    # B 上数据丢失。故以节点级标记为准: ${WORKSPACE_ETCD_PREFIX}/_meta/migrated/<ip>
-    # etcd 查询失败时中止 —— 无法安全判断是否需要迁移，宁可中止不可误判
     local self_ip
     self_ip=$(get_local_ip)
-    local marker_key="${WORKSPACE_ETCD_PREFIX}/_meta/migrated/${self_ip}"
 
-    local marker_val
-    if ! marker_val=$(_ws_etcd_get "${marker_key}"); then
-        error "Failed to query etcd for migration marker; is etcd running?"
-    fi
-
-    if [ -n "${marker_val}" ]; then
-        info "This node (${self_ip}) already migrated (marker found), skipping migration"
-        # 本机已迁移，仍计算集群 pending（未迁移节点数）供 agentos.sh Phase 2.0
-        # 的 MooseFS master 屏障使用
-        local node_ips_pending
-        node_ips_pending=$(_ws_get_node_ips_from_etcd 2>/dev/null || get_local_ip)
-        echo "WORKSPACE_MIGRATION_NEEDED=no"
-        echo "WORKSPACE_PENDING_NODES=$(_ws_count_pending_nodes "${node_ips_pending}")"
-        return 0
-    fi
-
-    # 本机未迁移: 无论 prefix 下是否已有其他节点写的归属记录，都执行本机迁移
-    # （rsync 幂等、重跑安全 —— 覆盖"集群 upgrade 中途中断后续跑"场景）
-    local existing
-    if existing=$(_ws_etcd_list_keys "${WORKSPACE_ETCD_PREFIX}/" 2>/dev/null) && [ -n "${existing}" ]; then
-        info "Ownership records from other nodes found (cluster upgrade in progress), continuing this node's migration"
-    else
-        info "No workspace etcd records found, migration needed"
-    fi
-
-    # Phase 1: 数据迁移
-    info "Starting data migration..."
-
-    # 1.1 获取全部节点 IP 列表
-    info "Fetching node IP list from etcd discovery..."
+    # 1. 获取集群全部节点 IP（来自 config.yaml 的 cluster_nodes）
+    info "Fetching cluster node list from config.yaml (cluster_nodes)..."
     local node_ips
-    node_ips=$(_ws_get_node_ips_from_etcd) || {
-        warning "Failed to get node IPs from etcd, falling back to local IP only"
-        node_ips=$(get_local_ip)
-    }
-
+    node_ips=$(_ws_get_cluster_nodes) \
+        || error "Failed to read cluster_nodes from config.yaml (${SCRIPT_DIR}/../config.yaml); cannot compute workspace ownership"
     if [ -z "${node_ips}" ]; then
-        node_ips=$(get_local_ip)
-        warning "Empty node IP list, using local IP only: ${node_ips}"
+        error "Empty cluster_nodes in config.yaml; aborting migration"
     fi
 
-    info "Node IPs: ${node_ips}"
+    info "Cluster nodes: ${node_ips}"
 
     # self_ip 必须属于 node_ips: HRW 只在 node_ips 内选属主，若本机 IP 不在列表
-    # （多网卡时 get_local_ip 选中未在 etcd 注册的网卡，或本节点注册缺失），所有
-    # 用户都会落入 "not local" 分支 → 本机一个用户都不会被迁移，却仍会写 migrated
-    # 标记 → 拆旧后本机数据永久丢失。宁可中止（用 BIND_IP 指到已注册 IP 后重跑，
-    # 迁移幂等安全）
+    # （多网卡时 get_local_ip 选中未在 cluster_nodes 配置的网卡），所有用户都会
+    # 落入 "not local" 分支 → 本机一个用户都不会被迁移，归属记录却仍会写入 →
+    # 拆旧后本机数据永久丢失。宁可中止（用 BIND_IP 指到 cluster_nodes 中的 IP 后
+    # 重跑，迁移幂等安全）
     local _self_in_list="no" _nip
     for _nip in ${node_ips}; do
         if [ "${_nip}" = "${self_ip}" ]; then
@@ -1078,15 +929,10 @@ deploy_ws_upgrade_migrate() {
         fi
     done
     if [ "${_self_in_list}" != "yes" ]; then
-        error "Local IP ${self_ip} is not in the discovered node list [${node_ips}]: HRW would assign no user to this node, migration would be silently skipped while a 'migrated' marker is still written. Set BIND_IP to the registered node IP (or fix node registration in etcd) and re-run upgrade (migration is idempotent)"
+        error "Local IP ${self_ip} is not in cluster_nodes [${node_ips}]: HRW would assign no user to this node, migration would be silently skipped while ownership records are still written. Set BIND_IP to an IP in cluster_nodes (or fix cluster_nodes in config.yaml) and re-run migrate (migration is idempotent)"
     fi
 
-    # 保存节点 IP 列表到临时文件，供 Phase 3 使用
-    local node_ips_file
-    node_ips_file=$(mktemp /tmp/workspace_node_ips.XXXXXX)
-    echo "${node_ips}" > "${node_ips_file}"
-
-    # 1.2 列出 /home/agentos/users/ 下所有用户目录
+    # 2. 列出 ${WORKSPACE_ACCESS_ROOT} 下所有用户目录
     local users_dir="${WORKSPACE_ACCESS_ROOT}"
 
     # 源挂载健康状态（只判定一次；提前到"目录缺失/为空"判定之前）: 挂载点存在时
@@ -1098,60 +944,38 @@ deploy_ws_upgrade_migrate() {
         source_mounted="yes"
     fi
 
+    local users=()
+    local entry
     if [ ! -d "${users_dir}" ]; then
         warning "Users directory not found: ${users_dir}, nothing to migrate"
         # 目录整体不存在（非"挂载点存在但读空"）：本机没有 workspace 旧数据访问路径
-        # （例如本节点未部署旧存储，auto 模式下的自动跳过），无数据可丢，故仍写标记。
+        # （例如本节点未部署旧存储，auto 模式下的自动跳过），无数据可丢。
         # 与之相对，目录存在却为空 + 未检测到挂载 → 见下方，属挂载失效，必须中止
         if [ "${source_mounted}" != "yes" ]; then
-            warning "No source mount detected at ${users_dir} either; treating this node as having no workspace data (if this node does hold old workspace data, fix the mount and re-run upgrade before tearing down the old storage)"
+            warning "No source mount detected at ${users_dir} either; treating this node as having no workspace data (if this node does hold old workspace data, fix the mount and re-run migrate before tearing down the old storage)"
         fi
-        # 无数据可迁也写标记: 本机迁移即告完成，避免重跑与 master 屏障误判
-        if ! _ws_write_migrated_marker "${self_ip}"; then
-            error "Failed to write migration marker to etcd (nothing to migrate; re-run is safe)"
+    else
+        # ls 退出码必须显式捕获: 旧存储是网络挂载（MooseFS/NFS），挂载点仍在
+        # /proc/mounts（_ws_is_source_mounted 判为健康）但 stale/IO 错误时，ls 非零且
+        # 无输出 —— 与"目录确实为空"结果完全相同。若按空处理会写归属记录 →
+        # 拆旧后数据永久丢失。故 rc≠0 一律中止（重跑幂等安全）
+        local users_ls_rc=0
+        local users_ls_out=""
+        users_ls_out=$(ls -1 "${users_dir}" 2>/dev/null) || users_ls_rc=$?
+        if [ "${users_ls_rc}" -ne 0 ]; then
+            error "Failed to list user directories under ${users_dir} (ls rc=${users_ls_rc}; stale network mount or I/O error?); aborting migrate to avoid writing ownership records while old data may still be present but unreadable (fix the mount and re-run; migration is idempotent)"
         fi
-        echo "WORKSPACE_MIGRATION_NEEDED=no"
-        echo "WORKSPACE_PENDING_NODES=$(_ws_count_pending_nodes "${node_ips}")"
-        rm -f "${node_ips_file}"
-        return 0
+        while IFS= read -r entry; do
+            [ -n "${entry}" ] && users+=("${entry}")
+        done <<< "${users_ls_out}"
+
+        # 空目录 + 源挂载不可见 = 极可能挂载失效（数据仍在旧存储但读不到）→ 中止
+        if [ "${#users[@]}" -eq 0 ] && [ "${source_mounted}" != "yes" ]; then
+            error "No user directory found under ${users_dir} while no source mount is detected (mount failed?); aborting migrate (fix the mount and re-run; migration is idempotent)"
+        fi
     fi
 
-    local users=()
-    local entry
-    # ls 退出码必须显式捕获: 旧存储是网络挂载（MooseFS/NFS），挂载点仍在
-    # /proc/mounts（_ws_is_source_mounted 判为健康）但 stale/IO 错误时，ls 非零且
-    # 无输出 —— 与"目录确实为空"结果完全相同。若按空处理会走"无用户目录"分支写
-    # migrated 标记 → 拆旧后数据永久丢失。故 rc≠0 一律中止（重跑幂等安全）
-    local users_ls_rc=0
-    local users_ls_out=""
-    users_ls_out=$(ls -1 "${users_dir}" 2>/dev/null) || users_ls_rc=$?
-    if [ "${users_ls_rc}" -ne 0 ]; then
-        error "Failed to list user directories under ${users_dir} (ls rc=${users_ls_rc}; stale network mount or I/O error?); aborting upgrade to avoid writing a 'migrated' marker while old data may still be present but unreadable (fix the mount and re-run; migration is idempotent)"
-    fi
-    while IFS= read -r entry; do
-        [ -n "${entry}" ] && users+=("${entry}")
-    done <<< "${users_ls_out}"
-
-    if [ "${#users[@]}" -eq 0 ]; then
-        # 空目录 + 源挂载不可见 = 极可能挂载失效（数据仍在旧存储但读不到），
-        # 此时写 migrated 标记会让该节点数据永久无法迁移 → 中止
-        if [ "${source_mounted}" != "yes" ]; then
-            error "No user directory found under ${users_dir} while no source mount is detected (mount failed?); aborting upgrade (fix the mount and re-run; migration is idempotent)"
-        fi
-        info "No user directories found under ${users_dir}, nothing to migrate"
-        if ! _ws_write_migrated_marker "${self_ip}"; then
-            error "Failed to write migration marker to etcd (nothing to migrate; re-run is safe)"
-        fi
-        echo "WORKSPACE_MIGRATION_NEEDED=no"
-        echo "WORKSPACE_PENDING_NODES=$(_ws_count_pending_nodes "${node_ips}")"
-        rm -f "${node_ips_file}"
-        return 0
-    fi
-
-    info "Found ${#users[@]} user(s): ${users[*]}"
-
-    # 1.3 + 1.4: HRW 计算归属 + rsync 本节点归属用户
-    # self_ip 已在 Phase 0 获取
+    # 3. HRW 计算归属 + rsync 本节点归属用户
     info "Local IP: ${self_ip}"
 
     local migrated=0
@@ -1169,14 +993,14 @@ deploy_ws_upgrade_migrate() {
         if [ "${owning_ip}" = "${self_ip}" ]; then
             # 空源 + rsync --delete 会清空已迁移的目标数据，故对空目录一律跳过 rsync。
             # 是否属于"挂载失效"由 source_mounted 判定：挂载健康时空目录是真实状态，
-            # 不得中止（否则本就空的用户目录会让升级永久阻塞）。
+            # 不得中止（否则本就空的用户目录会让迁移永久阻塞）。
             # 但 ls 退出码必须显式捕获：stale 网络挂载下 ls 非零且无输出，会被误判为
-            # "目录为空"而静默跳过该用户 → 最终仍写 migrated 标记 → 数据永久丢失
+            # "目录为空"而静默跳过该用户 → 归属记录仍会写入 → 数据永久丢失
             src_ls_rc=0
             src_ls_out=""
             src_ls_out=$(ls -A "${src_dir}" 2>/dev/null) || src_ls_rc=$?
             if [ "${src_ls_rc}" -ne 0 ]; then
-                error "Failed to list source directory ${src_dir} for user '${user}' (ls rc=${src_ls_rc}; stale network mount or I/O error?); aborting upgrade to avoid treating unreadable data as empty (fix the mount and re-run; migration is idempotent)"
+                error "Failed to list source directory ${src_dir} for user '${user}' (ls rc=${src_ls_rc}; stale network mount or I/O error?); aborting migrate to avoid treating unreadable data as empty (fix the mount and re-run; migration is idempotent)"
             fi
             if [ -z "${src_ls_out}" ]; then
                 if [ "${source_mounted}" = "yes" ]; then
@@ -1197,7 +1021,7 @@ deploy_ws_upgrade_migrate() {
             else
                 # rsync 失败必须中止: 继续会照常写归属记录并报"迁移完成"，
                 # 用户挂载后看到的将是不完整/空数据
-                error "Failed to migrate user '${user}' (rsync rc=${rsync_rc}), aborting upgrade (fix the issue and re-run; migration is idempotent)"
+                error "Failed to migrate user '${user}' (rsync rc=${rsync_rc}), aborting migrate (fix the issue and re-run; migration is idempotent)"
             fi
         else
             info "Skipping user '${user}' (owner: ${owning_ip}, not local)"
@@ -1206,49 +1030,27 @@ deploy_ws_upgrade_migrate() {
     done
 
     # 空源且源挂载不可见必须中止: 极可能是挂载失效导致读到空目录。若仅跳过并继续写
-    # marker，该用户会被永久判定"迁移完成"，旧存储拆除后再无机会迁移 → 数据丢失。
-    # migration 幂等，修好挂载后重跑 upgrade 安全
+    # 归属记录，该用户会被永久判定"迁移完成"，旧存储拆除后再无机会迁移 → 数据丢失。
+    # migration 幂等，修好挂载后重跑 migrate 安全
     if [ "${empty_source}" -gt 0 ]; then
-        error "Detected ${empty_source} user dir(s) with empty source under ${users_dir} while the source mount is not visible (likely mount failure); aborting upgrade (fix the mount and re-run; migration is idempotent)"
+        error "Detected ${empty_source} user dir(s) with empty source under ${users_dir} while the source mount is not visible (likely mount failure); aborting migrate (fix the mount and re-run; migration is idempotent)"
     fi
 
-    success "Migration complete: ${migrated} migrated, ${skipped} skipped (not local)"
-
-    # 写本机迁移标记（节点级）: 供多节点串行 upgrade 的 Phase 0 判定与 master 屏障。
-    # 写失败必须中止让用户感知 —— 数据已迁移，重跑 upgrade 幂等安全
-    if ! _ws_write_migrated_marker "${self_ip}"; then
-        error "Failed to write migration marker ${marker_key} (data migrated; re-run upgrade is safe and idempotent)"
+    if [ "${#users[@]}" -gt 0 ]; then
+        success "Migration complete: ${migrated} migrated, ${skipped} skipped (not local)"
     fi
-    success "Migration marker written for node ${self_ip}"
 
-    echo "WORKSPACE_MIGRATION_NEEDED=yes"
-    echo "WORKSPACE_NODE_IPS_FILE=${node_ips_file}"
-    echo "WORKSPACE_PENDING_NODES=$(_ws_count_pending_nodes "${node_ips}")"
+    # 4. 写 etcd 归属记录
+    _ws_write_ownership "${node_ips}" \
+        || error "Failed to write workspace etcd ownership records; re-run 'migrate' (idempotent)"
+
+    success "Workspace migration completed"
 }
 
-# ===== Phase 3.3: 写 etcd 归属记录 =====
-deploy_ws_upgrade_write_etcd() {
-    # 禁用时不写任何归属记录（与其它命令的跳过语义一致）
-    if _ws_should_skip; then
-        info "Workspace storage disabled (WORKSPACE_STORAGE_ENABLED=no), skipping ownership write"
-        return 0
-    fi
-
-    local node_ips_file="${WORKSPACE_NODE_IPS_FILE:-}"
-    local node_ips
-    local from_discovery="no"
-
-    if [ -n "${node_ips_file}" ] && [ -f "${node_ips_file}" ]; then
-        node_ips=$(cat "${node_ips_file}")
-    else
-        # 回退: 从 etcd discovery 获取
-        info "Node IPs file not found, fetching from etcd discovery..."
-        node_ips=$(_ws_get_node_ips_from_etcd) || {
-            warning "Failed to get node IPs, using local IP only"
-            node_ips=$(get_local_ip)
-        }
-        from_discovery="yes"
-    fi
+# ===== 写 etcd 归属记录（内部函数，由 deploy_ws_migrate 调用） =====
+# 输入: node_ips（空格/换行分隔的集群节点 IP 列表）
+_ws_write_ownership() {
+    local node_ips="$1"
 
     if [ -z "${node_ips}" ]; then
         error "Cannot determine node IP list for writing workspace ownership"
@@ -1295,34 +1097,23 @@ deploy_ws_upgrade_write_etcd() {
         # etcd 读失败必须与"确实无记录"区分开（前者 rc≠0 且无输出，后者 rc=0 且空）:
         # 若把读失败当成空值，下面"保留已有记录"的保护会失效，本函数会把一条因读取
         # 失败而看不见的、指向其他健康节点的记录改写为本机 → 客户端挂到可能陈旧的
-        # 副本。宁可中止（记录只是未写，重跑 upgrade 幂等安全）
+        # 副本。宁可中止（记录只是未写，重跑 migrate 幂等安全）
         existing_rc=0
         existing_ip=""
         existing_ip=$(_ws_etcd_get "${etcd_key}") || existing_rc=$?
         if [ "${existing_rc}" -ne 0 ]; then
-            error "Failed to read existing ownership record for '${user}' (${etcd_key}) from etcd (etcd unreachable?); refusing to continue to avoid overwriting a valid record (re-run upgrade after etcd recovers; idempotent)"
+            error "Failed to read existing ownership record for '${user}' (${etcd_key}) from etcd (etcd unreachable?); refusing to continue to avoid overwriting a valid record (re-run migrate after etcd recovers; idempotent)"
         fi
         if [ "${existing_ip}" = "${owning_ip}" ]; then
             up_to_date=$((up_to_date + 1))
             continue
         fi
 
-        # discovery 回退路径只补缺失记录，不覆盖已有记录：
-        # upgrade 期间 etcd discovery 集合不稳定（teardown 会清节点注册，
-        # up 后才重新注册），HRW 结果可能漂移；此时覆盖会把"数据实际在本机"
-        # 的记录改指向他机 → autofs 挂载导向错误 → ENOENT。已有记录的纠错
-        # 应由显式操作完成（frontend POST /workspace / 运维）。
-        if [ "${from_discovery}" = "yes" ] && [ -n "${existing_ip}" ]; then
-            info "  ${user} → keep existing ${existing_ip} (discovery fallback, not overwriting)"
-            kept=$((kept + 1))
-            continue
-        fi
-
         # 数据在本机（存储根枚举到）但 HRW 属主是他机：记录必须跟随数据的
         # 实际位置而非 HRW 期望位置 —— 若改指向属主，autofs 会去属主节点
         # 挂载不存在的数据（ENOENT），本机数据沦为孤儿且无人再迁移。保留
-        # 指向数据实际位置的记录后，属主节点后续 upgrade 时其 Phase 1 可经
-        # NFS 视图枚举到该用户并 rsync 拉取，其 Phase 3.3 写回自己，完成收敛。
+        # 指向数据实际位置的记录后，属主节点后续 migrate 时可经 NFS 视图
+        # 枚举到该用户并 rsync 拉取，写回自己，完成收敛。
         if [ "${owning_ip}" != "${self_ip}" ]; then
             local existing_in_list="no"
             local ip
@@ -1344,7 +1135,7 @@ deploy_ws_upgrade_write_etcd() {
                     warning "  Failed to write etcd record for ${user}"
                 fi
             fi
-            warning "  Placement mismatch for '${user}': HRW owner ${owning_ip} != data location ${self_ip}; re-run 'upgrade' on ${owning_ip} to rebalance"
+            warning "  Placement mismatch for '${user}': HRW owner ${owning_ip} != data location ${self_ip}; re-run 'migrate' on ${owning_ip} to rebalance"
             continue
         fi
 
@@ -1364,12 +1155,7 @@ deploy_ws_upgrade_write_etcd() {
         warning "Etcd ownership records incomplete: ${written} written, ${up_to_date} up-to-date, ${kept} kept, expected ${#users[@]}"
     fi
 
-    # 清理临时文件
-    if [ -n "${node_ips_file}" ] && [ -f "${node_ips_file}" ]; then
-        rm -f "${node_ips_file}"
-    fi
-
-    # 部分失败返回非零（调用方 agentos.sh 定位为 optional，会 warning 但不中止 upgrade）
+    # 部分失败返回非零（调用方 deploy_ws_migrate 会 error 中止）
     [ $((written + up_to_date + kept)) -eq "${#users[@]}" ] || return 1
 }
 
@@ -1379,7 +1165,7 @@ parse_args() {
     local args=("$@")
     while [ $i -lt ${#args[@]} ]; do
         case "${args[$i]}" in
-            up|down|restart|install|uninstall|status|upgrade_migrate|upgrade_write_etcd)
+            up|down|restart|install|uninstall|status|migrate)
                 CMD="${args[$i]}"
                 i=$((i+1))
                 ;;
@@ -1397,7 +1183,7 @@ parse_args() {
     done
 
     if [ -z "${CMD:-}" ]; then
-        error "Command not specified! Use 'install', 'up', 'down', 'restart', 'uninstall', 'status', 'upgrade_migrate' or 'upgrade_write_etcd'"
+        error "Command not specified! Use 'install', 'up', 'down', 'restart', 'uninstall', 'status' or 'migrate'"
         exit 1
     fi
 
@@ -1423,6 +1209,8 @@ Commands (Required):
   restart   重启所有服务
   uninstall 停止服务 + 清理配置（不卸载软件包，可重新 install 还原）
   status    显示服务和挂载状态
+  migrate   数据迁移: 从 config.yaml 的 cluster_nodes 取节点 → HRW 归属 →
+            rsync 本节点归属用户 → 写 etcd 归属记录（须先于 down 执行，幂等可重跑）
 
 Options:
   --ip IP            指定本机使用的 IP 地址（多网卡环境必用）。
@@ -1467,17 +1255,7 @@ EOF
 main() {
     _ws_load_config
     parse_args "$@"
-    case "${CMD}" in
-        upgrade_migrate)
-            deploy_ws_upgrade_migrate
-            ;;
-        upgrade_write_etcd)
-            deploy_ws_upgrade_write_etcd
-            ;;
-        *)
-            deploy_ws_${CMD}
-            ;;
-    esac
+    deploy_ws_${CMD}
 }
 
 main "$@"
