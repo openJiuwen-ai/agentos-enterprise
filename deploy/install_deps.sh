@@ -8,13 +8,15 @@ set -euo pipefail
 # 支持 openEuler 22.03/24.03 和 Ubuntu 22.04/24.04（x86_64 / aarch64）
 # 安装内容:
 #   1. 系统包: python3.11、iproute/iproute2 (ip)、iptables、curl、fuse3、bwrap、jq、
-#              NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server)、autofs
+#              NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server)、autofs、
+#              Conch 沙箱依赖（virtiofsd/qemu/erofs-utils 等，随 OS 版本不同）
 #   2. MooseFS: moosefs-master、moosefs-chunkserver、moosefs-client
 #   3. Python 依赖: deploy/requirements.txt
 #
 # 用法:
 #   ./install_deps.sh                  # 安装全部依赖
 #   ./install_deps.sh --skip-system    # 跳过系统包
+#   ./install_deps.sh --skip-conch-deps # 跳过 Conch 沙箱依赖
 #   ./install_deps.sh --skip-moosefs  # 跳过 MooseFS
 #   ./install_deps.sh --skip-python   # 跳过 Python 依赖
 #
@@ -31,6 +33,7 @@ REQUIREMENTS_FILE="${SCRIPT_DIR}/requirements.txt"
 
 # ===== 开关 =====
 SKIP_SYSTEM=0
+SKIP_CONCH_DEPS=0
 SKIP_MOOSEFS=0
 SKIP_PYTHON=0
 
@@ -185,6 +188,37 @@ install_system_openeuler() {
         dnf install -y --disablerepo=moosefs "${pkgs[@]}" || error "Failed to install system packages via dnf"
     }
 
+    # Conch 沙箱模块的系统依赖（openEuler 各版本包名有差异）
+    # 24.03: 源内直接提供 virtiofsd 包
+    # 22.03: 源内无独立 virtiofsd 包，安装 qemu（其携带 /usr/libexec/virtiofsd 文件，
+    #        部署包内 virtiofsd RPM 安装时会以 --replacefiles 覆盖，见 conch/conch_deploy.sh）
+    if [ "${SKIP_CONCH_DEPS}" -eq 1 ]; then
+        info "Skipping Conch dependencies installation"
+    else
+        local conch_pkgs=(
+            "xxhash-libs"
+            "fuse3-help"
+            "pixman-devel"
+            "containernetworking-plugins"
+            "kmod"
+        )
+        # edk2-ovmf 仅 x86_64 需要
+        if [ "${ARCH_RPM}" = "x86_64" ]; then
+            conch_pkgs+=("edk2-ovmf")
+        fi
+        case "${DETECTED_VERSION}" in
+            24.03*) conch_pkgs+=("virtiofsd") ;;
+            22.03*) conch_pkgs+=("qemu") ;;
+            *)
+                warning "openEuler ${DETECTED_VERSION} 非 22.03/24.03，Conch 依赖按 24.03 口径安装 virtiofsd"
+                conch_pkgs+=("virtiofsd")
+                ;;
+        esac
+        info "Installing Conch dependencies: ${conch_pkgs[*]}"
+        dnf install -y --disablerepo=moosefs "${conch_pkgs[@]}" \
+            || error "Failed to install Conch dependencies via dnf"
+    fi
+
     # 检查 python3.11 是否已安装
     if ! command -v "python${YR_PYTHON_VERSION}" >/dev/null 2>&1; then
         info "python${YR_PYTHON_VERSION} not found, trying to install ${python_pkg}"
@@ -246,6 +280,33 @@ install_system_ubuntu() {
         pkgs=("iptables" "curl" "fuse3" "iproute2" "bwrap" "jq" "gpg" "nfs-kernel-server" "nfs-common" "rpcbind" "autofs")
         apt-get install -y "${pkgs[@]}" || error "Failed to install system packages via apt"
     }
+
+    # Conch 沙箱模块的系统依赖（Ubuntu 各版本来源有差异）
+    # rpm: conch_deploy.sh 以 rpm 安装 stratovirt/conch 等 RPM
+    # 24.04: erofs-utils/virtiofsd 由 apt 安装
+    # 22.04: erofs-utils/virtiofsd 由部署包内 RPM 以 --nodeps 安装（见 conch/conch_deploy.sh），另需安装 qemu
+    if [ "${SKIP_CONCH_DEPS}" -eq 1 ]; then
+        info "Skipping Conch dependencies installation"
+    else
+        local conch_pkgs=(
+            "rpm"
+            "containernetworking-plugins"
+            "kmod"
+            "procps"
+            "libpixman-1-0"
+        )
+        case "${DETECTED_VERSION}" in
+            24.04*) conch_pkgs+=("erofs-utils" "virtiofsd") ;;
+            22.04*) conch_pkgs+=("qemu") ;;
+            *)
+                warning "Ubuntu ${DETECTED_VERSION} 非 22.04/24.04，Conch 依赖按 24.04 口径安装 erofs-utils/virtiofsd"
+                conch_pkgs+=("erofs-utils" "virtiofsd")
+                ;;
+        esac
+        info "Installing Conch dependencies: ${conch_pkgs[*]}"
+        apt-get install -y "${conch_pkgs[@]}" \
+            || error "Failed to install Conch dependencies via apt"
+    fi
 
     # 检查 python3.11 是否已安装
     if ! command -v "python${YR_PYTHON_VERSION}" >/dev/null 2>&1; then
@@ -424,6 +485,10 @@ parse_args() {
                 SKIP_SYSTEM=1
                 i=$((i+1))
                 ;;
+            --skip-conch-deps)
+                SKIP_CONCH_DEPS=1
+                i=$((i+1))
+                ;;
             --skip-moosefs)
                 SKIP_MOOSEFS=1
                 i=$((i+1))
@@ -452,12 +517,14 @@ Usage: ./$(basename "$0") [OPTIONS]
 
 安装内容:
   1. 系统包:   python${YR_PYTHON_VERSION}、ip (iproute/iproute2)、iptables、curl、fuse3、bwrap、jq、
-               NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server + nfs-common)、autofs
+               NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server + nfs-common)、autofs、
+               Conch 沙箱依赖（virtiofsd/qemu/erofs-utils 等，随 OS 版本不同）
   2. MooseFS:  moosefs-master、moosefs-chunkserver、moosefs-client
   3. Python:   deploy/requirements.txt 中的全部依赖
 
 Options:
   --skip-system      跳过系统包安装
+  --skip-conch-deps  跳过 Conch 沙箱依赖安装
   --skip-moosefs    跳过 MooseFS 安装
   --skip-python      跳过 Python 依赖安装
   -h, --help         显示帮助信息
@@ -549,6 +616,9 @@ main() {
     echo "  Python:     ${YR_PYTHON_VERSION}"
     if [ "${SKIP_SYSTEM}" -eq 0 ]; then
         echo "  System pkgs: installed"
+    fi
+    if [ "${SKIP_SYSTEM}" -eq 0 ] && [ "${SKIP_CONCH_DEPS}" -eq 0 ]; then
+        echo "  Conch deps:  installed"
     fi
     if [ "${SKIP_MOOSEFS}" -eq 0 ]; then
         echo "  MooseFS:    installed"

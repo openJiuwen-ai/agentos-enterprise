@@ -21,6 +21,8 @@ CONCH_READY_TIMEOUT="${CONCH_READY_TIMEOUT:-300}"
 CONCH_READY_POLL_INTERVAL="${CONCH_READY_POLL_INTERVAL:-0.5}"
 CONCH_STOP_TIMEOUT="${CONCH_STOP_TIMEOUT:-90}"
 CONCH_SERVICE="${CONCH_SERVICE:-conchd.service}"
+SANDBOX_IMAGE_ROOT="${SANDBOX_IMAGE_ROOT:-/root/resources/MindAgent-image}"
+SANDBOX_IMAGE_REGISTRY="${SANDBOX_IMAGE_REGISTRY:-swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev}"
 CMD=""
 BIND_IP="${BIND_IP:-}"
 OS_VARIANT=""
@@ -288,6 +290,40 @@ stop_on_this_host() {
     success "Stopped conchd"
 }
 
+# ===== 沙箱模板导入 =====
+# conchd 启动就绪后按本机架构导入工具沙箱模板：
+# 本地离线 tar 存在时用 conch template load 导入；不存在时从 registry 拉取
+provision_sandbox_template() {
+    command -v conch >/dev/null 2>&1 || error "conch command not found; run install first"
+
+    local template_tar template_ref
+    case "$(uname -m)" in
+        aarch64)
+            template_tar="${SANDBOX_IMAGE_ROOT}/aarch64/tool-sandbox-conch_latest-arm64.tar"
+            template_ref="${SANDBOX_IMAGE_REGISTRY}/tool-sandbox-conch:latest-arm64"
+            ;;
+        x86_64)
+            template_tar="${SANDBOX_IMAGE_ROOT}/x86_64/tool-sandbox-conch_latest-amd64.tar"
+            template_ref="${SANDBOX_IMAGE_REGISTRY}/tool-sandbox-conch:latest-amd64"
+            ;;
+        *)
+            error "Unsupported architecture for sandbox template: $(uname -m)"
+            ;;
+    esac
+
+    if [ -f "${template_tar}" ]; then
+        info "Loading sandbox template from ${template_tar}"
+        conch template load -i "${template_tar}" \
+            || error "Failed to load sandbox template from ${template_tar}"
+        success "Sandbox template loaded from ${template_tar}"
+    else
+        info "Sandbox template tar not found, pulling ${template_ref}"
+        CONCH_API_TIMEOUT=30m conch template pull "${template_ref}" \
+            || error "Failed to pull sandbox template ${template_ref}"
+        success "Sandbox template pulled: ${template_ref}"
+    fi
+}
+
 # ===== 本机调度 =====
 run_on_host() {
     local host="$1" action="$2"
@@ -382,6 +418,7 @@ deploy_conch_up() {
     info "Starting Conch on ${host}..."
     run_on_host "${host}" up
     success "Conch started on ${host}"
+    provision_sandbox_template
     conch_up_phase=2
     trap - EXIT
     success "Conch deployment completed"
@@ -510,7 +547,8 @@ print_help() {
 Usage: ./$(basename "$0") <up|down|restart|install|uninstall|status> [options]
 
 Commands:
-  up        在目标主机启动 conchd（优先使用 systemd）
+  up        在目标主机启动 conchd（优先使用 systemd），启动后按架构导入工具沙箱模板
+            （本地 tar 优先，缺失时从 registry 拉取）
   down      在目标主机停止 conchd
   restart   在目标主机重启 conchd
   install   本机安装 RPM，并安装 RPM 内置的 Python Wheel
