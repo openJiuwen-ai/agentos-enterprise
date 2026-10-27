@@ -675,7 +675,7 @@ yr_start_master() {
     # --log-dir-prefix 把会话/日志迁到 ${YR_LOG_DIR_PREFIX}，与下方读取路径保持一致
     # 共进程：--function-proxy-merge-process-enable 将 function_agent 内嵌入 function_proxy 进程
     # --port-policy FIX 固定 frontend 端口：端口被占用时直接失败，而非静默切换到其他端口
-    exec_on_host "${master_host}" "export TORCH_DEVICE_BACKEND_AUTOLOAD=0 && yr start --master \
+    exec_on_host "${master_host}" "export TORCH_DEVICE_BACKEND_AUTOLOAD=0 ENABLE_TRACE=${TRACE_ENABLE} TRACE_CONFIG='${TRACE_CONFIG_JSON}' && yr start --master \
         --log-dir-prefix '${YR_LOG_DIR_PREFIX}' \
         -s 'values.host_ip=\"${master_host}\"' \
         -s 'mode.master.frontend=true' \
@@ -689,6 +689,10 @@ yr_start_master() {
         -s 'function_proxy.args.log_expiration_enable=${LOG_EXPIRATION_ENABLE}' \
         -s 'function_proxy.args.log_expiration_max_file_count=${LOG_EXPIRATION_MAX_FILE_COUNT}' \
         -s 'function_proxy.args.log_expiration_cleanup_interval=${LOG_EXPIRATION_CLEANUP_INTERVAL}' \
+        -s 'function_proxy.args.enable_trace=${TRACE_ENABLE}' \
+        -s 'function_proxy.args.trace_config=${TRACE_CONFIG_TOML}' \
+        -s 'function_master.args.enable_trace=${TRACE_ENABLE}' \
+        -s 'function_master.args.trace_config=${TRACE_CONFIG_TOML}' \
         ${ssh_opts}" 2>&1 | tee "${startup_log}"
 
     if grep -q "All components are healthy" "${startup_log}" 2>/dev/null || \
@@ -745,7 +749,7 @@ yr_start_agent() {
         -s 'values.frontend.ssh_backend_key=\"${AGENTOS_SSH_KEY}\"' \
         -s 'values.frontend.ssh_authorized_keys=\"${AGENTOS_SSH_KEY}.pub\"' \
         -s 'values.frontend.ssh_backend_public_key_dir=\"${AGENTOS_SSH_BACKEND_PUBLIC_DIR}\"'"
-    if exec_on_host "${agent_host}" "export TORCH_DEVICE_BACKEND_AUTOLOAD=0 && yr start \
+    if exec_on_host "${agent_host}" "export TORCH_DEVICE_BACKEND_AUTOLOAD=0 ENABLE_TRACE=${TRACE_ENABLE} TRACE_CONFIG='${TRACE_CONFIG_JSON}' && yr start \
         --log-dir-prefix '${YR_LOG_DIR_PREFIX}' \
         -s 'values.host_ip=\"${agent_host}\"' \
         --function-proxy-merge-process-enable \
@@ -755,6 +759,8 @@ yr_start_agent() {
         -s 'function_proxy.args.log_expiration_enable=${LOG_EXPIRATION_ENABLE}' \
         -s 'function_proxy.args.log_expiration_max_file_count=${LOG_EXPIRATION_MAX_FILE_COUNT}' \
         -s 'function_proxy.args.log_expiration_cleanup_interval=${LOG_EXPIRATION_CLEANUP_INTERVAL}' \
+        -s 'function_proxy.args.enable_trace=${TRACE_ENABLE}' \
+        -s 'function_proxy.args.trace_config=${TRACE_CONFIG_TOML}' \
         ${ssh_opts} --master_address=http://${master_address}" 2>&1; then
         success "openyuanrong agent started on ${agent_host}"
     else
@@ -811,6 +817,84 @@ _yr_cfg() {
         "$(_yr_python)" "${AGENT_RUNTIME_CONFIG_PY}" --ip "${BIND_IP}" "$@"
     else
         "$(_yr_python)" "${AGENT_RUNTIME_CONFIG_PY}" "$@"
+    fi
+}
+
+# ===== 统一 tracing 开关（AgentRuntime 全链路打点，默认关闭） =====
+# 配置来源：~/.agentos/deploy/config.yaml 顶层 trace_otlp_endpoints（字符串数组，主备语义）。
+#   - 列表非空 ⇒ 开启：取第一个 endpoint 注入全部组件（部署级主备——备用项仅作配置储备，
+#     主 endpoint 不可达时修改 config.yaml 后重新 up 切换；SDK 侧 otel-go v1.24 /
+#     otel-cpp v1.13 均无原生多 endpoint failover，切换期间的 span 按 best-effort 丢弃）。
+#   - 列表为空 / 缺省 ⇒ 关闭（等价现状默认）。
+#   - host:port 形式，不要带 http:// 前缀（otel-go v1.24.0 gRPC exporter 不支持带 scheme 的
+#     endpoint；http:// 前缀会被剥离并告警，https:// 直接报错）。
+#   - 注意：数组只在本脚本内消费——绝不能把数组透传进 trace_config 的 endpoint 字段
+#     （Go json.Unmarshal / C++ nlohmann 遇类型不匹配会静默关闭 tracing）。
+# 生效机制：Go frontend 经 unit Environment=（systemd）/ export（进程模式）注入
+#   ENABLE_TRACE/TRACE_CONFIG；C++ 经 yr start -s '<组件>.args.enable_trace/--trace_config' 注入。
+#   domain_scheduler 以进程内模块内嵌于 function_master、function_agent/runtime_manager 合并于
+#   function_proxy（--function-proxy-merge-process-enable），均随宿主组件一并覆盖。
+# 用法：编辑 ~/.agentos/deploy/config.yaml 的 trace_otlp_endpoints 后执行 ./agentos.sh up
+#   （up 读的是 install 持久化的副本；只改仓库/安装包内 deploy/config.yaml 需重新 install
+#   同步——install 会用安装包 deploy 目录整体覆盖 ~/.agentos/deploy）。
+# 仅 up 流程调用：down/status/uninstall/help 不解析 tracing 配置，避免配置错误阻断拆除/查询路径。
+_yr_trace_init() {
+    TRACE_ENDPOINTS=""
+    TRACE_ENABLE=false
+    TRACE_OTLP_ENDPOINT=""
+    TRACE_CONFIG_JSON='{}'
+    TRACE_CONFIG_TOML='""'
+    # 命令替换的退出码取管道最后一个命令（tr 恒返回 0），必须先判断再 tr，才能捕获
+    # config.py 的失败（config 缺失 / trace_otlp_endpoints 类型错误 / python 缺失）。
+    # 读取失败降级为关闭而非终止：cluster/python 层面的问题由 up 后续步骤暴露并报错。
+    if ! TRACE_ENDPOINTS="$(_yr_cfg trace-endpoints 2>/dev/null)"; then
+        warning "Failed to read trace_otlp_endpoints (run: $(_yr_python) ${AGENT_RUNTIME_CONFIG_PY} trace-endpoints); tracing stays disabled"
+        TRACE_ENDPOINTS=""
+    fi
+    TRACE_ENDPOINTS="$(printf '%s' "${TRACE_ENDPOINTS}" | tr -d '\r')"
+    if [ -n "${TRACE_ENDPOINTS}" ]; then
+        TRACE_ENABLE=true
+        for _ep in ${TRACE_ENDPOINTS}; do
+            case "${_ep}" in
+                https://*)
+                    error "trace_otlp_endpoints does not support https:// (TLS collector is out of scope): ${_ep}"
+                    ;;
+                http://*)
+                    _ep="${_ep#http://}"
+                    warning "trace endpoint http:// prefix stripped, using host:port form: ${_ep}"
+                    ;;
+            esac
+            # Endpoints feed single-quoted JSON/TOML contexts downstream: reject quotes,
+            # backslashes and anything else that would break them (IPv4/hostname:port pass).
+            if ! printf '%s' "${_ep}" | grep -Eq '^[A-Za-z0-9._:~-]+$'; then
+                error "trace_otlp_endpoints entries must be host:port (characters [A-Za-z0-9._:~-] only): ${_ep}"
+            fi
+            if [ -z "${TRACE_OTLP_ENDPOINT}" ]; then
+                TRACE_OTLP_ENDPOINT="${_ep}"
+            fi
+        done
+        [ -n "${TRACE_OTLP_ENDPOINT}" ] || error "trace_otlp_endpoints is set but contains no usable endpoint"
+        if [ "$(printf '%s' "${TRACE_ENDPOINTS}" | wc -w)" -gt 1 ]; then
+            info "trace endpoints: ${TRACE_ENDPOINTS} (using primary: ${TRACE_OTLP_ENDPOINT}; the rest are config-level backups)"
+        fi
+    fi
+    # 共用配置 JSON：Go(TRACE_CONFIG) 与 C++(--trace_config) 的 schema 互为超集，未知键均被忽略；
+    # logFileExporter.enable=true 可让 C++ 每个 span 额外以 "trace info:" 落组件日志（排障用，默认关）。
+    # 关闭态也生成合法 JSON，保证注入点引用的变量恒有定义。
+    if [ "${TRACE_ENABLE}" = "true" ]; then
+        TRACE_CONFIG_JSON='{"otlpGrpcExporter":{"enable":true,"endpoint":"'"${TRACE_OTLP_ENDPOINT}"'"},"logFileExporter":{"enable":false}}'
+    else
+        # Go 侧 ENABLE_TRACE=false 不解析 TRACE_CONFIG，C++ 侧 enable_trace=false 不解析 trace_config；
+        # 用空对象简化（避免关闭态的 JSON 引号在 systemd/TOML 双层转义中出问题）。
+        TRACE_CONFIG_JSON='{}'
+    fi
+    # yr -s 的值按 TOML 解析。用 TOML 三引号字符串（"""..."""）包裹 JSON——内层 " 无需任何转义，
+    # 避免 \" 转义被 systemd ExecStart 解析剥离导致 TOML 字符串提前终止。
+    # 关闭态传空 TOML 字符串 ""（C++ enable_trace=false 不会解析）。
+    if [ "${TRACE_ENABLE}" = "true" ]; then
+        TRACE_CONFIG_TOML="\"\"\"${TRACE_CONFIG_JSON}\"\"\""
+    else
+        TRACE_CONFIG_TOML='""'
     fi
 }
 
@@ -874,6 +958,8 @@ StartLimitBurst=5
 [Service]
 Type=simple
 Environment=TORCH_DEVICE_BACKEND_AUTOLOAD=0
+Environment=ENABLE_TRACE=${TRACE_ENABLE}
+Environment=TRACE_CONFIG='${TRACE_CONFIG_JSON}'
 ExecStart=${yr_bin} start --master --log-dir-prefix=${YR_LOG_DIR_PREFIX} \\
     -s 'values.host_ip="${host_ip}"' \\
     -s 'mode.master.etcd=false' \\
@@ -890,6 +976,10 @@ ExecStart=${yr_bin} start --master --log-dir-prefix=${YR_LOG_DIR_PREFIX} \\
     -s 'function_proxy.args.log_expiration_enable=${LOG_EXPIRATION_ENABLE}' \\
     -s 'function_proxy.args.log_expiration_max_file_count=${LOG_EXPIRATION_MAX_FILE_COUNT}' \\
     -s 'function_proxy.args.log_expiration_cleanup_interval=${LOG_EXPIRATION_CLEANUP_INTERVAL}' \\
+    -s 'function_proxy.args.enable_trace=${TRACE_ENABLE}' \\
+    -s 'function_proxy.args.trace_config=${TRACE_CONFIG_TOML}' \\
+    -s 'function_master.args.enable_trace=${TRACE_ENABLE}' \\
+    -s 'function_master.args.trace_config=${TRACE_CONFIG_TOML}' \\
     -s 'values.frontend.ssh_enable=true' \\
     -s 'values.frontend.ssh_host_key="${AGENTOS_SSH_KEY}"' \\
     -s 'values.frontend.ssh_backend_key="${AGENTOS_SSH_KEY}"' \\
@@ -921,6 +1011,8 @@ StartLimitBurst=5
 [Service]
 Type=simple
 Environment=TORCH_DEVICE_BACKEND_AUTOLOAD=0
+Environment=ENABLE_TRACE=${TRACE_ENABLE}
+Environment=TRACE_CONFIG='${TRACE_CONFIG_JSON}'
 ExecStart=${yr_bin} start --log-dir-prefix=${YR_LOG_DIR_PREFIX} \\
     -s 'values.host_ip="${host_ip}"' \\
     -s 'values.etcd.address=${etcd_addr_list}' \\
@@ -936,6 +1028,8 @@ ExecStart=${yr_bin} start --log-dir-prefix=${YR_LOG_DIR_PREFIX} \\
     -s 'function_proxy.args.log_expiration_enable=${LOG_EXPIRATION_ENABLE}' \\
     -s 'function_proxy.args.log_expiration_max_file_count=${LOG_EXPIRATION_MAX_FILE_COUNT}' \\
     -s 'function_proxy.args.log_expiration_cleanup_interval=${LOG_EXPIRATION_CLEANUP_INTERVAL}' \\
+    -s 'function_proxy.args.enable_trace=${TRACE_ENABLE}' \\
+    -s 'function_proxy.args.trace_config=${TRACE_CONFIG_TOML}' \\
     -s 'values.frontend.ssh_enable=true' \\
     -s 'values.frontend.ssh_host_key="${AGENTOS_SSH_KEY}"' \\
     -s 'values.frontend.ssh_backend_key="${AGENTOS_SSH_KEY}"' \\
@@ -968,6 +1062,9 @@ EOF
 deploy_yr_up_systemd() {
     [ -f "${AGENT_RUNTIME_CONFIG_PY}" ] || error "config parser not found: ${AGENT_RUNTIME_CONFIG_PY}"
     _yr_has_systemd || error "systemd not available; agent-runtime up requires systemd (or use --no-systemd)"
+
+    # tracing 配置解析/校验只在 up 流程执行（见 _yr_trace_init 注释）
+    _yr_trace_init
 
     local i
 
@@ -1014,6 +1111,8 @@ deploy_yr_up() {
         deploy_yr_up_systemd
         return
     fi
+    # tracing 配置解析/校验只在 up 流程执行（见 _yr_trace_init 注释）
+    _yr_trace_init
     local local_ip master_host
     # yr_up_phase:
     #   0 = 检测/校验阶段（check 失败不清理，避免误杀原可用集群）
@@ -1344,6 +1443,12 @@ Environment Variables:
   AGENTOS_SSH_BACKEND_PUBLIC_DIR 挂进实例 /run/openyuanrong/ssh 的公钥目录
                              （默认 /root/.ssh/agent_pub），该目录下须有 authorized_keys
                              文件（即该私钥的公钥）。不能在 /etc 下（docker executor 会拒挂载）。
+  (tracing)                  AgentRuntime 全链路 tracing 开关由 ~/.agentos/deploy/config.yaml
+                             顶层 trace_otlp_endpoints 控制（字符串数组，主备语义，取第一个
+                             注入；空列表=关闭）。host:port 形式，不带 http:// 前缀；参考栈
+                             jiuwenswarm/deploy/observability（collector 4317，需先拉起）。
+                             注意：up 读的是 install 持久化的副本 ~/.agentos/deploy/config.yaml；
+                             修改仓库/安装包内 deploy/config.yaml 后需重新 install 同步。
   TOOL_SANDBOX_IMAGE         工具沙箱镜像名。down/uninstall 时按该镜像兜底回收残留的
                              docker 工具沙箱容器。优先级：本环境变量 >
                              deploy/jiuwenswarm/.env.custom 的 TOOL_SANDBOX_IMAGE；
