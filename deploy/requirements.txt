@@ -129,7 +129,7 @@ openai==2.46.0
 openai-codex==0.144.4
 openai-codex-cli-bin==0.144.4
 openapi-pydantic==0.5.1
-openjiuwen==0.1.19.post2
+openjiuwen==0.1.19.post3
 openpyxl==3.1.5
 opentelemetry-api==1.41.1
 opentelemetry-exporter-otlp-proto-common==1.41.1
