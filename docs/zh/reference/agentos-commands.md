@@ -47,21 +47,6 @@ bash deploy/agentos.sh <COMMAND> [OPTIONS]
 | `AGENTOS_SSH_KEY` | agent SSH 直连私钥路径 | `/root/.ssh/agent_key` |
 | `AGENTOS_SSH_BACKEND_PUBLIC_DIR` | 挂进实例的公钥目录（须含 `authorized_keys`） | `/root/.ssh/agent_pub` |
 
-> tracing 开关用法（由 `~/.agentos/deploy/config.yaml` 顶层 `trace_otlp_endpoints` 控制，部署时一键配置，重启 agentos-executor 后生效）：
->
-> ```yaml
-> # 编辑 ~/.agentos/deploy/config.yaml（install 持久化的副本，up 直接读它）
-> trace_otlp_endpoints: ["10.0.0.1:4317"]        # 开启：取第一个地址注入全部组件
-> # trace_otlp_endpoints: ["10.0.0.1:4317", "10.0.0.2:4317"]   # 主备（备用项为配置储备）
-> # trace_otlp_endpoints: []                     # 关闭（默认）
-> ```
-> ```bash
-> ./agentos.sh up
-> ```
->
-> 配置文件生效规则：`up` 读取的是 `install` 时持久化到 `~/.agentos/deploy/config.yaml` 的副本——直接修改该副本后 `up` 立即生效；修改仓库/安装包内的 `deploy/config.yaml` 则需重新执行 `install` 同步（`install` 会用安装包 deploy 目录整体覆盖 `~/.agentos/deploy`，注意此前对副本的修改会被覆盖）。
-> 地址为 **host:port 形式，不要带 `http://` 前缀**（otel-go v1.24.0 限制；带前缀会被部署脚本剥离并告警）；参考栈 `jiuwenswarm/deploy/observability`（collector 4317，需先拉起）。主备语义：**取第一个地址注入**（部署级主备），主地址不可达时修改列表后重新 `up` 切换。关闭时不注入任何 tracing 管道（等价现状默认）；collector 不可达不影响业务，仅 span 丢失。
-
 ## etcd.sh 子命令
 
 `deploy/etcd.sh` 独立管理 etcd unit 生命周期（`agentos.sh` 的 `init` / `deinit` 委托给它）：

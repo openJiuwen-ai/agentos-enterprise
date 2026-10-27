@@ -31,7 +31,7 @@ cluster:
 |------|----------|--------|
 | moosefs | `deploy/moosefs/moosefs.conf` | `MOOSEFS_ENABLED`（auto/yes/no，单机自动跳过）、`MFS_MOUNT_POINT`（默认 `/home/agentos/users`） |
 | jiuwenbox | `deploy/jiuwenbox/default-policy.yaml` | policy 模板（`__JIUWENSWARM_EXTENSIONS_DIR__` 启动时自动替换） |
-| agent-runtime | 环境变量 + config.yaml | `YR_PYTHON_VERSION`（默认 3.11）、`YR_VERSION`（默认 0.9.0）、`AGENTOS_SSH_KEY`、`AGENTOS_SSH_BACKEND_PUBLIC_DIR`；**tracing 开关**：config.yaml 顶层 `trace_otlp_endpoints`（字符串数组，主备语义，取第一个注入；空列表=关闭，默认）。地址 host:port 形式不带 `http://` 前缀；collector 参考栈在 jiuwenswarm 仓 `deploy/observability`，需先拉起 |
+| agent-runtime | 环境变量 | `YR_PYTHON_VERSION`（默认 3.11）、`YR_VERSION`（默认 0.9.0）、`AGENTOS_SSH_KEY`、`AGENTOS_SSH_BACKEND_PUBLIC_DIR` |
 | etcd | 环境变量 | `YR_ETCD_CLIENT_PORT`（默认 32379） |
 | agent-gateway | 环境变量 | `A2X_REGISTRY_PORT`（默认 4003）、`A2X_REGISTRY_TLS_*`（三者齐全开启 mTLS） |
 | jiuwenswarm | `deploy/jiuwenswarm/.env.custom` | 见下表 |

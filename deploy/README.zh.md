@@ -331,7 +331,6 @@ Agent 分布式运行时模块，具体选型为 openyuanrong 集群。通过环
 | `YR_PKG_BASE` | whl 包来源（远程 URL 基址或本地目录路径） | `install` 时默认指向 agentos 根目录 |
 | `AGENTOS_SSH_KEY` | agent SSH 直连私钥路径（host/backend/client 三处混用） | `/root/.ssh/agent_key` |
 | `AGENTOS_SSH_BACKEND_PUBLIC_DIR` | 挂进实例的公钥目录（须含 `authorized_keys`） | `/root/.ssh/agent_pub` |
-| （tracing） | AgentRuntime 全链路 tracing 由 config.yaml 顶层 `trace_otlp_endpoints` 控制（字符串数组，主备，取第一个注入；空=关闭，默认） | `[]` |
 
 详见 `agent_runtime_deploy.sh -h`。
 
