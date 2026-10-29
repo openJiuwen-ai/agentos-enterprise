@@ -379,6 +379,13 @@ pack() {
     [[ -e "${none_rpm}" ]] || continue
     cp -p "${none_rpm}" "${server_staging}/"
   done
+  # erofs.ko 版本目录（oe2203/oe2203sp1~sp4，openEuler 22.03 内核模块）在 ${ARCH} 目录下与 rpm 同级，
+  # 如有则一并打入 server 包根目录（conch_deploy.sh up 按 AGENTOS_ROOT/<版本>/erofs.ko 加载）
+  local erofs_ko_dir
+  for erofs_ko_dir in "${CONCH_ARCHIVE_ROOT}/${ARCH}"/oe2203*/; do
+    [[ -e "${erofs_ko_dir}" ]] || continue
+    cp -a "${erofs_ko_dir}" "${server_staging}/"
+  done
 
   # credential_router：平台相关 credential-router 开头的 .tar.gz 从 credential_router archive ${ARCH} 目录取（build_credential_router 已校验目录），打入 server 包根目录与各 whl/rpm 同级
   cp -p "${CREDENTIAL_ROUTER_ARCHIVE_ROOT}/${ARCH}"/credential-router*.tar.gz "${server_staging}/"

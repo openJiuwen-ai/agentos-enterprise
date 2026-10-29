@@ -55,6 +55,7 @@ archive/a2x_registry-*-py3-none-any.whl   -> server 包（平台无关 wheel，�
 **conch archive**：
 ```
 archive/<x86_64|aarch64>/*.rpm   -> server 包（平台相关 rpm，按 ${ARCH} 取对应架构；必有）
+archive/<x86_64|aarch64>/oe2203{,sp1~sp4}/erofs.ko -> server 包（openEuler 22.03 各版本 EROFS 内核模块，按 ${ARCH} 取对应架构；如有则一并打入）
 archive/*.rpm                    -> server 包（平台无关 none rpm，在 archive 根目录；如有则一并打入）
 ```
 
@@ -108,7 +109,7 @@ archive/*.rpm                    -> server 包（平台无关 none rpm，在 arc
 - archive 解压后删 `archive.tar.gz` 省磁盘空间
 - tar 加 `--atime-preserve`、wheel cp 加 `-p` 保留原始 mtime 可回溯
 - 随远端 client 迁移删除 `tui-launcher` 本地构建逻辑（`TUI_LAUNCHER_VERSION`/`TUI_LAUNCHER_PACKAGES`/`build_tui_launcher`），client 包不再包含 `agentos_tui_launcher`
-- 新增 conch 沙箱模块：daily/release 都从 OBS archive 获取 rpm（平台相关按 `${ARCH}` 取 + 平台无关 none），打入 server 包根目录与各 whl 同级
+- 新增 conch 沙箱模块：daily/release 都从 OBS archive 获取 rpm（平台相关按 `${ARCH}` 取 + 平台无关 none）与 erofs.ko 版本目录（openEuler 22.03 各版本，如有则一并打入），打入 server 包根目录与各 whl 同级
 - 新增 credential_router：daily/release 都从 OBS archive 获取平台相关 `credential-router*.tar.gz`（按 `${ARCH}` 取 + 平台无关 none），打入 server 包根目录与各 whl/rpm 同级
 
 ## 依赖
@@ -123,7 +124,7 @@ archive/*.rpm                    -> server 包（平台无关 none rpm，在 arc
 2. `build_openyuanrong` — 下载并解压 OBS `archive.tar.gz`（openyuanrong wheels）
 3. `build_jiuwenswarm` — 下载并解压 OBS `archive.tar.gz`（jiuwenswarm wheels + deploy）
 4. `build_agent_gateway` — 下载并解压 OBS `archive.tar.gz`（a2x_registry wheel）
-5. `build_conch` — 下载并解压 OBS `archive.tar.gz`（conch 沙箱模块 rpm：平台相关按 `${ARCH}` 取 + 平台无关 none，打入 server 包根目录与各 whl 同级）
+5. `build_conch` — 下载并解压 OBS `archive.tar.gz`（conch 沙箱模块 rpm：平台相关按 `${ARCH}` 取 + 平台无关 none；erofs.ko 版本目录如有则一并打入，均进 server 包根目录与各 whl 同级）
 6. `build_credential_router` — 下载并解压 OBS `archive.tar.gz`（credential-router 平台相关 tar.gz）
 7. `pack` — 组装 client/server 两个 tgz 产物
 8. `collect_buildinfo` — 收集各部件 archive 内名字含 buildinfo 关键字的构建信息文件，以及 `build/` 目录顶层名字含 buildinfo 关键字的文件（agent-os 主仓 buildinfo 由 CI 流水线生成于此），到 `AgentOS-Buildinfo/` 目录，`cp -p` + `tar --atime-preserve` 保留源文件时间戳，压缩为 `AgentOS-Buildinfo.tgz`（与 AgentOS-Server/Client 同级；须在 pack 之后，pack 会清空 staging）
@@ -336,8 +337,10 @@ daily和release编译的产品分支过程产物归档
     |-archive
       |-x86_64
       | |-xxx_x86_64.rpm
+      | |-oe2203、oe2203sp1~sp4（各含 erofs.ko）
       |-aarch64
       | |-xxx_aarch64.rpm
+      | |-oe2203、oe2203sp1~sp4（各含 erofs.ko）
       |-XXX_.noarch.rpm
   |-last_successful_build
     |-archive.tar.gz
@@ -348,8 +351,10 @@ archive.tar.gz
   |-archive
     |-x86_64
     | |-xxx_x86_64.rpm
+    | |-oe2203、oe2203sp1~sp4（各含 erofs.ko）
     |-aarch64
     | |-xxx_aarch64.rpm
+    | |-oe2203、oe2203sp1~sp4（各含 erofs.ko）
     |-XXX_.noarch.rpm
 ```
 

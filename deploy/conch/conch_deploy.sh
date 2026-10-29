@@ -205,6 +205,64 @@ conch_status_on_host() {
     return 1
 }
 
+# ===== EROFS 内核模块加载 =====
+# openEuler 22.03 部分官方内核未启用 CONFIG_EROFS_FS。modprobe erofs 失败时，从 uname -r
+# 识别 oe2203/oe2203sp1~sp4 具体版本，取部署包根目录（与 RPM 同级）同名目录的 erofs.ko
+# 安装到 /lib/modules/<内核版本>/extra/ 并 depmod，用 modprobe 加载（解析 libcrc32c /
+# lz4_decompress 等模块依赖）；加载成功才写 /etc/modules-load.d/agentos-erofs.conf
+# （记录安装过 ko 的内核版本，uninstall 据此清理），重启后由 systemd-modules-load
+# 自动加载。modprobe 成功（内核自带或用户已自行适配）时不改动系统。
+# erofs.ko 的生成方法见本目录 README.zh.md
+ensure_erofs_module() {
+    if grep -q '^erofs ' /proc/modules 2>/dev/null; then
+        info "erofs module is already loaded"
+        return 0
+    fi
+    local modprobe_out kernel_release oe_variant ko_file ko_vermagic modules_dir_existed=0
+    if modprobe_out="$(modprobe erofs 2>&1)"; then
+        info "erofs module loaded by modprobe"
+        return 0
+    fi
+    warning "${modprobe_out}"
+    kernel_release="$(uname -r)"
+    oe_variant="$(echo "${kernel_release}" | grep -oE 'oe2203(sp[1-4])?' || true)"
+    [ -n "${oe_variant}" ] || error "erofs module not found and kernel '${kernel_release}' is not openEuler 22.03; install the kernel modules package for your kernel, or build erofs.ko as described in ${SCRIPT_DIR}/README.zh.md"
+    info "Detected openEuler 22.03 variant: ${oe_variant} (kernel: ${kernel_release})"
+    ko_file="${AGENTOS_ROOT}/${oe_variant}/erofs.ko"
+    [ -f "${ko_file}" ] || error "erofs.ko not found: ${ko_file}; build one as described in ${SCRIPT_DIR}/README.zh.md"
+    if [ -d "/lib/modules/${kernel_release}" ]; then
+        modules_dir_existed=1
+    fi
+    info "Installing erofs.ko to /lib/modules/${kernel_release}/extra/"
+    install -D -m 0644 "${ko_file}" "/lib/modules/${kernel_release}/extra/erofs.ko" \
+        || error "failed to install erofs.ko to /lib/modules/${kernel_release}/extra/"
+    depmod -a "${kernel_release}" \
+        || error "depmod failed for kernel ${kernel_release}"
+    info "Loading erofs module with modprobe"
+    if ! modprobe_out="$(modprobe erofs 2>&1)"; then
+        warning "${modprobe_out}"
+        rm -f "/lib/modules/${kernel_release}/extra/erofs.ko"
+        if [ "${modules_dir_existed}" = "0" ]; then
+            rm -rf "/lib/modules/${kernel_release}"
+        else
+            rmdir "/lib/modules/${kernel_release}/extra" 2>/dev/null || true
+            depmod -a "${kernel_release}" 2>/dev/null || true
+        fi
+        ko_vermagic="$(modinfo -F vermagic "${ko_file}" 2>/dev/null || true)"
+        error "modprobe erofs failed (running kernel: ${kernel_release}; bundled erofs.ko built for: ${ko_vermagic%% *}); build a matching erofs.ko as described in ${SCRIPT_DIR}/README.zh.md, replace ${ko_file}, and re-run up"
+    fi
+    mkdir -p /etc/modules-load.d
+    local erofs_conf=/etc/modules-load.d/agentos-erofs.conf
+    grep -qxF "# agentos: ${kernel_release}" "${erofs_conf}" 2>/dev/null \
+        || printf '# agentos: %s\n' "${kernel_release}" >> "${erofs_conf}" \
+        || error "failed to write ${erofs_conf}"
+    grep -qxF 'erofs' "${erofs_conf}" 2>/dev/null \
+        || printf 'erofs\n' >> "${erofs_conf}" \
+        || error "failed to write ${erofs_conf}"
+    success "erofs module loaded (installed from ${ko_file})"
+    info "erofs will be loaded at boot via ${erofs_conf}"
+}
+
 start_on_this_host() {
     local pids pid="" start_mode="direct"
     command -v conchd >/dev/null 2>&1 || error "conchd not found; run install first"
@@ -414,6 +472,8 @@ deploy_conch_up() {
 
     check_existing "${host}"
 
+    ensure_erofs_module
+
     conch_up_phase=1
     info "Starting Conch on ${host}..."
     run_on_host "${host}" up
@@ -447,6 +507,19 @@ conch_uninstall() {
     stop_on_this_host
     if has_systemd; then
         systemctl disable "${CONCH_SERVICE}" 2>/dev/null || true
+    fi
+
+    # 清理 up 时安装的 erofs.ko 与开机自动加载配置（以 conf 中记录的内核为准）
+    local erofs_conf=/etc/modules-load.d/agentos-erofs.conf
+    if [ -f "${erofs_conf}" ]; then
+        local kver
+        for kver in $(sed -n 's/^# agentos: //p' "${erofs_conf}"); do
+            [ -f "/lib/modules/${kver}/extra/erofs.ko" ] || continue
+            rm -f "/lib/modules/${kver}/extra/erofs.ko"
+            rmdir "/lib/modules/${kver}/extra" 2>/dev/null || true
+            depmod -a "${kver}" 2>/dev/null || true
+        done
+        rm -f "${erofs_conf}"
     fi
 
     local python_bin="python${YR_PYTHON_VERSION:-3.11}"

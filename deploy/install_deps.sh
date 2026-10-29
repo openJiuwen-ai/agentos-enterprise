@@ -202,9 +202,11 @@ install_system_openeuler() {
             "containernetworking-plugins"
             "kmod"
         )
-        # edk2-ovmf 仅 x86_64 需要
+        # OVMF 固件包名随架构不同
         if [ "${ARCH_RPM}" = "x86_64" ]; then
             conch_pkgs+=("edk2-ovmf")
+        else
+            conch_pkgs+=("edk2-aarch64")
         fi
         case "${DETECTED_VERSION}" in
             24.03*) conch_pkgs+=("virtiofsd") ;;
