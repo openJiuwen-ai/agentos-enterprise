@@ -107,6 +107,7 @@ _ws_load_config() {
     local _env_etcd_prefix="${WORKSPACE_ETCD_PREFIX:-}"
     local _env_etcd_endpoint="${ETCD_ENDPOINT:-}"
     local _env_bind_ip="${BIND_IP:-}"
+    local _env_negative_timeout="${AUTOFS_NEGATIVE_TIMEOUT:-}"
 
     # 读取配置文件
     local conf_file="${SCRIPT_DIR}/workspace_storage.conf"
@@ -123,6 +124,7 @@ _ws_load_config() {
     [ -n "${_env_etcd_prefix}" ]   && WORKSPACE_ETCD_PREFIX="${_env_etcd_prefix}"
     [ -n "${_env_etcd_endpoint}" ] && ETCD_ENDPOINT="${_env_etcd_endpoint}"
     [ -n "${_env_bind_ip}" ]       && BIND_IP="${_env_bind_ip}"
+    [ -n "${_env_negative_timeout}" ] && AUTOFS_NEGATIVE_TIMEOUT="${_env_negative_timeout}"
 
     # 设置默认值
     : "${WORKSPACE_STORAGE_ROOT:="/home/agentos/.users"}"
@@ -131,6 +133,19 @@ _ws_load_config() {
     : "${WORKSPACE_ETCD_PREFIX:="/agent-runtime/workspace"}"
     : "${WORKSPACE_STORAGE_ENABLED:="auto"}"
     : "${WORKSPACE_STORAGE_USE_SYSTEMD:="auto"}"
+    : "${AUTOFS_NEGATIVE_TIMEOUT:="1"}"
+
+    # 负缓存（negative timeout）须保持极短: program map 查询失败（key 无 etcd 归属
+    # 记录）会被 automount 缓存为 ENOENT。新用户/迁移场景中归属记录写入后，若负缓存
+    # 未过期，首次访问仍会失败。autofs 默认值为 60s，故默认压到 1s。
+    # 校验必须先于任何破坏性操作完成（fail-fast），故放此处而非 master 条目拼接处
+    case "${AUTOFS_NEGATIVE_TIMEOUT}" in
+        ''|*[!0-9]*)
+            error "Invalid AUTOFS_NEGATIVE_TIMEOUT value: ${AUTOFS_NEGATIVE_TIMEOUT} (expected: positive integer, in seconds)"
+            ;;
+    esac
+    [ "${AUTOFS_NEGATIVE_TIMEOUT}" -gt 0 ] \
+        || error "Invalid AUTOFS_NEGATIVE_TIMEOUT value: ${AUTOFS_NEGATIVE_TIMEOUT} (expected: positive integer, in seconds)"
 }
 
 # ===== systemd 三态检测函数 =====
@@ -367,9 +382,12 @@ _WS_AUTOFS_MAP="/etc/auto.workspace-storage"
 _WS_AUTOFS_HOME="/etc/agentos/workspace-storage"
 
 # autofs master 条目必须在 _ws_load_config() 之后求值（conf 可覆盖 WORKSPACE_ACCESS_ROOT），
-# 故封装为函数在使用处调用，禁止在脚本顶层展开
+# 故封装为函数在使用处调用，禁止在脚本顶层展开。
+# 注意：本函数会被命令替换 $(...) 消费，只允许 echo 输出 —— stdout 会被捕获为变量值，
+# 禁止在此 error/exit（诊断输出会被吞掉，错误文本还可能被当作条目写入 master map）。
+# AUTOFS_NEGATIVE_TIMEOUT 的合法性已在 _ws_load_config() 中校验
 _ws_autofs_master_entry() {
-    echo "${WORKSPACE_ACCESS_ROOT} /etc/auto.workspace-storage --timeout=300"
+    echo "${WORKSPACE_ACCESS_ROOT} /etc/auto.workspace-storage --timeout=300 --negative-timeout=${AUTOFS_NEGATIVE_TIMEOUT}"
 }
 
 # ===== install 逻辑 =====
@@ -1273,6 +1291,8 @@ Environment Variables:
   WORKSPACE_ETCD_PREFIX        etcd 键前缀（默认 /agent-runtime/workspace）
   WORKSPACE_STORAGE_ENABLED    是否启用（auto/yes/no，默认 auto）
   WORKSPACE_STORAGE_USE_SYSTEMD 是否使用 systemd（auto/yes/no，默认 auto）
+  AUTOFS_NEGATIVE_TIMEOUT      autofs 负缓存时长，单位秒，正整数（默认 1；
+                               修改后需重新 install 使 master map 生效）
   ETCDCTL_PATH                 etcdctl 路径（由调用环境设置）
   ETCD_LD_PATH                 etcd 库路径（由调用环境设置）
   ENABLE_TLS                   是否启用 TLS（true/false）
