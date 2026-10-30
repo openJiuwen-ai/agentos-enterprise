@@ -242,6 +242,7 @@ ensure_agentos_user() {
 # agentos 仓部署关闭用户认证，create-user 仅负责建目录 + 拷模板，不创建 API key。
 AGENTOS_HOME_BASE="${AGENTOS_HOME_BASE:-/home/agentos/users}"
 AGENTOS_SWARM_TEMPLATE_DIR="${AGENTOS_SWARM_TEMPLATE_DIR:-${HOME:-/root}/.jiuwenswarm}"
+# 显式覆盖/兜底值；默认跟随 agentos 用户真实 uid/gid（见 _chown_user_home）
 AGENTOS_SYS_UID="${AGENTOS_SYS_UID:-1000}"
 AGENTOS_SYS_GID="${AGENTOS_SYS_GID:-1000}"
 
@@ -253,11 +254,14 @@ _validate_username() {
     fi
 }
 
-# 递归 chown 家目录到 agentos 用户（UID/GID 1000）
+# 递归 chown 家目录到 agentos 用户；默认跟随本机 agentos 用户的真实 uid/gid
+# （useradd 未指定 -u 时各环境可能不同，写死 1000 会与进程运行用户错位），
+# 可用 AGENTOS_SYS_UID/AGENTOS_SYS_GID 显式覆盖
 _chown_user_home() {
     local home_dir="$1"
-    local uid="${AGENTOS_SYS_UID}"
-    local gid="${AGENTOS_SYS_GID}"
+    local uid gid
+    uid=$(id -u agentos 2>/dev/null || echo "${AGENTOS_SYS_UID}")
+    gid=$(id -g agentos 2>/dev/null || echo "${AGENTOS_SYS_GID}")
     if ! chown -R "${uid}:${gid}" "${home_dir}" 2>/dev/null; then
         warning "chown ${home_dir} to ${uid}:${gid} failed (need root?)"
     fi

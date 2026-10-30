@@ -655,8 +655,33 @@ yr_check_existing() {
     return 0
 }
 
+# ===== workspace 目录属主（uid/gid）=====
+# yr start 将其经 -s 透传给 function_proxy（--workspace_uid/--workspace_gid），
+# 归属节点创建 /home/agentos/.users/<owner> 时按此 chown。默认跟随本机 agentos
+# 用户的真实 uid/gid：useradd 未指定 -u 时各环境可能不同，写死 1000 会与
+# create-user 的家目录属主错位。显式指定 WORKSPACE_UID/WORKSPACE_GID 可跳过检测。
+# 仅在 up 路径调用（install 阶段 agentos 用户可能尚未创建）；独立执行本脚本
+# （未走 agentos.sh up 的 ensure_agentos_user）时先幂等补建，保持自包含。
+_workspace_uidgid() {
+    if [ -n "${WORKSPACE_UID:-}" ] && [ -n "${WORKSPACE_GID:-}" ]; then
+        info "workspace owner uid/gid = ${WORKSPACE_UID}:${WORKSPACE_GID} (env override)"
+        return 0
+    fi
+    if ! id -u agentos >/dev/null 2>&1; then
+        warning "agentos user not found; creating it (standalone run without agentos.sh up?)"
+        useradd agentos 2>/dev/null \
+            || warning "failed to create agentos user; fallback uid/gid 1000"
+    fi
+    WORKSPACE_UID=$(id -u agentos 2>/dev/null || echo 1000)
+    WORKSPACE_GID=$(id -g agentos 2>/dev/null || echo 1000)
+    info "workspace owner uid/gid = ${WORKSPACE_UID}:${WORKSPACE_GID} (agentos user)"
+}
+
 yr_start_master() {
     local master_host="$1"
+
+    # workspace 目录属主跟随本机 agentos 用户，经 -s 透传给 function_proxy
+    _workspace_uidgid
 
     info "Starting openyuanrong master on ${master_host}..."
 
@@ -689,6 +714,8 @@ yr_start_master() {
         -s 'function_proxy.args.log_expiration_enable=${LOG_EXPIRATION_ENABLE}' \
         -s 'function_proxy.args.log_expiration_max_file_count=${LOG_EXPIRATION_MAX_FILE_COUNT}' \
         -s 'function_proxy.args.log_expiration_cleanup_interval=${LOG_EXPIRATION_CLEANUP_INTERVAL}' \
+        -s 'function_proxy.args.workspace_uid=${WORKSPACE_UID}' \
+        -s 'function_proxy.args.workspace_gid=${WORKSPACE_GID}' \
         ${ssh_opts}" 2>&1 | tee "${startup_log}"
 
     if grep -q "All components are healthy" "${startup_log}" 2>/dev/null || \
@@ -735,6 +762,9 @@ yr_start_agent() {
         warning "Could not detect master address, using ${master_address}"
     fi
 
+    # workspace 目录属主跟随本机 agentos 用户，经 -s 透传给 function_proxy
+    _workspace_uidgid
+
     info "Starting openyuanrong agent on ${agent_host}, master_address=${master_address}..."
     # 设置 TORCH_DEVICE_BACKEND_AUTOLOAD=0，避免环境 pytorch 问题导致函数实例拉不起来
     # --log-dir-prefix 与 master 端保持一致，会话/日志均落在 ${YR_LOG_DIR_PREFIX}
@@ -755,6 +785,8 @@ yr_start_agent() {
         -s 'function_proxy.args.log_expiration_enable=${LOG_EXPIRATION_ENABLE}' \
         -s 'function_proxy.args.log_expiration_max_file_count=${LOG_EXPIRATION_MAX_FILE_COUNT}' \
         -s 'function_proxy.args.log_expiration_cleanup_interval=${LOG_EXPIRATION_CLEANUP_INTERVAL}' \
+        -s 'function_proxy.args.workspace_uid=${WORKSPACE_UID}' \
+        -s 'function_proxy.args.workspace_gid=${WORKSPACE_GID}' \
         ${ssh_opts} --master_address=http://${master_address}" 2>&1; then
         success "openyuanrong agent started on ${agent_host}"
     else
@@ -856,6 +888,8 @@ _yr_resolve_yr_path() {
 # executor unit 通过 After/Wants 依赖 agentos-etcd.service（字面量，对应 etcd.sh 中的 AGENT_RUNTIME_ETCD_SVC）。
 _yr_generate_executor_unit() {
     local host_ip etcd_addr_list yr_bin py_bindir
+    # unit 固化生成时刻的 workspace 属主（uid/gid）；每次 up 重新渲染 unit 可跟随变化
+    _workspace_uidgid
     host_ip=$(_yr_cfg local-ip) || error "Failed to get local IP"
     etcd_addr_list=$(_yr_cfg etcd-address-list) || error "Failed to build etcd address list"
     yr_bin=$(_yr_resolve_yr_path)
@@ -890,6 +924,8 @@ ExecStart=${yr_bin} start --master --log-dir-prefix=${YR_LOG_DIR_PREFIX} \\
     -s 'function_proxy.args.log_expiration_enable=${LOG_EXPIRATION_ENABLE}' \\
     -s 'function_proxy.args.log_expiration_max_file_count=${LOG_EXPIRATION_MAX_FILE_COUNT}' \\
     -s 'function_proxy.args.log_expiration_cleanup_interval=${LOG_EXPIRATION_CLEANUP_INTERVAL}' \\
+    -s 'function_proxy.args.workspace_uid=${WORKSPACE_UID}' \\
+    -s 'function_proxy.args.workspace_gid=${WORKSPACE_GID}' \\
     -s 'values.frontend.ssh_enable=true' \\
     -s 'values.frontend.ssh_host_key="${AGENTOS_SSH_KEY}"' \\
     -s 'values.frontend.ssh_backend_key="${AGENTOS_SSH_KEY}"' \\
@@ -936,6 +972,8 @@ ExecStart=${yr_bin} start --log-dir-prefix=${YR_LOG_DIR_PREFIX} \\
     -s 'function_proxy.args.log_expiration_enable=${LOG_EXPIRATION_ENABLE}' \\
     -s 'function_proxy.args.log_expiration_max_file_count=${LOG_EXPIRATION_MAX_FILE_COUNT}' \\
     -s 'function_proxy.args.log_expiration_cleanup_interval=${LOG_EXPIRATION_CLEANUP_INTERVAL}' \\
+    -s 'function_proxy.args.workspace_uid=${WORKSPACE_UID}' \\
+    -s 'function_proxy.args.workspace_gid=${WORKSPACE_GID}' \\
     -s 'values.frontend.ssh_enable=true' \\
     -s 'values.frontend.ssh_host_key="${AGENTOS_SSH_KEY}"' \\
     -s 'values.frontend.ssh_backend_key="${AGENTOS_SSH_KEY}"' \\
