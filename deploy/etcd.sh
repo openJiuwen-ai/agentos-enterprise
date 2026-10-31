@@ -110,7 +110,9 @@ _yr_etcdctl_path() {
 }
 
 # ===== agent-runtime（openyuanrong）在 etcd 中写入的业务数据前缀 =====
-# yr stop --force 不会优雅退出清理 etcd 数据，down 后按前缀删除避免残留。
+# 由 master 节点的 agent-runtime down 流程调用清理（agent 节点 down 不清；
+# 前提：写方 function-proxy/function-master 已退出）：
+# 清掉本次运行的业务数据，避免残留干扰下次启动；up/restart 启动侧与故障自愈不触发清理。
 # 不动 etcd 自身集群元数据（member/ 等），仅清业务层数据。
 AGENT_RUNTIME_ETCD_DATA_PREFIXES=("/datasystem/" "/scheduler/" "/sn/" "/yr/")
 
@@ -261,10 +263,12 @@ EOF
     success "etcd data cleaned: ${AGENT_RUNTIME_ETCD_DATA_DIR}"
 }
 
-# ===== clean-yr-data: 清理 agent-runtime（openyuanrong）在 etcd 中残留的业务数据 =====
-# yr stop --force 是强制停止，不会优雅退出清理 etcd 业务数据。
+# ===== clean-yr-data: 清理 agent-runtime（openyuanrong）在 etcd 中的业务数据 =====
+# 由 master 节点的 agent-runtime down 流程调用（agent 节点 down 不清）：清掉本次运行的
+# 业务数据，避免下次启动读到旧拓扑/旧实例路由导致失败。调用前提：写方
+# （function-proxy/function-master）已退出——写方存活时清理会破坏运行中集群的数据；
+# up 与故障自愈路径不触发本命令。
 # 按前缀删除 /datasystem/、/scheduler/、/sn/、/yr/ 开头的 key，
-# 避免下次 up 时读到旧拓扑/旧实例路由导致路由失败。
 # 不动 etcd 自身集群元数据（member/ 等），仅清业务层数据。
 # etcd 服务必须正在运行（本命令不启停 etcd）。
 etcd_clean_yr_data() {
@@ -410,9 +414,9 @@ Commands:
   clean           清理 etcd 数据目录（交互确认，-y/--yes 跳过确认）
                   适用场景：etcd 拓扑变更、数据损坏修复、全新 re-bootstrap
                   平滑重启不需 clean，down + up 即可保留数据恢复
-  clean-yr-data   清理 agent-runtime（openyuanrong）在 etcd 中残留的业务数据（按前缀删除）
+  clean-yr-data   清理 agent-runtime（openyuanrong）在 etcd 中的业务数据（按前缀删除）
                   删除 /datasystem/、/scheduler/、/sn/、/yr/ 开头的 key
-                  etcd 服务必须正在运行；不影响 etcd 集群元数据
+                  由 master 节点的 agent-runtime down 调用（前提：function-proxy/function-master 已退出）；etcd 服务必须正在运行；不影响 etcd 集群元数据
 
 Environment:
   YR_PYTHON_VERSION          Python 版本（默认 3.11）

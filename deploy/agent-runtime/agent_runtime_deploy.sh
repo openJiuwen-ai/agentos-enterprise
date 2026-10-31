@@ -30,6 +30,8 @@ AGENT_RUNTIME_EXECUTOR_UNIT="/etc/systemd/system/${AGENT_RUNTIME_EXECUTOR_SVC}.s
 AGENT_RUNTIME_EXECUTOR_DROPIN_DIR="/etc/systemd/system/${AGENT_RUNTIME_EXECUTOR_SVC}.service.d"
 AGENT_RUNTIME_EXECUTOR_DROPIN="${AGENT_RUNTIME_EXECUTOR_DROPIN_DIR}/env.conf"
 YR_HEALTH_CHECK_RETRIES="${YR_HEALTH_CHECK_RETRIES:-30}"
+# down 清理 etcd 业务数据前，等待写方（function-proxy/function-master）退出的轮询次数（每次 5s）
+YR_WRITER_EXIT_RETRIES="${YR_WRITER_EXIT_RETRIES:-6}"
 
 # ===== frontend 端口 =====
 # 使用 --port-policy FIX 固定端口：端口被占用时 yr start 直接失败，而非静默切换到其他端口。
@@ -513,7 +515,7 @@ yr_uninstall_packages() {
     )
 
     # 卸载解释器：与 install 严格一致，只认 python${python_version}。缺失时不回退其他解释器，
-    # 所有包按 ❌ 失败记录并继续，由 deploy_yr_uninstall 结尾统一 error 汇总中断。
+    # 所有包按 ❌ 失败记录并继续，由 yr_uninstall 结尾统一 error 汇总中断。
     local py_bin=""
     if exec_on_host "${host}" "command -v python${python_version}" >/dev/null 2>&1; then
         py_bin="python${python_version}"
@@ -808,6 +810,14 @@ yr_stop_all() {
     yr_cleanup_processes "${local_ip}"
     # 兜底回收残留的 docker 工具沙箱容器（yr stop --force 不清理 docker 实例）
     yr_cleanup_tool_sandboxes "${local_ip}"
+    # 最后清理 etcd 残留状态数据（仅 master 节点，集群级操作，agent 节点 down 不清）。
+    # 与 systemd 模式共享同一前提：写方（function-proxy/function-master）确认退出后才清理
+    # —— yr_cleanup_processes 只按 yr start / /yr/ 路径两个模式强杀，写方 cmdline 不在其
+    # 中时仍可能存活，故复用 _yr_wait_writers_exit 轮询确认（超时强杀兜底，极端卡死则
+    # 跳过清理、保留现场）。
+    if _yr_cfg is-master-node >/dev/null 2>&1 && _yr_wait_writers_exit "${local_ip}"; then
+        _yr_clean_etcd_data "${local_ip}"
+    fi
 
     # 等待 master 节点 frontend 端口释放，避免快速 restart 时端口冲突导致 yr start 失败
     # 进程模式仅 master 节点启 frontend，agent 节点无 frontend；
@@ -846,8 +856,11 @@ _yr_cfg() {
     fi
 }
 
-# ===== 清理 agent-runtime（openyuanrong）在 etcd 中残留的业务数据 =====
-# yr stop --force 是强制停止，不会优雅退出清理 etcd 数据。
+# ===== 清理 agent-runtime（openyuanrong）在 etcd 中的业务数据 =====
+# down 流程的最后一步调用（systemd 模式在 yr_down_systemd、进程模式在 yr_stop_all）：
+# 此前进程已优雅退出、沙箱实例清理完成，etcd 里剩余的才是真正的残留状态数据。
+# 前提：仅 master 节点执行（集群级操作）；写方（function-proxy / function-master）
+# 已退出（见 _yr_wait_writers_exit），写方存活时清理会破坏运行中集群的数据。
 # 委托 deploy/etcd.sh clean-yr-data 按前缀删除，避免重复维护 etcdctl 定位逻辑。
 _yr_clean_etcd_data() {
     local host="$1"
@@ -860,6 +873,41 @@ _yr_clean_etcd_data() {
 
     info "Cleaning agent-runtime (openyuanrong) etcd data on ${host}..."
     bash "${etcd_sh}" clean-yr-data || warning "etcd clean-yr-data failed on ${host}"
+}
+
+# ===== 检测 etcd 业务数据写方（function-proxy / function-master）是否存活 =====
+_yr_writers_running() {
+    local host="$1"
+    local pids
+    pids=$(exec_on_host "${host}" "ps -ef | grep -E 'function[_-]proxy|function[_-]master' | grep -v grep" 2>/dev/null)
+    [ -n "${pids}" ]
+}
+
+# ===== 等待写方（function-proxy / function-master）退出（down 清理 etcd 的前提） =====
+# systemctl stop 返回后，KillMode=mixed 的 SIGTERM/SIGKILL 宽限期内进程可能仍短暂存活，
+# 故轮询确认写方退出后再清理；超时则复用 yr_cleanup_processes 强杀兜底。
+# 强杀后仍存活（极端卡死）则放弃清理、保留现场，由用户排查。
+# 返回 0 = 写方已退出（可安全清理）；返回 1 = 仍存活（调用方跳过清理）。
+_yr_wait_writers_exit() {
+    local host="$1"
+    local i
+
+    for i in $(seq 1 "${YR_WRITER_EXIT_RETRIES}"); do
+        if ! _yr_writers_running "${host}"; then
+            return 0
+        fi
+        sleep 5
+    done
+
+    if _yr_writers_running "${host}"; then
+        warning "function-proxy/function-master still alive after $((YR_WRITER_EXIT_RETRIES * 5))s, force killing before etcd cleanup"
+        yr_cleanup_processes "${host}"
+        if _yr_writers_running "${host}"; then
+            warning "writers survived force kill, skipping etcd cleanup to preserve state"
+            return 1
+        fi
+    fi
+    return 0
 }
 
 # ===== 定位 yr 入口脚本绝对路径 =====
@@ -1003,7 +1051,7 @@ EOF
 
 # ===== systemd up: 角色推导 → 生成 unit → enable --now → 健康检查 =====
 # etcd 启动已拆到 deploy/etcd.sh，需先执行 etcd.sh up
-deploy_yr_up_systemd() {
+yr_up_systemd() {
     [ -f "${AGENT_RUNTIME_CONFIG_PY}" ] || error "config parser not found: ${AGENT_RUNTIME_CONFIG_PY}"
     _yr_has_systemd || error "systemd not available; agent-runtime up requires systemd (or use --no-systemd)"
 
@@ -1028,8 +1076,11 @@ deploy_yr_up_systemd() {
 
 # ===== systemd down: 只停服务，不删 unit 文件（删文件留给 uninstall） =====
 # etcd 停止已拆到 deploy/etcd.sh down，此处不再触碰 etcd
-# yr stop --force 不会清理 etcd 业务数据，down 后按前缀清理残留 key
-deploy_yr_down_systemd() {
+# down 清理顺序：进程优雅退出（systemctl stop）→ 沙箱实例清理 → 最后清理 etcd 残留
+# 状态数据（此时物理资源已收尾，etcd 里剩余的才是真正的残留状态）。
+# etcd 清理仅 master 节点执行（前缀删除是集群级操作，agent 节点 down 不触碰集群
+# 共享数据），且前提是写方（function-proxy / function-master）已退出。
+yr_down_systemd() {
     _yr_has_systemd || { warning "systemd not available, nothing to stop"; return 0; }
 
     systemctl stop "${AGENT_RUNTIME_EXECUTOR_SVC}" 2>/dev/null || true
@@ -1037,19 +1088,23 @@ deploy_yr_down_systemd() {
     # 等待 frontend 端口释放，避免快速 restart 时端口冲突导致 yr start 失败
     _wait_port_release
 
-    # 清理 agent-runtime（openyuanrong）在 etcd 中残留的业务数据（topology/agentInfo/route/instance 等）
-    _yr_clean_etcd_data "$(get_local_ip)"
-
     # 兜底回收残留的 docker 工具沙箱容器（yr stop --force 不清理 docker 实例）
     yr_cleanup_tool_sandboxes "$(get_local_ip)"
+
+    # 最后一步：清理 etcd 残留状态数据。前提：本机是 master 节点（agent 节点
+    # 短路跳过），且写方（function-proxy/function-master）已退出；等待失败
+    # （极端卡死）则跳过清理、保留现场，由用户排查。
+    if _yr_cfg is-master-node >/dev/null 2>&1 && _yr_wait_writers_exit "$(get_local_ip)"; then
+        _yr_clean_etcd_data "$(get_local_ip)"
+    fi
 
     success "agent-runtime executor stopped"
 }
 
 # ===== 主流程 =====
-deploy_yr_up() {
+yr_up() {
     if [ "${NO_SYSTEMD}" != "1" ]; then
-        deploy_yr_up_systemd
+        yr_up_systemd
         return
     fi
     local local_ip master_host
@@ -1079,7 +1134,7 @@ deploy_yr_up() {
     #   - check 阶段 (phase=0) 失败（如发现已有集群）不清理，保护原可用集群
     trap '
         if [ "${yr_up_phase:-0}" = "1" ]; then
-            warning "deploy_yr_up failed during startup phase, cleaning up residual agent-runtime (openyuanrong) processes on this host..."
+            warning "yr_up failed during startup phase, cleaning up residual agent-runtime (openyuanrong) processes on this host..."
             yr_cleanup_processes "'"${local_ip}"'"
         fi
     ' EXIT
@@ -1129,9 +1184,9 @@ deploy_yr_up() {
     trap - EXIT
 }
 
-deploy_yr_down() {
+yr_down() {
     if [ "${NO_SYSTEMD}" != "1" ]; then
-        deploy_yr_down_systemd
+        yr_down_systemd
         return
     fi
     yr_stop_all
@@ -1139,7 +1194,7 @@ deploy_yr_down() {
 
 # ===== 状态探测：只读检测，不启停服务 =====
 # 输出格式：agent-runtime|<service>|<state>|<detail>|<version>（state 小写）
-deploy_yr_status() {
+yr_status() {
     # 探测 yuanrong 版本号：importlib.metadata 比 pip show 快约 30 倍
     local yr_ver="-"
     local pkg_ver
@@ -1150,15 +1205,15 @@ deploy_yr_status() {
     # 否则需确认 systemd 可用且 unit 文件存在——用户可能以 --no-systemd 部署但 status 未传该参数，
     # 此时 NO_SYSTEMD=0 但实际无 unit，应回退进程检测避免误报 stopped
     if [ "${NO_SYSTEMD}" != "1" ] && _yr_has_systemd && [ -f "${AGENT_RUNTIME_EXECUTOR_UNIT}" ]; then
-        _deploy_yr_status_systemd "${yr_ver}"
+        _yr_status_systemd "${yr_ver}"
         return $?
     fi
-    _deploy_yr_status_process "${yr_ver}"
+    _yr_status_process "${yr_ver}"
     return $?
 }
 
 # ----- systemd 模式：检测 agentos-executor.service -----
-_deploy_yr_status_systemd() {
+_yr_status_systemd() {
     local yr_ver="${1:-}"
     local svc="${AGENT_RUNTIME_EXECUTOR_SVC}"
     local is_active is_failed role
@@ -1195,7 +1250,7 @@ _deploy_yr_status_systemd() {
 }
 
 # ----- 进程模式：检测 yr start 阻塞进程 + /yr/ 运行时进程 -----
-_deploy_yr_status_process() {
+_yr_status_process() {
     local yr_ver="${1:-}"
     local start_pids yr_pids role
 
@@ -1231,12 +1286,12 @@ _deploy_yr_status_process() {
     fi
 }
 
-deploy_yr_restart() {
-    deploy_yr_down
-    deploy_yr_up
+yr_restart() {
+    yr_down
+    yr_up
 }
 
-deploy_yr_install() {
+yr_install() {
     local local_host
     local_host=$(get_local_ip)
     local arch
@@ -1262,14 +1317,15 @@ deploy_yr_install() {
     success "openyuanrong packages install completed!"
 }
 
-deploy_yr_uninstall() {
+yr_uninstall() {
     local local_host
     local_host=$(get_local_ip)
 
-    # 卸载前先停服务并清理 unit 文件（保留 etcd 数据）。
+    # 卸载前先停服务并清理 unit 文件；etcd 业务数据随 down 流程按前提清理
+    # （写方退出后才清，见 yr_down_systemd），etcd 集群元数据保留。
     # 进程模式的停止由用户显式 down。
     if [ "${NO_SYSTEMD}" != "1" ] && _yr_has_systemd; then
-        deploy_yr_down_systemd
+        yr_down_systemd
         # down 只 stop，unit 文件的 disable + 删除留给 uninstall
         systemctl disable "${AGENT_RUNTIME_EXECUTOR_SVC}" 2>/dev/null || true
         rm -rf "${AGENT_RUNTIME_EXECUTOR_UNIT}" "${AGENT_RUNTIME_EXECUTOR_DROPIN_DIR}"
@@ -1418,7 +1474,7 @@ EOF
 
 main() {
     parse_args "$@"
-    deploy_yr_${CMD}
+    yr_${CMD}
 }
 
 main "$@"
