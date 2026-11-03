@@ -49,7 +49,10 @@ jiuwenswarm_run_deploy() {
 }
 
 # ===== install/uninstall: 本机 pip 操作 =====
-# jiuwenswarm whl 包名格式: jiuwenswarm-<version>-py3-none-any.whl，已包含 gateway
+# 发行包名：0.2.8 起为 workswarm-<version>-py3-none-any.whl；日构建（agent_os 分支）
+# 仍为 jiuwenswarm-<version>-py3-none-any.whl。两者包内路径和 console script 均不变，
+# 只有 pip 发行包名不同。whl 已包含 gateway。
+
 jiuwenswarm_install() {
     # 工具沙箱镜像检查：先于任何安装动作执行（fail-fast），不满足条件时直接中断，
     # 避免 whl 已装到一半、后续模块未装、无 install 汇总的半安装状态
@@ -60,23 +63,68 @@ jiuwenswarm_install() {
     [ -z "${local_host}" ] && local_host="127.0.0.1"
 
     local found_whl
-    found_whl=$(ls "${AGENTOS_ROOT}"/jiuwenswarm-*-py3-none-any.whl 2>/dev/null || true)
+    # 0.2.8 起官方发行包为 workswarm-*；日构建仍为 jiuwenswarm-*。workswarm 优先。
+    # 注意：不能用单个 ls 合并两个 glob —— ls 会跨参数做字母序合并排序，而
+    # jiuwenswarm 在任何 locale 下都排在 workswarm 之前，会让 "workswarm 优先" 失效。
+    # 故先查 workswarm，仅当无匹配时再回退 jiuwenswarm。
+    found_whl=$(ls "${AGENTOS_ROOT}"/workswarm-*-py3-none-any.whl 2>/dev/null || true)
+    if [ -z "${found_whl}" ]; then
+        found_whl=$(ls "${AGENTOS_ROOT}"/jiuwenswarm-*-py3-none-any.whl 2>/dev/null || true)
+    fi
     if [ -n "${found_whl}" ]; then
         local jw_whl="${found_whl%%$'\n'*}"
         info "Found jiuwenswarm whl: ${jw_whl}"
+        # 0.2.8 起发行包名改为 workswarm：新旧发行包的 RECORD 会同时声明同一批
+        # jiuwenswarm/* 文件（包内路径不变），两份 dist-info 并存后 pip uninstall
+        # 任一个都会删掉另一个仍在用的文件。
+        # 顺序：先装新包（失败时旧包仍在，服务不中断），装成功后再定向删除旧发行包的
+        # dist-info 目录（仅清元数据，不动 jiuwenswarm/* 共享文件），覆盖
+        # workswarm→jiuwenswarm 与 jiuwenswarm→workswarm 两个方向。
+        local new_dist other_dist
+        if [[ "$(basename "${jw_whl}")" == workswarm-* ]]; then
+            new_dist="workswarm"; other_dist="jiuwenswarm"
+        else
+            new_dist="jiuwenswarm"; other_dist="workswarm"
+        fi
         if bash -c "python${YR_PYTHON_VERSION} -m pip install '${jw_whl}[ssh]' --quiet"; then
-            # 加固：pip show 确认包确实已注册到当前 Python 环境
-            if bash -c "python${YR_PYTHON_VERSION} -m pip show jiuwenswarm >/dev/null 2>&1"; then
-                success "jiuwenswarm installed on ${local_host}"
+            # 加固：pip show 确认新发行包确实已注册到当前 Python 环境
+            if python${YR_PYTHON_VERSION} -m pip show "${new_dist}" >/dev/null 2>&1; then
+                success "jiuwenswarm installed on ${local_host} (${new_dist})"
             else
-                error "pip install returned success but 'pip show jiuwenswarm' failed on ${local_host} (wheel may be corrupted or installed to wrong env)"
+                error "pip install returned success but 'pip show ${new_dist}' failed on ${local_host} (wheel may be corrupted or installed to wrong env)"
+            fi
+            # 清理旧发行包残留的 dist-info 元数据（仅删 *.dist-info 目录，不动共享文件）。
+            # 用 pip show 的 Location 定位 site-packages，避免 getsitepackages 在 venv 下取错索引。
+            if python${YR_PYTHON_VERSION} -m pip show "${other_dist}" >/dev/null 2>&1; then
+                local old_loc old_dis_arr=()
+                old_loc=$(python${YR_PYTHON_VERSION} -m pip show "${other_dist}" 2>/dev/null \
+                    | awk -F': ' '/^Location:/{print $2; exit}')
+                # old_loc 为空时必须跳过：否则 "${old_loc}"/${other_dist}-*.dist-info 会
+                # 退化成 /${other_dist}-*.dist-info 从根目录 glob（无 nullglob 下未匹配
+                # 保留字面量，rm -f 虽不删东西但会打印误导性的 "Removed" 日志）。
+                if [ -n "${old_loc}" ]; then
+                    # 用 ls -d 把 glob 解析成实际路径，再用 mapfile 收进数组，最后
+                    # rm -rf -- "${arr[@]}" 逐元素传递。不能写成 rm -rf ${old_dis}：
+                    # old_loc 来自 pip show 的 Location，是 site-packages 绝对路径，可能
+                    # 含空格（自定义 venv 如 /opt/agent os/venv/...）或通配符。含空格路径
+                    # 不加引号会按 IFS 拆成残缺 token，rm -rf 递归删除真实存在的无关目录
+                    # （root 执行，低概率但后果严重）；含 */? 还会被二次 glob 扩展。
+                    mapfile -t old_dis_arr < <(ls -d "${old_loc}"/${other_dist}-*.dist-info 2>/dev/null || true)
+                    if [ ${#old_dis_arr[@]} -gt 0 ]; then
+                        if rm -rf -- "${old_dis_arr[@]}"; then
+                            info "Removed orphaned ${other_dist} dist-info: ${old_dis_arr[*]}"
+                        else
+                            warning "Failed to remove orphaned ${other_dist} dist-info: ${old_dis_arr[*]}"
+                        fi
+                    fi
+                fi
             fi
         else
             error "Failed to install jiuwenswarm on ${local_host}"
         fi
     else
-        warning "No jiuwenswarm whl found at ${AGENTOS_ROOT}/jiuwenswarm-*-py3-none-any.whl, skipping jiuwenswarm install"
-        warning "Please place jiuwenswarm-<version>-py3-none-any.whl in ${AGENTOS_ROOT}/ before install"
+        warning "No jiuwenswarm/workswarm whl found at ${AGENTOS_ROOT}/ (expected workswarm-<version>-py3-none-any.whl or jiuwenswarm-<version>-py3-none-any.whl), skipping jiuwenswarm install"
+        warning "Please place the jiuwenswarm wheel in ${AGENTOS_ROOT}/ before install"
     fi
 
     # 安装完成后刷新存量用户配置
@@ -261,10 +309,36 @@ jiuwenswarm_uninstall() {
     # 先停用 systemd 服务，再卸载 pip 包，避免卸载后残留 unit 文件
     jiuwenswarm_disable_systemd
 
-    if bash -c "python${YR_PYTHON_VERSION} -m pip uninstall -y jiuwenswarm openjiuwen 2>/dev/null"; then
-        success "jiuwenswarm and openjiuwen uninstalled on ${local_host}"
+    # 0.2.8 起发行包名为 workswarm；旧环境/日构建为 jiuwenswarm，两者都尝试卸载
+    local name removed="" openjiuwen_removed=0
+    for name in workswarm jiuwenswarm; do
+        if python${YR_PYTHON_VERSION} -m pip show "${name}" >/dev/null 2>&1; then
+            if python${YR_PYTHON_VERSION} -m pip uninstall -y "${name}" >/dev/null 2>&1; then
+                removed+="${name} "
+            else
+                warning "Failed to uninstall ${name} on ${local_host}"
+            fi
+        fi
+    done
+    # openjiuwen: 仅在已安装时卸载，退出码参与成败判定（不再用 || true 吞掉）。
+    # 吞掉退出码会让下面 success 固定打印 "and openjiuwen uninstalled" 产生假成功，
+    # 与本 PR 把 openjiuwen 升到 0.1.20 的诉求冲突（卸载失败需如实告警）。
+    if python${YR_PYTHON_VERSION} -m pip show openjiuwen >/dev/null 2>&1; then
+        if python${YR_PYTHON_VERSION} -m pip uninstall -y openjiuwen >/dev/null 2>&1; then
+            openjiuwen_removed=1
+        else
+            warning "Failed to uninstall openjiuwen on ${local_host}"
+        fi
+    fi
+
+    if [ -n "${removed}" ]; then
+        if [ "${openjiuwen_removed}" -eq 1 ]; then
+            success "jiuwenswarm (${removed% }) and openjiuwen uninstalled on ${local_host}"
+        else
+            success "jiuwenswarm (${removed% }) uninstalled on ${local_host}"
+        fi
     else
-        warning "jiuwenswarm/openjiuwen not installed or failed to uninstall on ${local_host}"
+        warning "jiuwenswarm/workswarm not installed on ${local_host}, nothing to uninstall"
     fi
 }
 
@@ -275,10 +349,20 @@ jiuwenswarm_status() {
     local rc=0
 
     # 探测 jiuwenswarm 版本号：importlib.metadata 比 pip show 快约 30 倍
-    local jwsw_ver="-"
-    local pkg_ver
-    pkg_ver=$(python${YR_PYTHON_VERSION} -c "from importlib.metadata import version; print(version('jiuwenswarm'))" 2>/dev/null || true)
-    [ -n "${pkg_ver}" ] && jwsw_ver="${pkg_ver}"
+    # 发行包名随版本变化：0.2.8 起为 workswarm，旧包为 jiuwenswarm。
+    # 两个包名在单个 Python 进程内按序探测，避免只有旧包的存量环境启动两个进程、
+    # status 按节点 fanout 时耗时翻倍（与上面 "比 pip show 快 30 倍" 的优化意图相悖）。
+    local jwsw_ver
+    jwsw_ver=$(python${YR_PYTHON_VERSION} -c "
+from importlib.metadata import version, PackageNotFoundError
+for pkg in ('workswarm', 'jiuwenswarm'):
+    try:
+        print(version(pkg))
+        break
+    except PackageNotFoundError:
+        continue
+" 2>/dev/null || true)
+    [ -z "${jwsw_ver}" ] && jwsw_ver="-"
 
     # systemd 模式：枚举 gateway 和 web 两类 unit
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then

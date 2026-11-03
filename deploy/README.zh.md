@@ -314,11 +314,11 @@ MooseFS RPM 包（moosefs-master、moosefs-chunkserver、moosefs-client）和 fu
 
 #### jiuwenbox
 
-- 配置文件：`deploy/jiuwenbox/default-policy.yaml`（`__JIUWENSWARM_EXTENSIONS_DIR__` 在各机 start 时按该机 `pip show jiuwenswarm` 替换）
+- 配置文件：`deploy/jiuwenbox/default-policy.yaml`（`__JIUWENSWARM_EXTENSIONS_DIR__` 在各机 start 时按该机 `pip show workswarm`/`jiuwenswarm` 替换）
 - `module.sh` 为薄封装；启停逻辑在 `jiuwenbox_deploy.sh`
 - 每台机器各启动一份 jiuwenbox（无 master/agent 差异）
 - 已有实例时只报错、不自动清理（对齐 agent-runtime）；需先 `down` 再 `up`
-- 前置：各目标机已安装 jiuwenswarm（含 `jiuwenbox-server`）
+- 前置：各目标机已安装 jiuwenswarm/workswarm（含 `jiuwenbox-server`）
 
 #### agent-runtime
 
@@ -448,7 +448,7 @@ docker load -i yr-runtime-sandbox.tar
 `install` 时统一从 agentos 根目录（`deploy` 的同级目录）获取 whl 包：
 
 - **openyuanrong**：`YR_PKG_BASE` 默认指向 agentos 根目录，agent-runtime 脚本按版本/arch 自动拼接 whl 文件名
-- **jiuwenswarm**：匹配 `jiuwenswarm-*-py3-none-any.whl`（如 `jiuwenswarm-0.2.3-py3-none-any.whl`，已包含 gateway）
+- **jiuwenswarm**：0.2.8 起发行包名为 workswarm，优先匹配 `workswarm-*-py3-none-any.whl`（如 `workswarm-0.2.8-py3-none-any.whl`）；旧版/日构建回退 `jiuwenswarm-*-py3-none-any.whl`（如 `jiuwenswarm-0.2.3-py3-none-any.whl`）。两者包内路径与 console script 不变，已包含 gateway
 - **a2x-registry**：匹配 `a2x_registry-*-py3-none-any.whl`（agent-gateway 模块）
 - **moosefs**：从 agentos 根目录获取 RPM 包（moosefs-master/chunkserver/client）
 

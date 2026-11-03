@@ -222,12 +222,16 @@ remove_stale_uds_socket() {
 
 # ===== policy / 前置检查 =====
 resolve_extensions_dir() {
-  local py pip_cmd location ext_dir
+  local py pip_cmd name location="" ext_dir
   require_python
   py="$(python_bin)"
   pip_cmd="${py} -m pip"
-  location="$(${pip_cmd} show jiuwenswarm 2>/dev/null | awk '/^Location:/{print $2}')" || true
-  [ -n "${location}" ] || error "Cannot resolve jiuwenswarm via '${pip_cmd} show jiuwenswarm'. Is it installed?"
+  # 发行包名：0.2.8 起为 workswarm，旧包/日构建为 jiuwenswarm
+  for name in workswarm jiuwenswarm; do
+    location="$(${pip_cmd} show "${name}" 2>/dev/null | awk '/^Location:/{print $2}')" || true
+    [ -n "${location}" ] && break
+  done
+  [ -n "${location}" ] || error "Cannot resolve jiuwenswarm via '${pip_cmd} show workswarm|jiuwenswarm'. Is it installed?"
   ext_dir="${location}/jiuwenswarm/extensions"
   [ -d "${ext_dir}" ] || warning "extensions directory not found: ${ext_dir} (binding anyway)"
   echo "${ext_dir}"
@@ -496,6 +500,8 @@ Environment=PATH=${py_bindir}:${PATH}
 Environment=LD_LIBRARY_PATH=${py_libdir}:${LD_LIBRARY_PATH:-}
 Environment=JIUWENBOX_LISTEN=${LISTEN_URI}
 Environment=JIUWENBOX_POLICY_PATH=${POLICY_ABS}
+# 0.2.8 起：数据面 etcd 同步与默认策略持久化只在 agentos 运行标识下启用
+Environment=JIUWENBOX_RUNTIME_PROFILE=agentos
 EOF
   if [[ -n "${UDS_MODE:-}" ]]; then
     echo "Environment=JIUWENBOX_UDS_MODE=${UDS_MODE}" >> "${JIUWENBOX_DROPIN}"
@@ -637,7 +643,7 @@ start_on_this_host() {
   info "systemd not available, using nohup mode..."
   py="$(python_bin)"
   log_level="${JIUWENBOX_LOG_LEVEL:-info}"
-  start_env=("JIUWENBOX_LISTEN=$LISTEN_URI" "JIUWENBOX_POLICY_PATH=$POLICY_ABS")
+  start_env=("JIUWENBOX_LISTEN=$LISTEN_URI" "JIUWENBOX_POLICY_PATH=$POLICY_ABS" "JIUWENBOX_RUNTIME_PROFILE=agentos")
   [[ -n "${UDS_MODE:-}" ]] && start_env+=("JIUWENBOX_UDS_MODE=$UDS_MODE")
   [[ -n "${SAVE_LOGS_DIR:-}" ]] && start_env+=("JIUWENBOX_SAVE_LOGS_DIR=$SAVE_LOGS_DIR")
   [[ -n "${JIUWENBOX_ETCD_ENDPOINTS:-}" ]] && start_env+=("JIUWENBOX_ETCD_ENDPOINTS=$JIUWENBOX_ETCD_ENDPOINTS")
@@ -822,11 +828,19 @@ deploy_jiuwenbox_status() {
   command -v jiuwenbox >/dev/null 2>&1 && has_cli=1 || has_cli=0
 
   # 探测 jiuwenbox 版本号：jiuwenbox-server 随 jiuwenswarm whl 安装
-  # importlib.metadata 比 pip show 快约 30 倍
-  local jwb_ver="-"
-  local pkg_ver
-  pkg_ver=$("$(python_bin)" -c "from importlib.metadata import version; print(version('jiuwenswarm'))" 2>/dev/null || true)
-  [ -n "${pkg_ver}" ] && jwb_ver="${pkg_ver}"
+  # importlib.metadata 比 pip show 快约 30 倍；发行包名 0.2.8 起为 workswarm。
+  # 两个包名在单个 Python 进程内按序探测，避免只有旧包的存量环境启动两个进程。
+  local jwb_ver
+  jwb_ver=$("$(python_bin)" -c "
+from importlib.metadata import version, PackageNotFoundError
+for pkg in ('workswarm', 'jiuwenswarm'):
+    try:
+        print(version(pkg))
+        break
+    except PackageNotFoundError:
+        continue
+" 2>/dev/null || true)
+  [ -z "${jwb_ver}" ] && jwb_ver="-"
 
   # systemd 模式
   if _jiuwenbox_has_systemd && [ -f "${JIUWENBOX_UNIT}" ]; then

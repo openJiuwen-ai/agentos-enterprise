@@ -24,6 +24,7 @@ build==1.5.1
 burner-redis==0.1.7
 cacheout==0.16.0
 cachetools==7.1.4
+cbor2==6.2.0.post1
 certifi==2026.7.22
 cffi==2.1.0
 charset-normalizer==3.4.9
@@ -74,14 +75,18 @@ graphviz==0.21
 greenlet==3.5.4
 grpcio==1.82.1
 h11==0.16.0
+h2==4.4.1
 hf-xet==1.5.2
+hpack==4.2.0
 htmldate==1.10.0
 httpcore==1.0.9
 httptools==0.8.0
 httpx==0.28.1
 httpx-sse==0.4.3
 huggingface_hub==1.24.0
+hyperframe==6.1.0
 idna==3.18
+imageio-ffmpeg==0.7.0
 importlib_metadata==8.7.1
 importlib_resources==7.1.0
 installer==1.0.1
@@ -129,7 +134,7 @@ openai==2.46.0
 openai-codex==0.144.4
 openai-codex-cli-bin==0.144.4
 openapi-pydantic==0.5.1
-openjiuwen==0.1.19.post3
+openjiuwen==0.1.20
 openpyxl==3.1.5
 opentelemetry-api==1.41.1
 opentelemetry-exporter-otlp-proto-common==1.41.1
@@ -177,6 +182,7 @@ pyee==13.0.1
 Pygments==2.20.0
 PyJWT==2.13.0
 pymilvus==2.6.9
+pyOpenSSL==26.4.0
 pyoxigraph==0.5.9
 pyparsing==3.3.2
 PyPDF2==3.0.1
@@ -239,6 +245,7 @@ truststore==0.10.4
 typer==0.27.0
 typing-inspection==0.4.2
 typing_extensions==4.16.0
+tzdata==2026.6
 tzlocal==5.4.4
 uncalled-for==0.3.2
 urllib3==2.7.0
@@ -247,6 +254,7 @@ uvicorn==0.51.0
 uvloop==0.22.1
 watchdog==6.0.0
 watchfiles==1.2.0
+webauthn==3.0.1
 websocket-client==1.9.0
 websockets==15.0.1
 wecom-aibot-sdk==1.0.8
