@@ -224,3 +224,6 @@ network:
     # TCP destination ports blocked for inbound traffic. Block rules take precedence.
     blocked_ports: []
 
+cgroup:
+  memory_max: "2048M"
+  cpu_max: 1.0
