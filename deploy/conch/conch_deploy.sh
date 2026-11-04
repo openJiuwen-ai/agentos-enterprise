@@ -5,7 +5,7 @@ set -euo pipefail
 # ============================================================
 # Conch 部署脚本
 # 优先使用 systemd 托管；systemd 不可用时回退直接管理 conchd。
-# RPM 安装方式随操作系统不同（openeuler-2403/2203、ubuntu-2404/2204），
+# 安装方式随操作系统不同（openeuler-2403/2203、ubuntu-2404/2204），
 # 详见 print_help 中 install 命令的说明。
 # 用法:
 #   ./conch_deploy.sh up --ip 192.168.1.1
@@ -55,6 +55,24 @@ install_rpm() {
     success "${label} installed"
 }
 
+# install_yum <包名或本地RPM文件...>: yum 安装（包名从系统源装，本地 RPM 依赖由源自动解决）
+install_yum() {
+    info "Installing via yum: $*"
+    yum install -y "$@" \
+        || error "Failed to install via yum: $*"
+    success "$* installed"
+}
+
+# install_apt <包名...>: apt 安装 OS 依赖（Ubuntu）
+install_apt() {
+    info "Installing via apt: $*"
+    DEBIAN_FRONTEND=noninteractive apt-get update \
+        || warning "apt-get update failed; falling back to existing package lists"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" \
+        || error "Failed to install via apt: $*"
+    success "$* installed"
+}
+
 install_conch_wheel() {
     local wheel_source wheel_dest python_bin
     wheel_source=$(rpm -ql conch 2>/dev/null \
@@ -80,7 +98,7 @@ install_conch_wheel() {
 # ===== 操作系统检测 =====
 # 检测当前系统，成功时设置 OS_VARIANT 并返回 0：
 #   openeuler-2403 / openeuler-2203 / ubuntu-2404 / ubuntu-2204
-# Conch 各操作系统的 RPM 安装清单与参数不同（见 conch_install）。
+# Conch 各操作系统的安装方式与清单不同（见 conch_install）。
 detect_os_variant() {
     local os_type="" os_version=""
     OS_VARIANT=""
@@ -402,8 +420,6 @@ check_existing() {
 }
 
 conch_install() {
-    command -v rpm >/dev/null 2>&1 || error "rpm command not found"
-
     detect_os_variant \
         || error "Unsupported OS for Conch install; supported: openEuler 24.03/22.03, Ubuntu 24.04/22.04"
     info "Detected OS: ${OS_VARIANT}"
@@ -414,29 +430,30 @@ conch_install() {
 
     case "${OS_VARIANT}" in
         openeuler-2403)
-            # 24.03：依赖齐备，按原有顺序直接安装（保持原有流程不变）
+            # 24.03：erofs-utils/stratovirt/conch 均为部署包 RPM，经 yum 安装（依赖由源自动解决）
             erofs_rpm=$(find_rpm erofs-utils) || error "erofs-utils RPM not found in ${AGENTOS_ROOT}"
-            install_rpm erofs-utils "${erofs_rpm}"
-            install_rpm stratovirt "${stratovirt_rpm}"
-            install_rpm conch "${conch_rpm}"
+            install_yum "${erofs_rpm}" "${stratovirt_rpm}" "${conch_rpm}"
             ;;
         openeuler-2203)
-            # 22.03：erofs/stratovirt 可直接安装；conch 依赖 virtiofsd，
-            # 须先用 --replacefiles 安装部署包自带的 virtiofsd RPM（其文件与系统已有包冲突）
+            # 22.03：erofs-utils/stratovirt/conch 均为部署包 RPM，经 yum 安装（依赖由源自动解决）；
+            # 源内无独立 virtiofsd 包，先装 qemu（携带 /usr/libexec/virtiofsd），再用部署包
+            # virtiofsd RPM 以 --replacefiles 覆盖该文件
             erofs_rpm=$(find_rpm erofs-utils) || error "erofs-utils RPM not found in ${AGENTOS_ROOT}"
             virtiofsd_rpm=$(find_rpm virtiofsd) || error "virtiofsd RPM not found in ${AGENTOS_ROOT}"
-            install_rpm erofs-utils "${erofs_rpm}"
-            install_rpm stratovirt "${stratovirt_rpm}"
+            install_yum "${stratovirt_rpm}" "${erofs_rpm}"
+            install_yum qemu
             install_rpm virtiofsd "${virtiofsd_rpm}" --replacefiles
-            install_rpm conch "${conch_rpm}"
+            install_yum "${conch_rpm}"
             ;;
         ubuntu-2404)
-            # Ubuntu 24.04：erofs-utils 由 apt 安装（非本脚本 rpm 安装），仅需安装 stratovirt/conch
+            # Ubuntu 24.04：OS 依赖由 apt 安装（含 erofs-utils/virtiofsd），stratovirt/conch 用部署包 RPM --nodeps 安装
+            install_apt rpm erofs-utils virtiofsd containernetworking-plugins kmod procps iptables libpixman-1-0
             install_rpm stratovirt "${stratovirt_rpm}" --nodeps
             install_rpm conch "${conch_rpm}" --nodeps
             ;;
         ubuntu-2204)
-            # Ubuntu 22.04：erofs-utils/stratovirt/virtiofsd/conch 全部 --nodeps 安装
+            # Ubuntu 22.04：OS 依赖由 apt 安装（qemu 提供 virtiofsd 对应文件），erofs-utils/stratovirt/virtiofsd/conch 全部 --nodeps 安装
+            install_apt rpm containernetworking-plugins kmod qemu procps iptables libpixman-1-0
             erofs_rpm=$(find_rpm erofs-utils) || error "erofs-utils RPM not found in ${AGENTOS_ROOT}"
             virtiofsd_rpm=$(find_rpm virtiofsd) || error "virtiofsd RPM not found in ${AGENTOS_ROOT}"
             install_rpm erofs-utils "${erofs_rpm}" --nodeps
@@ -452,7 +469,7 @@ conch_install() {
     command -v mkfs.erofs >/dev/null 2>&1 || error "mkfs.erofs not found after installation"
     command -v stratovirt >/dev/null 2>&1 || error "stratovirt not found after installation"
     command -v conchd >/dev/null 2>&1 || error "conchd not found after installation"
-    success "Conch RPM installation completed"
+    success "Conch installation completed"
 }
 
 deploy_conch_up() {
@@ -624,7 +641,8 @@ Commands:
             （本地 tar 优先，缺失时从 registry 拉取）
   down      在目标主机停止 conchd
   restart   在目标主机重启 conchd
-  install   本机安装 RPM，并安装 RPM 内置的 Python Wheel
+  install   本机安装 Conch 及依赖（openEuler 用 yum 安装，Ubuntu 用 apt + 部署包 RPM），
+            并安装 RPM 内置的 Python Wheel
   uninstall 本机卸载 Python Wheel 和 RPM
   status    查询本机 conchd 状态
 
@@ -640,10 +658,13 @@ Environment Variables:
   CONCH_SERVICE  systemd unit name (default: conchd.service)
 
 RPM install（自动检测操作系统，Wheel 安装流程各系统一致）:
-  openeuler-2403: erofs-utils -> stratovirt -> conch
-  openeuler-2203: erofs-utils -> stratovirt -> virtiofsd(--replacefiles) -> conch
-  ubuntu-2404:    stratovirt -> conch                                    (--nodeps)
-  ubuntu-2204:    erofs-utils -> stratovirt -> virtiofsd -> conch        (--nodeps)
+  openeuler-2403: erofs-utils、stratovirt、conch 均用 yum 安装部署包 RPM（依赖由源自动解决）
+  openeuler-2203: yum 安装 qemu（系统源）；erofs-utils、stratovirt、conch 用 yum 安装部署包 RPM；
+                  virtiofsd 用 rpm -ivh --replacefiles 安装（覆盖 qemu 的 /usr/libexec/virtiofsd）
+  ubuntu-2404:    apt 安装 rpm、erofs-utils、virtiofsd、containernetworking-plugins、kmod、
+                  procps、iptables、libpixman-1-0；stratovirt、conch 用部署包 RPM --nodeps 安装
+  ubuntu-2204:    apt 安装 rpm、containernetworking-plugins、kmod、qemu、procps、iptables、
+                  libpixman-1-0；erofs-utils、stratovirt、virtiofsd、conch 用部署包 RPM --nodeps 安装
 RPM uninstall 与各操作系统的安装清单保持一致（逆序卸载）。
 EOF
 }
