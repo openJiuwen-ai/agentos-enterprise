@@ -18,6 +18,8 @@ BIND_IP="${BIND_IP:-}"
 PYTHON_CONFIG=""
 POLICY_TEMPLATE="${SCRIPT_DIR}/default-policy.yaml"
 
+OS_FAMILY=""
+
 RUN_DIR="${JIUWENBOX_RUN_DIR:-/tmp/jiuwenbox}"
 LOG_DIR="${JIUWENBOX_LOG_DIR:-/var/log/agentos}"
 LOG_FILE="${LOG_DIR}/jiuwenbox.log"
@@ -56,7 +58,7 @@ Commands:
   up        在目标主机启动 jiuwenbox（每台各一份）
   down      在目标主机停止 jiuwenbox
   restart   先 down 再 up
-  install   安装 jiuwenbox
+  install   安装 jiuwenbox 运行依赖（bubblewrap/bwrap、iptables、iproute 或 iproute2）
   uninstall 卸载 jiuwenbox
   status    查看 jiuwenbox 运行状态
 
@@ -71,6 +73,8 @@ Environment:
   JIUWENBOX_ETCD_ENDPOINTS  (empty = fill from ~/.agentos/deploy/config.yaml etcd_nodes)
 
 Notes:
+  install 按操作系统安装系统依赖：openEuler 用 yum（iproute），Ubuntu 用 apt（iproute2）。
+  bubblewrap 在部分 openEuler 版本中包名为 bwrap，安装失败时会改用该包名重试。
   有 systemd 时生成 jiuwenbox.service（Restart=on-failure, RestartSec=3）并 enable；
   无 systemd 时回退 nohup（被 kill 后不会自动拉起）。
 
@@ -799,15 +803,152 @@ parse_args() {
   [ -n "${CMD:-}" ] || print_help
 }
 
+# ===== 系统依赖安装（install）=====
+# 包管理器用法对齐 conch_deploy.sh（openEuler: yum，Ubuntu: apt）。
+# bubblewrap 包名回退对齐 install_deps.sh：部分发行版提供的是 bwrap 包。
+
+# 识别 openEuler / Ubuntu。未显式测试的小版本只告警并继续；其他发行版直接失败。
+detect_os_family() {
+  local os_type="" os_version=""
+  OS_FAMILY=""
+  if [ -f /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_type="${ID:-}"
+    os_version="${VERSION_ID:-}"
+  elif [ -f /etc/openEuler-release ]; then
+    os_type="openEuler"
+    os_version=$(grep -oE '[0-9]+\.[0-9]+' /etc/openEuler-release | head -n1)
+  fi
+  os_type=$(echo "${os_type}" | tr '[:upper:]' '[:lower:]')
+
+  case "${os_type}" in
+    openeuler)
+      OS_FAMILY="openeuler"
+      case "${os_version}" in
+        22.03*|24.03*) ;;
+        *) warning "openEuler version ${os_version:-unknown} not explicitly tested (expected 22.03 or 24.03), proceeding anyway" ;;
+      esac
+      ;;
+    ubuntu)
+      OS_FAMILY="ubuntu"
+      case "${os_version}" in
+        22.04*|24.04*) ;;
+        *) warning "Ubuntu version ${os_version:-unknown} not explicitly tested (expected 22.04 or 24.04), proceeding anyway" ;;
+      esac
+      ;;
+    *)
+      error "Unsupported OS for jiuwenbox install: ${os_type:-unknown} ${os_version:-unknown}. Only openEuler and Ubuntu are supported."
+      ;;
+  esac
+  info "Detected OS: ${os_type} ${os_version} (${OS_FAMILY})"
+}
+
+# install_yum <包名...>: yum 安装（openEuler）
+install_yum() {
+  info "Installing via yum: $*"
+  yum install -y "$@"
+}
+
+# install_apt <包名...>: apt 安装（Ubuntu）
+install_apt() {
+  info "Installing via apt: $*"
+  DEBIAN_FRONTEND=noninteractive apt-get update \
+    || warning "apt-get update failed; falling back to existing package lists"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+}
+
+# 命令已在 PATH 中则视为依赖已安装，不再走包管理器。
+jiuwenbox_dep_present() {
+  case "$1" in
+    bwrap) command -v bwrap >/dev/null 2>&1 ;;
+    ip) command -v ip >/dev/null 2>&1 ;;
+    iptables)
+      command -v iptables >/dev/null 2>&1 \
+        || command -v iptables-nft >/dev/null 2>&1 \
+        || command -v iptables-legacy >/dev/null 2>&1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# 安装 iptables、iproute/iproute2、bubblewrap。已有命令跳过；bubblewrap 失败时改试 bwrap。
+install_jiuwenbox_os_deps() {
+  local iproute_pkg mgr pkg
+  local -a missing=() pkgs=() retry=()
+  local need_bwrap=0
+
+  jiuwenbox_dep_present bwrap || missing+=("bwrap")
+  jiuwenbox_dep_present ip || missing+=("ip")
+  jiuwenbox_dep_present iptables || missing+=("iptables")
+  if ((${#missing[@]} == 0)); then
+    info "jiuwenbox dependencies already present: bwrap, ip, iptables"
+    return 0
+  fi
+  info "Missing jiuwenbox dependencies: ${missing[*]}"
+
+  detect_os_family
+  case "${OS_FAMILY}" in
+    openeuler)
+      mgr="yum"
+      iproute_pkg="iproute"
+      command -v yum >/dev/null 2>&1 || error "yum not found"
+      ;;
+    ubuntu)
+      mgr="apt"
+      iproute_pkg="iproute2"
+      command -v apt-get >/dev/null 2>&1 || error "apt-get not found"
+      ;;
+    *)
+      error "Unsupported OS family: ${OS_FAMILY:-unknown}"
+      ;;
+  esac
+
+  for pkg in "${missing[@]}"; do
+    case "${pkg}" in
+      bwrap)
+        pkgs+=("bubblewrap")
+        need_bwrap=1
+        ;;
+      ip) pkgs+=("${iproute_pkg}") ;;
+      iptables) pkgs+=("iptables") ;;
+    esac
+  done
+
+  info "Installing jiuwenbox dependencies: ${pkgs[*]}"
+  if ! "install_${mgr}" "${pkgs[@]}"; then
+    (( need_bwrap )) || error "Failed to install jiuwenbox dependencies: ${pkgs[*]}"
+    # bubblewrap 可能在某些 openEuler 版本中叫 bwrap（Ubuntu 同样可能）
+    warning "package install failed, trying with bwrap instead of bubblewrap"
+    for pkg in "${pkgs[@]}"; do
+      if [[ "${pkg}" == "bubblewrap" ]]; then
+        retry+=("bwrap")
+      else
+        retry+=("${pkg}")
+      fi
+    done
+    "install_${mgr}" "${retry[@]}" \
+      || error "Failed to install jiuwenbox dependencies: ${retry[*]}"
+  fi
+
+  jiuwenbox_dep_present bwrap || error "bwrap not found after installation"
+  jiuwenbox_dep_present ip || error "ip not found after installation"
+  jiuwenbox_dep_present iptables || error "iptables not found after installation"
+  success "jiuwenbox dependencies installed: ${missing[*]}"
+}
+
 deploy_jiuwenbox_install() {
+  require_root "$0" --python "$(python_bin)" install
   info "Installing jiuwenbox"
   info "Host: $(get_local_ip)"
   info "Python: $(python_bin)"
+  install_jiuwenbox_os_deps
   if _jiuwenbox_has_systemd; then
     info "systemd detected; jiuwenbox will be managed by systemd on up (Restart=on-failure)"
   else
     info "systemd not available; jiuwenbox will use nohup on up"
   fi
+  success "jiuwenbox install completed"
 }
 
 deploy_jiuwenbox_uninstall() {
