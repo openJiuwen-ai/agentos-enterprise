@@ -8,6 +8,9 @@
 #   master_nodes: master 节点列表（单机 1 节点 / 4 机 HA 2 节点）
 #   cluster_nodes: 整个集群的全部节点列表（workspace 亲和 HRW 候选集 / 数据迁移节点来源）
 #   ingress_virtual_ip: 统一入口虚拟 IP，抢占到 VIP 的节点部署 gateway/registry/web-server
+#   trace_otlp_endpoints: AgentRuntime 全链路 tracing 的 collector OTLP gRPC 地址列表
+#     （host:port 形式，不要带 http:// 前缀；支持多项主备）。空列表/缺省 = 关闭 tracing。
+#     取第一个地址注入全部组件（部署级主备）；主地址不可达时修改本列表后重新 up 切换。
 
 cluster:
   # etcd 集群节点（奇数节点保证 raft 共识）
@@ -24,3 +27,7 @@ cluster:
 
   # 统一入口虚拟 IP（抢占成功后启动 gateway/registry/web-server）
   ingress_virtual_ip: "127.0.0.1"
+
+# AgentRuntime 全链路 tracing 开关（默认关闭：保持空列表即可）
+# 示例：trace_otlp_endpoints: ["10.0.0.1:4317", "10.0.0.2:4317"]
+trace_otlp_endpoints: []

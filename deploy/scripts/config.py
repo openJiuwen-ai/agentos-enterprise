@@ -45,10 +45,31 @@ def _strip_quotes(s: str) -> str:
     return s
 
 
+def _parse_flow_list(val: str) -> list | None:
+    """解析流式列表值：[] / ["a", "b"] / [a, b]；非列表形态返回 None。
+
+    按逗号切分，不支持元素内含逗号（需要时请用块状列表写法）——
+    config.yaml 的列表用途（IP:port / IP）不会出现逗号。
+    """
+    v = val.strip()
+    if not (v.startswith("[") and v.endswith("]")):
+        return None
+    inner = v[1:-1].strip()
+    if not inner:
+        return []
+    items = []
+    for part in inner.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"Invalid flow list item (empty): {val}")
+        items.append(_strip_quotes(part))
+    return items
+
+
 def _parse_yaml_v2(text: str) -> dict:
     """两阶段 YAML 解析器：先 token 化，再组装。
 
-    支持 config.yaml 用到的语法：dict、list、scalar、注释。
+    支持 config.yaml 用到的语法：dict、list（块状与流式）、scalar、注释。
     """
     tokens = []
     for raw in text.splitlines():
@@ -95,7 +116,11 @@ def _parse_yaml_v2(text: str) -> dict:
                 key = key.strip()
                 val = val.strip()
                 if val:
-                    obj[key] = _strip_quotes(val)
+                    flow = _parse_flow_list(val)
+                    if flow is not None:
+                        obj[key] = flow
+                    else:
+                        obj[key] = _strip_quotes(val)
                     i += 1
                 else:
                     if i + 1 < len(tokens) and tokens[i + 1][0] > indent:
@@ -114,10 +139,12 @@ def _parse_yaml_v2(text: str) -> dict:
     return result
 
 
-def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
-    """加载 config.yaml，返回 cluster 配置字典。
+def load_full_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
+    """加载 config.yaml，返回完整顶层配置字典（cluster 及其余顶层字段）。
 
-    优先用 PyYAML，未安装时回退到内联简单解析器。
+    优先用 PyYAML，未安装时回退到内联简单解析器（两者对 config.yaml 用到的
+    dict/块状与流式 list/scalar/注释语法解析结果一致；内联解析器的流式列表
+    不支持元素内含逗号，该场景请用块状写法）。
     """
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -128,7 +155,15 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
         data = yaml.safe_load(text)
     except ImportError:
         data = _parse_yaml_v2(text)
-    cluster = data.get("cluster") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid config: top level must be a mapping in {config_path}")
+    return data
+
+
+def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
+    """加载 config.yaml，校验并返回 cluster 配置字典。"""
+    data = load_full_config(config_path)
+    cluster = data.get("cluster")
     if not cluster or not isinstance(cluster, dict):
         raise ValueError(f"Invalid config: missing 'cluster' section in {config_path}")
     for field in ("etcd_nodes", "master_nodes", "ingress_virtual_ip"):
@@ -144,6 +179,23 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
         if not isinstance(cluster["cluster_nodes"], list) or not cluster["cluster_nodes"]:
             raise ValueError("Invalid config: 'cluster.cluster_nodes' must be a non-empty list when present")
     return cluster
+
+
+def load_trace_endpoints(config_path: Path = DEFAULT_CONFIG_PATH) -> list:
+    """读取顶层 trace_otlp_endpoints（collector OTLP gRPC 地址列表，主备语义）。
+
+    - 缺省 / 空列表 / 空值 ⇒ 返回 []（tracing 关闭）
+    - 必须为非空字符串列表；host:port 格式校验由部署脚本完成
+    """
+    data = load_full_config(config_path)
+    endpoints = data.get("trace_otlp_endpoints", [])
+    if endpoints is None:
+        endpoints = []
+    if not isinstance(endpoints, list) or not all(
+        isinstance(e, str) and e.strip() for e in endpoints
+    ):
+        raise ValueError("Invalid config: 'trace_otlp_endpoints' must be a list of non-empty strings")
+    return [e.strip() for e in endpoints]
 
 
 def get_local_ip() -> str:
@@ -276,6 +328,10 @@ def main():
     sub.add_parser("etcd-nodes", help="Print all etcd node IPs, space-separated")
     sub.add_parser("cluster-nodes", help="Print all cluster node IPs (cluster_nodes), space-separated")
     sub.add_parser("ingress-vip", help="Print ingress_virtual_ip")
+    sub.add_parser(
+        "trace-endpoints",
+        help="Print trace_otlp_endpoints, space-separated (empty line when tracing is off)",
+    )
     sub.add_parser("all", help="Print all derived values as JSON")
 
     args = parser.parse_args()
@@ -320,6 +376,9 @@ def main():
         return
     if args.cmd == "ingress-vip":
         _LOGGER.info(cluster["ingress_virtual_ip"])
+        return
+    if args.cmd == "trace-endpoints":
+        _LOGGER.info(" ".join(load_trace_endpoints(Path(args.config))))
         return
     if args.cmd == "all":
         etcd_idx = find_local_match_index(local_ip, cluster["etcd_nodes"])
