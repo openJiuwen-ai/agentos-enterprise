@@ -31,10 +31,30 @@ if [ -f "${_conf_file}" ]; then
     source "${_conf_file}"
 fi
 
-# --- etcdctl paths: PATH → caller-supplied ETCDCTL_PATH → yr package third_party ---
-# 与 deploy.sh _ws_find_etcdctl 对齐的三段定位链（原相对路径拼接在本仓库布局下不存在）
+# --- etcdctl paths: configured path → standalone install → PATH → legacy yr ---
+# Keep standalone discovery aligned with deploy.sh and deploy/etcd.sh.
 ETCDCTL_PATH="${ETCDCTL_PATH:-}"
 ETCD_LD_PATH="${ETCD_LD_PATH:-}"
+
+# automount runs without agentos.sh's environment; reuse the install-time root.
+if [ -z "${AGENTOS_ETCD_ROOT:-}" ]; then
+    for _etcd_root_file in /etc/agentos/etcd-root "${HOME:-/root}/.agentos/etcd-root"; do
+        if [ -r "${_etcd_root_file}" ]; then
+            AGENTOS_ETCD_ROOT="$(cat "${_etcd_root_file}")"
+            if [ -n "${AGENTOS_ETCD_ROOT}" ]; then
+                break
+            fi
+        fi
+    done
+fi
+AGENTOS_ETCD_ROOT="${AGENTOS_ETCD_ROOT:-/opt/agentos/etcd}"
+
+if [ -z "${ETCDCTL_PATH}" ] || [ ! -x "${ETCDCTL_PATH}" ]; then
+    _standalone_etcdctl="${AGENTOS_ETCD_ROOT}/current/bin/etcdctl"
+    if [ -x "${_standalone_etcdctl}" ]; then
+        ETCDCTL_PATH="${_standalone_etcdctl}"
+    fi
+fi
 
 if [ -z "${ETCDCTL_PATH}" ] || [ ! -x "${ETCDCTL_PATH}" ]; then
     # 1) etcdctl in PATH (system-installed, e.g. /usr/bin/etcdctl)

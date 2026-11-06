@@ -9,10 +9,24 @@
 | 产物 | 说明 |
 |------|------|
 | `AgentOS-Client.tgz` | 客户端 TUI（含全平台 jiuwenswarm_tui，不区分架构；daily/release 同逻辑） |
-| `AgentOS-Server-${ARCH}.tgz` | 服务端（`deploy/` + jiuwenswarm + openyuanrong + a2x_registry wheels） |
+| `AgentOS-Server-${ARCH}.tgz` | 服务端（`deploy/` + jiuwenswarm + openyuanrong + a2x_registry wheels + 对应架构 etcd/etcdctl） |
 | `AgentOS-Buildinfo.tgz` | 各部件构建信息汇总（收集 jiuwenswarm/openyuanrong/agent-protocol/conch/credential_router 各 archive 内名字含 buildinfo 关键字的文件，归入 `AgentOS-Buildinfo/` 目录后压缩；保留源文件时间戳，与 AgentOS-Server/Client 同级目录） |
 
 脚本只在 linux 上运行（无交叉编译）。client 包内含 OBS 预编译的全平台 wheel（macosx/win/linux_aarch64/linux_x86_64），server 包仅 linux 平台。
+
+### etcd 随服务端发布包交付
+
+构建机需提供 Python 3。`build_etcd` 按 `ARCH=x86_64` 或 `ARCH=aarch64`（兼容 `amd64`/`arm64` 别名），
+从 `deploy/etcd/artifacts.json` 固定的 OBS 地址下载 etcd 3.5.24，校验压缩包 SHA256、内部文件 SHA256、manifest 和 ELF 架构后再打包。
+构建校验不执行目标架构二进制，因此可聚合与构建机架构不同的预编译产物。
+
+服务端包根目录包含 `etcd-linux-${ARCH}.tar.gz`；其中有 `bin/etcd`、`bin/etcdctl`、LICENSE 和 manifest。
+`AgentOS-Buildinfo.tgz` 中的 `etcd-buildinfo.json` 记录所选版本、架构、OBS 来源及校验和。
+客户端包不包含 etcd。
+
+`deploy/agentos.sh install` 直接读取同发布包中的 etcd 压缩包，不再联网下载；缺包会明确失败。
+可用 `ETCD_ARCHIVE=/path/to/archive.tar.gz` 指定另一份本地包，但仍须通过固定校验。
+安装仍校验本机架构及可执行版本，并原子切换 `current`；已有 etcd 数据目录及服务启停流程保持原有行为。
 
 ## daily/release 共用 jiuwenswarm/openyuanrong/agent-protocol 获取逻辑
 
@@ -115,19 +129,20 @@ archive/*.rpm                    -> server 包（平台无关 none rpm，在 arc
 ## 依赖
 
 - 本地目录：`deploy/`（server deploy 来源）
-- 工具：`curl` 或 `wget`、`git`、`tar`
-- 网络：访问 OBS（openjiuwen-ci、openyuanrong）
+- 工具：`curl` 或 `wget`、`git`、GNU `tar`、`python3`
+- 网络：访问 OBS（openjiuwen-ci、openyuanrong 和 artifacts.json 中固定的 etcd 来源）
 
 ## 构建流程（main 顺序）
 
 1. `clean` — 清空 `build/dist/`（含 downloads 和 staging）
-2. `build_openyuanrong` — 下载并解压 OBS `archive.tar.gz`（openyuanrong wheels）
-3. `build_jiuwenswarm` — 下载并解压 OBS `archive.tar.gz`（jiuwenswarm wheels + deploy）
-4. `build_agent_gateway` — 下载并解压 OBS `archive.tar.gz`（a2x_registry wheel）
-5. `build_conch` — 下载并解压 OBS `archive.tar.gz`（conch 沙箱模块 rpm：平台相关按 `${ARCH}` 取 + 平台无关 none；erofs.ko 版本目录如有则一并打入，均进 server 包根目录与各 whl 同级）
-6. `build_credential_router` — 下载并解压 OBS `archive.tar.gz`（credential-router 平台相关 tar.gz）
-7. `pack` — 组装 client/server 两个 tgz 产物
-8. `collect_buildinfo` — 收集各部件 archive 内名字含 buildinfo 关键字的构建信息文件，以及 `build/` 目录顶层名字含 buildinfo 关键字的文件（agent-os 主仓 buildinfo 由 CI 流水线生成于此），到 `AgentOS-Buildinfo/` 目录，`cp -p` + `tar --atime-preserve` 保留源文件时间戳，压缩为 `AgentOS-Buildinfo.tgz`（与 AgentOS-Server/Client 同级；须在 pack 之后，pack 会清空 staging）
+2. `build_etcd` — 按目标架构下载、校验固定版本 etcd，记录来源信息
+3. `build_openyuanrong` — 下载并解压 OBS `archive.tar.gz`（openyuanrong wheels）
+4. `build_jiuwenswarm` — 下载并解压 OBS `archive.tar.gz`（jiuwenswarm wheels + deploy）
+5. `build_agent_gateway` — 下载并解压 OBS `archive.tar.gz`（a2x_registry wheel）
+6. `build_conch` — 下载并解压 OBS `archive.tar.gz`（conch 沙箱模块 rpm：平台相关按 `${ARCH}` 取 + 平台无关 none；erofs.ko 版本目录如有则一并打入，均进 server 包根目录与各 whl 同级）
+7. `build_credential_router` — 下载并解压 OBS `archive.tar.gz`（credential-router 平台相关 tar.gz）
+8. `pack` — 组装 client/server 两个 tgz 产物
+9. `collect_buildinfo` — 收集各部件 archive 内名字含 buildinfo 关键字的构建信息文件，以及 `build/` 目录顶层名字含 buildinfo 关键字的文件（agent-os 主仓 buildinfo 由 CI 流水线生成于此），到 `AgentOS-Buildinfo/` 目录，`cp -p` + `tar --atime-preserve` 保留源文件时间戳，压缩为 `AgentOS-Buildinfo.tgz`（与 AgentOS-Server/Client 同级；须在 pack 之后，pack 会清空 staging）
 
 > agent-os 主仓 buildinfo 文件由 CI 流水线单独生成，放 `build/` 目录顶层（不受脚本 `clean` 影响，`clean` 只删 `build/dist/`）。`build-v2.sh` 不生成该文件，仅在 `collect_buildinfo` 阶段模糊匹配 `build/` 下所有含 `buildinfo` 关键字的文件纳入打包。
 

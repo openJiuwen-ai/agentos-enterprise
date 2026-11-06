@@ -481,13 +481,25 @@ EOF
     if [ -z "${resolved_endpoint}" ]; then
         warning "Failed to resolve etcd endpoints from config.yaml; autofs program map will fall back to 127.0.0.1:32379"
     fi
-    # etcdctl 只透传调用方显式指定的值，不做自动探测：
-    #   - workspace-storage 的 install 排在 agent-runtime 之前，此时 yr 尚未安装，
-    #     探测必然落空；即使命中系统 etcdctl，也可能固化成只存在于 install 环境的路径；
-    #   - 运行期 autofs_program_map.sh 自带 PATH → yr 三段自举，留空即可兜底。
-    # 显式值仍需固化：这类路径（如 /opt/etcd/bin/etcdctl）可能不在 automount 的 PATH 中。
+    # etcd 安装钩子导出的配套路径在此固化，支持自定义安装根目录。
+    # 单独安装 workspace-storage 时，回退读取 install 持久化的根目录。
     resolved_ld="${ETCD_LD_PATH:-}"
     resolved_etcdctl="${ETCDCTL_PATH:-}"
+    if [ -z "${resolved_etcdctl}" ] || [ ! -x "${resolved_etcdctl}" ]; then
+        local _etcd_root="" _etcd_root_file
+        for _etcd_root_file in /etc/agentos/etcd-root "${HOME:-/root}/.agentos/etcd-root"; do
+            if [ -r "${_etcd_root_file}" ]; then
+                _etcd_root="$(cat "${_etcd_root_file}")"
+                if [ -n "${_etcd_root}" ]; then
+                    break
+                fi
+            fi
+        done
+        _etcd_root="${AGENTOS_ETCD_ROOT:-${_etcd_root:-/opt/agentos/etcd}}"
+        if [ -x "${_etcd_root}/current/bin/etcdctl" ]; then
+            resolved_etcdctl="${_etcd_root}/current/bin/etcdctl"
+        fi
+    fi
     if [ -z "${resolved_ld}" ]; then
         case "${resolved_etcdctl}" in
             */third_party/etcd/etcdctl)
@@ -743,13 +755,32 @@ deploy_ws_status() {
 # ===== etcdctl 工具函数 =====
 
 # 定位 etcdctl 二进制
-# 优先级: 调用方显式 ETCDCTL_PATH（可执行）→ PATH → yr 包内置
+# 优先级: 调用方显式 ETCDCTL_PATH（可执行）→ 独立安装 → PATH → yr 包内置
 # 统一返回绝对路径：automount 的 PATH 极简，裸命令名在其上下文不可靠
 _ws_find_etcdctl() {
-    local path_etcdctl yr_pkg
+    local path_etcdctl yr_pkg root_file
 
     if [ -n "${ETCDCTL_PATH:-}" ] && [ -x "${ETCDCTL_PATH}" ]; then
         echo "${ETCDCTL_PATH}"
+        return 0
+    fi
+
+    # Reuse the root persisted by the etcd install hook when this script is
+    # invoked outside agentos.sh (custom AGENTOS_ETCD_ROOT).
+    path_etcdctl="${AGENTOS_ETCD_ROOT:-}"
+    if [ -z "${path_etcdctl}" ]; then
+        for root_file in /etc/agentos/etcd-root "${HOME:-/root}/.agentos/etcd-root"; do
+            if [ -r "${root_file}" ]; then
+                path_etcdctl="$(cat "${root_file}")"
+                if [ -n "${path_etcdctl}" ]; then
+                    break
+                fi
+            fi
+        done
+    fi
+    path_etcdctl="${path_etcdctl:-/opt/agentos/etcd}/current/bin/etcdctl"
+    if [ -x "${path_etcdctl}" ]; then
+        echo "${path_etcdctl}"
         return 0
     fi
 

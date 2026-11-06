@@ -1,0 +1,23 @@
+{
+  "version": "3.5.24",
+  "artifacts": {
+    "aarch64": {
+      "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/release/etcd-3.5.24/linux/aarch64/07e8e0242177d84227146078434878e4e064f0a7d02b353f8a4fc3a7e3417e91/etcd-3.5.24-linux-aarch64.tar.gz",
+      "sha256": "07e8e0242177d84227146078434878e4e064f0a7d02b353f8a4fc3a7e3417e91",
+      "files": {
+        "bin/etcd": "a09f8ce0315d9ced838381f793a8eba9d5a18706aab36a6700f25ff203339806",
+        "bin/etcdctl": "c95d6d8d595f608aeeca80a912abd9cfd0b37f06ea483da89e44de560c2ccdcf",
+        "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    },
+    "x86_64": {
+      "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/release/etcd-3.5.24/linux/x86_64/3b40499d1cae742ce15c6b2ae79f935cfbf792939fe40b79de193ead63ea1069/etcd-3.5.24-linux-x86_64.tar.gz",
+      "sha256": "3b40499d1cae742ce15c6b2ae79f935cfbf792939fe40b79de193ead63ea1069",
+      "files": {
+        "bin/etcd": "4143a8f4992ab052c986b3dd5f16e32a269fc8a767e27fdc6507720b4779062d",
+        "bin/etcdctl": "f4a2f33dcfc337f7d98550575969da7cb7ead868517da7617decc4b299b3fe0d",
+        "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      }
+    }
+  }
+}

@@ -8,7 +8,7 @@ set -euo >/dev/null 2>&1
 # 从 agent-runtime（openyuanrong）的部署脚本中拆出，单独管理 etcd unit 生命周期。
 #   - 仅 etcd_nodes 节点生成并启动 agentos-etcd.service
 #   - 角色推导读取 ~/.agentos/deploy/config.yaml（由 deploy/scripts/config.py 解析）
-#   - etcd 二进制路径从 yr config dump 的 values.etcd.bin_path 探测，回退 yr 包内 third_party/etcd/etcd
+#   - 优先使用发布包安装的独立 etcd；兼容已有部署的 yr 包路径
 #
 # 用法:
 #   ./etcd.sh up      # 生成并启动 etcd unit（非 etcd 节点跳过）
@@ -18,6 +18,27 @@ set -euo >/dev/null 2>&1
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ===== 独立 etcd 安装根目录 =====
+# install 时会把用户选择的 AGENTOS_ETCD_ROOT 持久化到 /etc/agentos/etcd-root
+# 与 ~/.agentos/etcd-root；init/deinit/status 是独立进程，必须复用该值，
+# 否则自定义安装目录会被静默回退到 /opt/agentos/etcd 或 yr 包内 etcd。
+_agentos_etcd_resolve_root() {
+    local root="${AGENTOS_ETCD_ROOT:-}" file
+    if [ -z "${root}" ]; then
+        for file in /etc/agentos/etcd-root "${HOME:-/root}/.agentos/etcd-root"; do
+            if [ -r "${file}" ]; then
+                root="$(cat "${file}")"
+                if [ -n "${root}" ]; then
+                    break
+                fi
+            fi
+        done
+    fi
+    printf '%s' "${root:-/opt/agentos/etcd}"
+}
+AGENTOS_ETCD_ROOT="$(_agentos_etcd_resolve_root)"
+export AGENTOS_ETCD_ROOT
 
 YR_PYTHON_VERSION="${YR_PYTHON_VERSION:-3.11}"
 AGENT_RUNTIME_CONFIG_PY="${SCRIPT_DIR}/scripts/config.py"
@@ -54,10 +75,19 @@ _yr_cfg() {
     fi
 }
 
-# ===== 探测 yr 内置 etcd 二进制路径 =====
-# 优先从 `yr config dump` 的 values.etcd.bin_path 读取；失败则回退到 yr 包内 third_party 路径。
+# ===== 定位 etcd（显式路径 → 独立安装 → 旧版 yr 包） =====
 _yr_etcd_bin_path() {
     local bin_path yr_pkg
+    if [ -n "${ETCD_BIN_PATH:-}" ]; then
+        [ -x "${ETCD_BIN_PATH}" ] || return 1
+        echo "${ETCD_BIN_PATH}"
+        return 0
+    fi
+    bin_path="${AGENTOS_ETCD_ROOT:-/opt/agentos/etcd}/current/bin/etcd"
+    if [ -x "${bin_path}" ]; then
+        echo "${bin_path}"
+        return 0
+    fi
 
     if command -v yr >/dev/null 2>&1; then
         bin_path=$(yr config dump 2>/dev/null \
@@ -78,16 +108,23 @@ _yr_etcd_bin_path() {
         return 0
     fi
 
+    # 最后兜底：系统 PATH 中的 etcd（与 install 侧口径统一；版本兼容性由环境保证）
+    if command -v etcd >/dev/null 2>&1; then
+        command -v etcd
+        return 0
+    fi
+
     return 1
 }
 
 # ===== 定位 etcdctl 二进制 =====
-# 优先 PATH 中的 etcdctl；否则从 _yr_etcd_bin_path 结果的同目录查找；回退 yr 包内 third_party。
+# 优先显式 ETCDCTL_PATH，再使用服务二进制同目录的配套 etcdctl，最后回退 PATH/yr。
 _yr_etcdctl_path() {
     local etcd_bin etcdctl_path yr_pkg
 
-    if command -v etcdctl >/dev/null 2>&1; then
-        echo "etcdctl"
+    if [ -n "${ETCDCTL_PATH:-}" ]; then
+        [ -x "${ETCDCTL_PATH}" ] || return 1
+        echo "${ETCDCTL_PATH}"
         return 0
     fi
 
@@ -98,6 +135,11 @@ _yr_etcdctl_path() {
             echo "${etcdctl_path}"
             return 0
         fi
+    fi
+
+    if command -v etcdctl >/dev/null 2>&1; then
+        command -v etcdctl
+        return 0
     fi
 
     yr_pkg=$("$(_yr_python)" -c "import yr, os; print(os.path.dirname(yr.__file__))" 2>/dev/null)
@@ -126,7 +168,7 @@ AGENT_RUNTIME_ETCD_DATA_PREFIXES=("/datasystem/" "/scheduler/" "/sn/" "/yr/")
 _yr_generate_etcd_unit() {
     local etcd_bin node_name initial_cluster advertise_ip cluster_state
     etcd_bin=$(_yr_etcd_bin_path) \
-        || error "Cannot locate yr built-in etcd binary (yr config dump / third_party/etcd/etcd)"
+        || error "Cannot locate etcd; run agentos.sh install or set ETCD_BIN_PATH"
     node_name=$(_yr_cfg etcd-name) || error "Failed to derive etcd node name"
     initial_cluster=$(_yr_cfg initial-cluster) || error "Failed to build initial-cluster"
     advertise_ip=$(_yr_cfg etcd-advertise-ip) \
@@ -419,6 +461,10 @@ Commands:
                   由 master 节点的 agent-runtime down 调用（前提：function-proxy/function-master 已退出）；etcd 服务必须正在运行；不影响 etcd 集群元数据
 
 Environment:
+  AGENTOS_ETCD_ROOT          独立 etcd 安装根目录（默认 /opt/agentos/etcd；
+                             install 时持久化到 /etc/agentos/etcd-root，后续命令自动复用）
+  ETCD_BIN_PATH              显式指定 etcd 二进制（优先级最高）
+  ETCDCTL_PATH               显式指定 etcdctl 二进制
   YR_PYTHON_VERSION          Python 版本（默认 3.11）
   YR_HEALTH_CHECK_RETRIES    up 健康检查重试次数（默认 30，每次 1s）
 

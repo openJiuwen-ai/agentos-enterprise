@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | `moosefs` | 分布式共享存储 | MooseFS 集群（master + chunkserver + client），单机自动跳过 |
 | `jiuwenbox` | 沙箱服务 | 每台机器同构启动 jiuwenbox-server（随 jiuwenswarm whl 安装） |
+| `etcd` | etcd 独立二进制安装 | 从发布包内置压缩包安装 etcd 3.5.24，校验 SHA256、ELF 架构及版本；无需安装元戎 wheel |
 | `agent-runtime` | Agent 分布式运行时（具体选型: openyuanrong 集群） | 分布式进程模式集群（master + agent） |
 | `conch` | Conch 沙箱引擎 | RPM 安装 erofs-utils、StratoVirt、Conch |
 | `agent-gateway` | A2X 注册中心 | a2x-registry 后端（sqlite 存储），优先 systemd 托管，抢占 ingress VIP 的节点启动 |
@@ -33,6 +34,10 @@ deploy/
 │   ├── module.sh             # jiuwenbox 钩子
 │   ├── jiuwenbox_deploy.sh   # up/down/restart
 │   └── default-policy.yaml   # policy 模板（含 extensions 占位符）
+├── etcd/
+│   ├── module.sh             # etcd 独立二进制安装钩子
+│   ├── install.py            # 校验与版本目录安装
+│   └── artifacts.json        # ARM/x86 产物 URL、SHA256 和文件校验和
 ├── agent-runtime/
 │   ├── module.sh             # agent-runtime 钩子函数
 │   └── agent_runtime_deploy.sh  # agent-runtime 部署脚本（openyuanrong 集群安装/启停）
@@ -53,7 +58,8 @@ deploy/
 核心机制：**模块注册 + 钩子函数 + 调度引擎**。
 
 1. **模块注册**：`agentos.sh` 顶部的 `MODULES` 数组声明所有模块及其部署顺序：
-   `MODULES=("moosefs" "jiuwenbox" "agent-runtime" "conch" "agent-gateway" "jiuwenswarm")`
+   `MODULES=("etcd" "workspace-storage" "conch" "jiuwenbox" "agent-runtime" "agent-gateway" "jiuwenswarm")`
+   其中 `etcd` 为**仅安装型模块**（`INSTALL_ONLY_MODULES`）：只参与 `install`/`uninstall`，`up`/`down`/`restart`/`status` 不调度（服务生命周期由 `etcd.sh` 的 `init`/`deinit` 管理）。
 2. **钩子约定**：每个模块在 `deploy/<module>/module.sh` 中实现 5 个钩子函数：
    - `<module>_up` — 启动/部署
    - `<module>_down` — 停止/卸载
@@ -64,7 +70,7 @@ deploy/
    - `up` / `install`：按 `MODULES` 声明顺序
    - `down` / `uninstall`：自动逆序
 4. **模块加载**：`load_modules` 在启动时 `source` 所有 `module.sh`，使钩子函数在当前 shell 中可用。
-5. **etcd 委托**：etcd 作为全集群前置依赖，独立于 `up/down`，由 `etcd.sh` 单独管理（`init`/`deinit` 委托）。
+5. **etcd 委托**：etcd 作为全集群前置依赖，独立于 `up/down`，由 `etcd.sh` 单独管理（`init`/`deinit` 委托）。etcd 二进制由 `etcd` 模块独立安装，不再依赖 openyuanrong whl 内的 `third_party/etcd`。
 
 ### 生命周期（三对互逆操作，嵌套如括号）
 
@@ -362,6 +368,19 @@ chmod 755 /root/.ssh/agent_pub
 
 #### etcd
 
+`install` 读取发布包根目录的 `etcd-linux-<arch>.tar.gz`（由 `build/build-v2.sh` 的
+`build_etcd` 按 `x86_64`/`aarch64` 从 `deploy/etcd/artifacts.json` 固定 OBS 地址下载并校验后打入）。
+每包包含配套的 `etcd`、`etcdctl`、Apache 许可证及来源清单。安装前校验压缩包和文件 SHA256、
+ELF 架构与实际版本，然后切换 `/opt/agentos/etcd/current` 到不可变版本目录。
+不修改已有 etcd 数据或自动重启服务；`uninstall` 也保留 etcd 二进制及数据。
+
+可用 `AGENTOS_ETCD_ROOT` 指定安装根目录，install 会将其持久化到
+`/etc/agentos/etcd-root`（并写入 `~/.agentos/etcd-root`）；后续 `init`/`deinit`/`status`
+以及 workspace/autofs 会自动复用该值，无需在每条命令前重复 export。需要回到默认目录时，
+显式传入 `AGENTOS_ETCD_ROOT=/opt/agentos/etcd` 重新 install。断网安装时设置
+`ETCD_ARCHIVE` 为对应架构的本地压缩包，仍须匹配清单中的 SHA256。服务优先使用此
+安装目录的二进制，workspace 和 autofs 也使用配套 `etcdctl`。已有部署仍兼容 yr 包路径。
+
 独立脚本 `deploy/etcd.sh` 管理 etcd unit 生命周期，`agentos.sh` 的 `init`/`deinit` 委托给它。
 
 | 子命令 | 说明 |
@@ -370,14 +389,16 @@ chmod 755 /root/.ssh/agent_pub
 | `down` | 停止并删除 unit（保留 `/var/lib/agentos/etcd` 数据） |
 | `status` | 报告 `agentos-etcd.service` 的 systemd 状态 + client 端口连通性（非 etcd 节点显示 N/A） |
 | `check` | 探测 etcd 集群是否可达（TCP 连通任一 etcd_node 的 client port 即通过） |
-| `clean` | 清理 etcd 数据目录（默认直接清理，无交互确认；对齐 yr start 语义） |
+| `clean` | 清理 etcd 数据目录（交互确认，`-y/--yes` 跳过） |
 
 | 环境变量 | 说明 | 默认值 |
 | --- | --- | --- |
 | `YR_ETCD_CLIENT_PORT` | etcd client 端口 | `32379` |
 | `YR_HEALTH_CHECK_RETRIES` | up 健康检查重试次数 | `30` |
 
-etcd 二进制路径从 `yr config dump` 的 `values.etcd.bin_path` 探测，回退 yr 包内 `third_party/etcd/etcd`。角色推导读取 `~/.agentos/deploy/config.yaml`（由 `scripts/config.py` 解析）。
+etcd 二进制优先使用独立安装目录（`AGENTOS_ETCD_ROOT`，默认 `/opt/agentos/etcd`）中的版本，
+并兼容已有部署的 `yr config dump` / `third_party/etcd` 路径。角色推导读取
+`~/.agentos/deploy/config.yaml`（由 `scripts/config.py` 解析）。
 
 - `init` 自动 `clean + up`，无需手动清理历史数据
 - `down` 保留数据，便于 `restart`；彻底清数据用 `init`（自动 clean）或独立 `./etcd.sh clean`

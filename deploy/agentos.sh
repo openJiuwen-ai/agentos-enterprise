@@ -37,7 +37,12 @@ ETCD_SH="${SCRIPT_DIR}/etcd.sh"
 # workspace-storage（NFS + autofs）替代旧版 moosefs。
 # 注意: deploy/moosefs/ 目录保留，仅供 down/uninstall 拆旧集群时动态加载（见 _teardown_legacy_moosefs），
 # 不在 MODULES 中 —— 新部署不再安装/启动 MooseFS。
-MODULES=("workspace-storage" "conch" "jiuwenbox" "agent-runtime" "agent-gateway" "jiuwenswarm")
+# etcd 仅安装独立二进制；服务生命周期仍由 etcd.sh 的 init/deinit 管理。
+# 先安装 etcd，便于 workspace-storage 为 autofs 固化 etcdctl 路径。
+MODULES=("etcd" "workspace-storage" "conch" "jiuwenbox" "agent-runtime" "agent-gateway" "jiuwenswarm")
+
+# ===== 仅安装型模块（无服务生命周期，up/down/restart/status 不调度） =====
+INSTALL_ONLY_MODULES=("etcd")
 
 # ===== 全局环境变量 =====
 YR_PYTHON_VERSION="${YR_PYTHON_VERSION:-3.11}"
@@ -127,6 +132,42 @@ reverse_modules() {
     echo "${reversed[@]}"
 }
 
+# ===== 模块生命周期参与判定 =====
+# install/uninstall 全员参与；其余钩子（up/down/restart/status）剔除 INSTALL_ONLY_MODULES
+_module_has_phase() {
+    local mod="$1" hook="$2" m
+    case "${hook}" in
+        install|uninstall)
+            return 0
+            ;;
+    esac
+    for m in "${INSTALL_ONLY_MODULES[@]}"; do
+        if [ "${m}" = "${mod}" ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# ===== 按钩子返回参与调度的模块列表（空格分隔；down/uninstall 逆序） =====
+modules_for_hook() {
+    local hook="$1"
+    local module_list
+    if [ "${hook}" = "down" ] || [ "${hook}" = "uninstall" ]; then
+        module_list="$(reverse_modules)"
+    else
+        module_list="${MODULES[*]}"
+    fi
+    local mod
+    local -a out=()
+    for mod in ${module_list}; do
+        if _module_has_phase "${mod}" "${hook}"; then
+            out+=("${mod}")
+        fi
+    done
+    echo "${out[*]}"
+}
+
 # ===== 调度引擎：遍历模块，调用对应钩子 =====
 # uninstall 时单模块失败不中断：❌ error 记录后继续执行其余模块，
 # 失败模块记入 HOOK_FAILED_MODULES，结尾 _print_summary 统一 ❌ error 汇总并退出非 0。
@@ -135,15 +176,12 @@ HOOK_FAILED_MODULES=()
 run_hooks() {
     local hook="$1"  # up / down / install / uninstall
 
+    # down/uninstall 逆序；up/down 等服务钩子剔除仅安装型模块（INSTALL_ONLY_MODULES）
     local module_list
-    if [ "${hook}" = "down" ] || [ "${hook}" = "uninstall" ]; then
-        # down/uninstall 逆序
-        module_list=$(reverse_modules)
-    else
-        module_list="${MODULES[@]}"
-    fi
+    module_list="$(modules_for_hook "${hook}")"
 
-    local total=${#MODULES[@]}
+    local total
+    total=$(wc -w <<<"${module_list}")
     local idx=0
     if [ "${hook}" = "uninstall" ]; then
         HOOK_FAILED_MODULES=()
@@ -394,7 +432,7 @@ deploy_up() {
     info "Starting full deployment (up)"
     ensure_agentos_user
     ensure_etcd_ready
-    info "Modules: ${MODULES[*]}"
+    info "Modules: $(modules_for_hook up)"
     run_hooks up
     _print_summary up
 }
@@ -427,7 +465,7 @@ deploy_deinit() {
 deploy_down() {
     echo ""
     info "Starting full teardown (down)"
-    info "Modules (reverse): $(reverse_modules)"
+    info "Modules (reverse): $(modules_for_hook down)"
     run_hooks down
     _teardown_legacy_moosefs down
     _print_summary down
@@ -510,7 +548,7 @@ _teardown_legacy_moosefs() {
 # ===== status: 一键查询各组件状态（只读探测，不启停服务） =====
 # 输出格式：每个组件钩子输出若干行 `组件名|服务名|状态|详情`（机器可读），
 # 由 _print_status_table 收集后统一格式化为表格输出。
-# etcd 不在 MODULES 中，由 etcd.sh status 独立委托。
+# etcd 是仅安装型模块，服务状态由 etcd.sh status 独立委托。
 deploy_status() {
     echo ""
     info "Querying component status"
@@ -547,9 +585,10 @@ deploy_status() {
     fi
 
     # 2. 按 MODULES 正序遍历各模块 _status 钩子（独立遍历，不复用 run_hooks）
-    #    缺失钩子的组件占位一行 "not supported"，不跳过
+    #    缺失钩子的组件占位一行 "not supported"，不跳过；
+    #    仅安装型模块（INSTALL_ONLY_MODULES）无运行时，不参与 status
     local mod fn rc tmpfile
-    for mod in "${MODULES[@]}"; do
+    for mod in $(modules_for_hook status); do
         fn="${mod}_status"
         if ! declare -f "${fn}" >/dev/null 2>&1; then
             status_lines+=("${mod}|-|n/a|not supported")
@@ -634,9 +673,9 @@ _print_summary() {
     echo "=========================================="
     if [ "${cmd}" = "up" ] || [ "${cmd}" = "down" ] || [ "${cmd}" = "restart" ]; then
         if [ "${cmd}" = "down" ]; then
-            echo "  Order: $(reverse_modules)"
+            echo "  Order: $(modules_for_hook down)"
         else
-            echo "  Order: ${MODULES[*]}"
+            echo "  Order: $(modules_for_hook up)"
         fi
     else
         echo "  Packages: ${MODULES[*]}"
@@ -705,6 +744,12 @@ Config:
               数据保留: MOOSEFS_PURGE_DATA=no(默认保留数据,重新install+up可恢复) / yes(彻底清理)
   jiuwenbox   配置文件: deploy/jiuwenbox/default-policy.yaml (含 extensions 目录占位符)
               jiuwenbox-server 随 jiuwenswarm whl 包安装，无需单独 install
+  etcd        install 从发布包根目录的 etcd-linux-<arch>.tar.gz 安装独立 etcd 3.5.24，
+              校验 SHA256、ELF 架构和可执行版本；不再安装 openyuanrong 获取其自带 etcd
+              AGENTOS_ETCD_ROOT: 安装目录（默认 /opt/agentos/etcd；install 后持久化，
+                                  init/deinit/status 自动复用，可显式覆盖）
+              ETCD_ARCHIVE: 可选离线压缩包（仍须通过固定 SHA256 校验）
+              uninstall 保留 etcd 二进制及数据；停服务使用 deinit
   agent-runtime  环境变量直接通过命令行/环境变量传入（见 agent_runtime_deploy.sh -h）
               agent SSH 直连默认启用（简便模式：host/backend/client 混用一套密钥）：
                 AGENTOS_SSH_KEY              私钥 (/root/.ssh/agent_key)，三处用途共用
@@ -719,6 +764,7 @@ Config:
 
 Prerequisites:
   - 本机需预装指定版本的 Python
+  - etcd install 需发布包根目录存在 etcd-linux-<arch>.tar.gz（由 build/build-v2.sh 打包）
   - jiuwenbox 部署前需确保 jiuwenswarm whl 包已安装（jiuwenbox-server 入口随 jiuwenswarm 安装）
   - jiuwenswarm/gateway 部署前需确保 agent-runtime（openyuanrong）已在本机安装并启动
   - IMPORTANT: up 前需先执行 init 启动 etcd（up 会前置检查 etcd 可达性）
@@ -783,6 +829,8 @@ Examples:
   新增组件只需两步:
   1. 在 deploy/ 下新建 <module>/ 目录，放入 module.sh（实现 <module>_up/down/install/uninstall/status 钩子）
   2. 在本脚本顶部 MODULES 数组中添加模块名
+  仅安装型模块（只装包、无服务生命周期，如 etcd）需同时在 INSTALL_ONLY_MODULES 登记:
+  up/down/restart/status 不调度（不再报"no hook"告警），仅参与 install/uninstall
 
 注意:
   - up/restart 不安装 whl 包，请先执行 install

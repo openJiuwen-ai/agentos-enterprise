@@ -34,6 +34,9 @@ CONCH_ARCHIVE_ROOT=""           # conch archive.tar.gz 解压根目录（pack �
 CREDENTIAL_ROUTER_BASE=""       # credential_router archive 下载基址（configure_* 设置）
 CREDENTIAL_ROUTER_ARCHIVE_ROOT=""  # credential_router archive.tar.gz 解压根目录（pack 取 credential-router*.tar.gz，平台相关）
 
+ETCD_ARCHIVE_ROOT=""            # 固定版本 etcd 下载目录（含目标架构压缩包及来源信息）
+ETCD_ARCHIVE=""
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [options]
@@ -209,6 +212,33 @@ build_jiuwenswarm() {
   fi
 }
 
+build_etcd() {
+  case "${ARCH}" in
+    amd64) ARCH=x86_64 ;;
+    arm64) ARCH=aarch64 ;;
+    x86_64|aarch64) ;;
+    *) echo "error: unsupported architecture: ${ARCH}" >&2; return 1 ;;
+  esac
+  echo "==> build_etcd (${ARCH})"
+  ETCD_ARCHIVE_ROOT="${DOWNLOAD_DIR}/etcd/${ARCH}"
+  ETCD_ARCHIVE="${ETCD_ARCHIVE_ROOT}/etcd-linux-${ARCH}.tar.gz"
+  mkdir -p "${ETCD_ARCHIVE_ROOT}"
+  local url
+  url=$(python3 - "${DEPLOY_DIR}/etcd/artifacts.json" "${ARCH}" "${ETCD_ARCHIVE_ROOT}/etcd-buildinfo.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+registry = json.loads(Path(sys.argv[1]).read_text())
+record = registry["artifacts"][sys.argv[2]]
+Path(sys.argv[3]).write_text(json.dumps({"version": registry["version"], "arch": sys.argv[2], **record}, indent=2) + "\n")
+print(record["url"])
+PY
+  ) || return 1
+  download_file "${url}" "${ETCD_ARCHIVE}" || return 1
+  python3 "${DEPLOY_DIR}/etcd/install.py" --verify-only --arch "${ARCH}" --archive "${ETCD_ARCHIVE}"
+}
+
 build_openyuanrong() {
   echo "==> build_openyuanrong (${BUILD_TYPE})"
 
@@ -369,6 +399,8 @@ pack() {
   cp -p "${OPENYUANRONG_ARCHIVE_ROOT}/${ARCH}"/*.whl "${server_staging}/"
   cp -p "${OPENYUANRONG_ARCHIVE_ROOT}"/*.whl "${server_staging}/"
 
+  cp -p "${ETCD_ARCHIVE}" "${server_staging}/"
+
   cp -p "${AGENT_GATEWAY_ARCHIVE_ROOT}"/*.whl "${server_staging}/"
 
   # conch：平台相关 rpm 从 conch archive ${ARCH} 目录取（build_conch 已校验目录），打入 server 包根目录与各 whl 同级
@@ -425,6 +457,7 @@ collect_buildinfo() {
     "agent-gateway|${AGENT_GATEWAY_ARCHIVE_ROOT}"
     "conch|${CONCH_ARCHIVE_ROOT}"
     "credential-router|${CREDENTIAL_ROUTER_ARCHIVE_ROOT}"
+    "etcd|${ETCD_ARCHIVE_ROOT}"
   )
 
   local entry comp_name archive_root buildinfo_file dest_name found=0
@@ -480,9 +513,16 @@ clean() {
 main() {
   parse_args "$@"
   configure_build
+  case "${ARCH}" in
+    amd64) ARCH=x86_64 ;;
+    arm64) ARCH=aarch64 ;;
+    x86_64|aarch64) ;;
+    *) echo "error: unsupported architecture: ${ARCH}" >&2; return 1 ;;
+  esac
 
   echo "AgentOS build (build_type=${BUILD_TYPE}, build_target=${BUILD_TARGET}, arch=${ARCH})"
   clean                                # 清空 build/dist/（含 downloads 和 staging）
+  build_etcd                           # 下载并校验固定版本 etcd，供部署离线安装
   build_openyuanrong                   # 下载并解压 OBS archive.tar.gz（openyuanrong wheels）
   build_jiuwenswarm                    # 下载并解压 OBS archive.tar.gz（jiuwenswarm wheels + deploy）
   build_agent_gateway                  # 下载并解压 OBS archive.tar.gz（a2x_registry wheel）
@@ -493,4 +533,6 @@ main() {
   echo "done"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
