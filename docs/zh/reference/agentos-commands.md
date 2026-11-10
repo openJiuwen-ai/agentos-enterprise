@@ -47,7 +47,7 @@ bash deploy/agentos.sh <COMMAND> [OPTIONS]
 | `AGENTOS_SSH_KEY` | agent SSH 直连私钥路径 | `/root/.ssh/agent_key` |
 | `AGENTOS_SSH_BACKEND_PUBLIC_DIR` | 挂进实例的公钥目录（须含 `authorized_keys`） | `/root/.ssh/agent_pub` |
 
-> tracing 开关用法（由 `~/.agentos/deploy/config.yaml` 顶层 `trace_otlp_endpoints` 控制，部署时一键配置，重启 agentos-executor 后生效）：
+> tracing 开关用法（由 `~/.agentos/deploy/config.yaml` 顶层 `trace_otlp_endpoints` 控制，部署时一键配置，重启 agentos-executor 后生效；Gateway 侧重启 jiuwenswarm-gateway 后生效）：
 >
 > ```yaml
 > # 编辑 ~/.agentos/deploy/config.yaml（install 持久化的副本，up 直接读它）

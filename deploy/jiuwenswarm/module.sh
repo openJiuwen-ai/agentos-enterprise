@@ -21,6 +21,7 @@ jiuwenswarm_refresh_users() {
 # ===== up/down: 调用 deploy.sh =====
 # deploy.sh 使用相对路径 source，需在其所在目录下执行
 jiuwenswarm_up() {
+    jiuwenswarm_apply_trace_settings
     jiuwenswarm_run_deploy up "$@"
 }
 
@@ -162,6 +163,57 @@ _jiuwenswarm_set_env_value() {
         printf '%s="%s"\n' "${key}" "${value}" >> "${tmp}"
     fi
     mv "${tmp}" "${file}"
+}
+
+# 将 AgentOS 的 trace_otlp_endpoints 开关同步到 Gateway：
+# 非空 -> telemetry.enabled/endpoint 打开；空 -> 关闭。
+# 写 Gateway 模板而不是部署后的用户 config，deploy.sh 会按模板重新生成 config。
+jiuwenswarm_apply_trace_settings() {
+    local py config_py trace_py template env_file endpoints first env_enabled
+    py=$(command -v "python${YR_PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || true)
+    if [ -z "${py}" ]; then
+        warning "Python not found; skip Gateway tracing switch"
+        return 0
+    fi
+
+    config_py="${SCRIPT_DIR}/scripts/config.py"
+    trace_py="${SCRIPT_DIR}/scripts/gateway_trace.py"
+    template="${JIUWENSWARM_DEPLOY_DIR}/conf/gateway-config-yuanrong.template.yaml"
+    env_file="${JIUWENSWARM_DEPLOY_DIR}/.env.custom"
+
+    if [ ! -f "${template}" ] || [ ! -f "${trace_py}" ]; then
+        warning "Gateway trace template/helper not found; skip tracing switch"
+        return 0
+    fi
+
+    if [ ! -f "${config_py}" ]; then
+        warning "config.py not found at ${config_py}; Gateway tracing stays unchanged"
+        return 0
+    fi
+    endpoints=$("${py}" "${config_py}" trace-endpoints 2>/dev/null) \
+        || { warning "Failed to read trace_otlp_endpoints; Gateway tracing stays unchanged"; return 0; }
+    first="${endpoints%% *}"
+
+    # .env.custom 属于用户配置，部署脚本不代写；但 OTEL_ENABLED 优先级高于
+    # telemetry.enabled，已有显式配置时必须提示，避免统一开关被静默覆盖。
+    if [ -f "${env_file}" ]; then
+        env_enabled=$(_jwsw_env_value "${env_file}" "OTEL_ENABLED")
+        if [ -n "${env_enabled}" ]; then
+            warning "OTEL_ENABLED=${env_enabled} in .env.custom overrides trace_otlp_endpoints; remove it to use the unified switch"
+        fi
+    fi
+
+    if [ -n "${first}" ]; then
+        if ! "${py}" "${trace_py}" --template "${template}" --endpoint "${first}"; then
+            warning "Invalid trace_otlp_endpoints; Gateway tracing stays unchanged"
+            return 0
+        fi
+        info "Gateway tracing enabled from trace_otlp_endpoints: ${first}"
+    else
+        "${py}" "${trace_py}" --template "${template}" --endpoint "" \
+            || { warning "Failed to disable Gateway tracing"; return 0; }
+        info "Gateway tracing disabled: trace_otlp_endpoints is empty"
+    fi
 }
 
 # 当前机器对应的 Conch 镜像 tag：x86_64 -> latest-amd64，aarch64 -> latest-arm64
