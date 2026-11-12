@@ -59,7 +59,10 @@ RUN pip3 config set global.index-url https://mirrors.huaweicloud.com/repository/
         PyPDF2>=3.0.1 python-docx>=1.2.0 openpyxl>=3.1.0 \
         reportlab==5.0.0 matplotlib==3.11.1 pandas==3.0.5 \
         pdfkit==1.0.0 graphviz==0.21 latex2mathml==3.81.0 \
-        scrapling[rag]==0.4.15 patchright==1.62.3 && \
+        scrapling[rag]==0.4.15 patchright==1.62.3 \
+        fpdf2==2.8.5 \
+        rapidocr-onnxruntime==1.4.4 shapely==2.0.7 && \
+    pip3 install --force-reinstall --no-deps opencv-python-headless==4.11.0.86 && \
     pip3 cache purge && \
     pip3 config unset global.index-url
 
