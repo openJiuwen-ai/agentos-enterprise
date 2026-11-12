@@ -617,11 +617,13 @@ _print_status_table() {
     local running=0 stopped=0 failed=0 na=0 total=0
     local line comp svc state detail version
 
-    echo ""
-    info "=== AgentOS Status ==="
-    echo ""
-    printf "%-16s %-42s %-10s %-20s %s\n" "Component" "Service" "State" "Version" "Detail"
-    printf "%-16s %-42s %-10s %-20s %s\n" "------------" "----------------------------------------" "--------" "--------------------" "------------------------------"
+    # 第一遍：解析每行并统计各列显示宽度。
+    # 列宽 = max(表头宽度, 该列所有数据宽度)。固定 %-Ns 在组件名（如
+    # workspace-storage 为 17 字符 > 16）或服务名超宽时会把后续列整体挤偏，
+    # 因此改为按实际内容动态计算。
+    local -a rows_comp=() rows_svc=() rows_state=() rows_version=() rows_detail=()
+    local w_comp=9 w_svc=7 w_state=5 w_version=7   # 表头 Component/Service/State/Version 宽度
+    local w_detail=6                               # 表头 Detail 宽度
 
     for line in "${lines[@]}"; do
         # 解析 `组件|服务|状态|详情|版本` 格式（版本为可选第 5 字段）
@@ -632,6 +634,18 @@ _print_status_table() {
         [ -z "${detail:-}" ] && detail="-"
         [ -z "${version:-}" ] && version="-"
 
+        rows_comp+=("${comp}")
+        rows_svc+=("${svc}")
+        rows_state+=("${state}")
+        rows_version+=("${version}")
+        rows_detail+=("${detail}")
+
+        if [ "${#comp}" -gt "${w_comp}" ]; then w_comp=${#comp}; fi
+        if [ "${#svc}" -gt "${w_svc}" ]; then w_svc=${#svc}; fi
+        if [ "${#state}" -gt "${w_state}" ]; then w_state=${#state}; fi
+        if [ "${#version}" -gt "${w_version}" ]; then w_version=${#version}; fi
+        if [ "${#detail}" -gt "${w_detail}" ]; then w_detail=${#detail}; fi
+
         total=$((total+1))
         case "${state}" in
             running)  running=$((running+1))  ;;
@@ -641,21 +655,41 @@ _print_status_table() {
             n/a|na)   na=$((na+1))           ;;
             *)        failed=$((failed+1))   ;;
         esac
+    done
 
+    # 第二遍：按动态列宽输出表头、分隔线与数据行
+    echo ""
+    info "AgentOS Status"
+    echo ""
+
+    local fmt="%-${w_comp}s %-${w_svc}s %-${w_state}s %-${w_version}s %s\n"
+    local sep_comp sep_svc sep_state sep_version sep_detail
+    printf -v sep_comp    '%*s' "${w_comp}"    ''; sep_comp=${sep_comp// /-}
+    printf -v sep_svc     '%*s' "${w_svc}"     ''; sep_svc=${sep_svc// /-}
+    printf -v sep_state   '%*s' "${w_state}"   ''; sep_state=${sep_state// /-}
+    printf -v sep_version '%*s' "${w_version}" ''; sep_version=${sep_version// /-}
+    printf -v sep_detail  '%*s' "${w_detail}" ''; sep_detail=${sep_detail// /-}
+
+    printf "${fmt}" "Component" "Service" "State" "Version" "Detail"
+    printf "${fmt}" "${sep_comp}" "${sep_svc}" "${sep_state}" "${sep_version}" "${sep_detail}"
+
+    local i colored_state pad_state
+    for i in "${!rows_comp[@]}"; do
         # 颜色编码：running 绿 / stopped 黄 / failed 红 / n/a 灰
-        # 先用空格补齐到固定宽度，再套颜色码——颜色码不占显示宽度但占字符串长度，
-        # 若先套颜色再 %-10b 会导致对齐错乱
-        local colored_state pad_state
-        pad_state=$(printf "%-10s" "${state}")
-        case "${state}" in
-            running)  colored_state="\033[32m${pad_state}\033[0m"  ;;
-            stopped|disabled) colored_state="\033[33m${pad_state}\033[0m" ;;
-            failed)   colored_state="\033[31m${pad_state}\033[0m"  ;;
-            n/a|na)   colored_state="\033[90m${pad_state}\033[0m"   ;;
-            *)        colored_state="\033[31m${pad_state}\033[0m"  ;;
+        # 先按列宽补齐再套颜色码——颜色码不占显示宽度但占字符串长度，
+        # 若交给 %-Ns 补齐会导致对齐错乱
+        printf -v pad_state "%-${w_state}s" "${rows_state[$i]}"
+        case "${rows_state[$i]}" in
+            running)          printf -v colored_state '\033[32m%s\033[0m' "${pad_state}" ;;
+            stopped|disabled) printf -v colored_state '\033[33m%s\033[0m' "${pad_state}" ;;
+            failed)           printf -v colored_state '\033[31m%s\033[0m' "${pad_state}" ;;
+            n/a|na)           printf -v colored_state '\033[90m%s\033[0m' "${pad_state}" ;;
+            *)                printf -v colored_state '\033[31m%s\033[0m' "${pad_state}" ;;
         esac
 
-        printf "%-16s %-42s %b %-20s %s\n" "${comp}" "${svc}" "${colored_state}" "${version}" "${detail}"
+        printf "%-${w_comp}s %-${w_svc}s %s %-${w_version}s %s\n" \
+            "${rows_comp[$i]}" "${rows_svc[$i]}" "${colored_state}" \
+            "${rows_version[$i]}" "${rows_detail[$i]}"
     done
 
     echo ""
