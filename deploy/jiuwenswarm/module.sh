@@ -21,6 +21,9 @@ jiuwenswarm_refresh_users() {
 # ===== up/down: 调用 deploy.sh =====
 # deploy.sh 使用相对路径 source，需在其所在目录下执行
 jiuwenswarm_up() {
+    # 按当前架构补 Conch 镜像 tag。install 已经把 deploy 目录拷到 ~/.agentos/deploy，
+    # 这里改的是本次 up 正在使用的那份 .env.custom，随后 deploy.sh 再拿它渲染 sandbox.image。
+    _jiuwenswarm_apply_conch_image_tag
     jiuwenswarm_apply_trace_settings
     jiuwenswarm_run_deploy up "$@"
 }
@@ -235,16 +238,13 @@ _jiuwenswarm_image_with_conch_tag() {
     printf '%s:%s' "${image}" "${tag}"
 }
 
-# 检查工具沙箱镜像
-# TOOL_SANDBOX_ENABLE=true 且 TOOL_SANDBOX_EXECUTOR=docker 时，install 检测本地是否已有沙箱镜像。
-# docker 命令缺失、守护进程不可达或镜像不存在时，均直接中断安装。
-# TOOL_SANDBOX_EXECUTOR=conch 时不检查本地镜像。镜像已有 tag 则保持原样；
-# 没有 tag 时按当前架构补上 latest-arm64 / latest-amd64，并写回 .env.custom。
-_jiuwenswarm_check_sandbox_image() {
+# 从本次 up/install 使用的 .env.custom 读取沙箱配置。
+_jiuwenswarm_read_sandbox_env() {
     local env_file="${JIUWENSWARM_DEPLOY_DIR}/.env.custom"
-    local sandbox_type="" sandbox_enable="" sandbox_image="" sandbox_executor=""
-
-    # 从 .env.custom 读取工具沙箱配置
+    sandbox_type=""
+    sandbox_enable=""
+    sandbox_image=""
+    sandbox_executor=""
     if [ -f "${env_file}" ]; then
         sandbox_type=$(_jwsw_env_value "${env_file}" 'TOOL_SANDBOX_TYPE')
         sandbox_enable=$(_jwsw_env_value "${env_file}" 'TOOL_SANDBOX_ENABLE')
@@ -252,19 +252,48 @@ _jiuwenswarm_check_sandbox_image() {
         sandbox_executor=$(_jwsw_env_value "${env_file}" 'TOOL_SANDBOX_EXECUTOR')
     fi
     sandbox_executor=$(printf '%s' "${sandbox_executor}" | tr '[:upper:]' '[:lower:]')
+}
+
+# up 时按当前架构补 Conch 镜像 tag，并写回本次启动使用的 .env.custom。
+# 镜像已有 tag 则保持原样。不在 install 时写：install 会先把 deploy 目录拷到
+# ~/.agentos/deploy，写安装包目录不会进入后续 up 读到的那份副本。
+_jiuwenswarm_apply_conch_image_tag() {
+    local env_file="${JIUWENSWARM_DEPLOY_DIR}/.env.custom"
+    local sandbox_type="" sandbox_enable="" sandbox_image="" sandbox_executor=""
+    _jiuwenswarm_read_sandbox_env
+    if [ "${sandbox_enable}" != "true" ] || [ -z "${sandbox_image}" ]; then
+        return 0
+    fi
+    if [ "${sandbox_executor}" != "conch" ]; then
+        return 0
+    fi
+    if _jiuwenswarm_image_has_tag "${sandbox_image}"; then
+        info "TOOL_SANDBOX_IMAGE already has a tag, leave it unchanged: ${sandbox_image}"
+        return 0
+    fi
+    if [ ! -f "${env_file}" ]; then
+        warning "TOOL_SANDBOX_EXECUTOR=conch but .env.custom not found: ${env_file}"
+        return 0
+    fi
+    local conch_tag new_image
+    conch_tag=$(_jiuwenswarm_host_conch_tag)
+    new_image=$(_jiuwenswarm_image_with_conch_tag "${sandbox_image}" "${conch_tag}")
+    _jiuwenswarm_set_env_value "${env_file}" "TOOL_SANDBOX_IMAGE" "${new_image}"
+    success "TOOL_SANDBOX_EXECUTOR=conch: TOOL_SANDBOX_IMAGE=${new_image}"
+}
+
+# 检查工具沙箱镜像
+# TOOL_SANDBOX_ENABLE=true 且 TOOL_SANDBOX_EXECUTOR=docker 时，install 检测本地是否已有沙箱镜像。
+# docker 命令缺失、守护进程不可达或镜像不存在时，均直接中断安装。
+# TOOL_SANDBOX_EXECUTOR=conch 时不检查本地镜像，镜像 tag 留到 up 再补。
+_jiuwenswarm_check_sandbox_image() {
+    local sandbox_type="" sandbox_enable="" sandbox_image="" sandbox_executor=""
+    _jiuwenswarm_read_sandbox_env
 
     # 仅当工具沙箱启用时处理
     if [ "${sandbox_enable}" = "true" ] && [ -n "${sandbox_image}" ]; then
         if [ "${sandbox_executor}" = "conch" ]; then
-            if _jiuwenswarm_image_has_tag "${sandbox_image}"; then
-                info "TOOL_SANDBOX_IMAGE already has a tag, leave it unchanged: ${sandbox_image}"
-            else
-                local conch_tag new_image
-                conch_tag=$(_jiuwenswarm_host_conch_tag)
-                new_image=$(_jiuwenswarm_image_with_conch_tag "${sandbox_image}" "${conch_tag}")
-                _jiuwenswarm_set_env_value "${env_file}" "TOOL_SANDBOX_IMAGE" "${new_image}"
-                success "TOOL_SANDBOX_EXECUTOR=conch: TOOL_SANDBOX_IMAGE=${new_image}"
-            fi
+            info "TOOL_SANDBOX_EXECUTOR=conch: skip local image check; image tag is applied at up"
             if [ -n "${sandbox_type}" ]; then
                 info "Current TOOL_SANDBOX_TYPE: ${sandbox_type}"
             fi
