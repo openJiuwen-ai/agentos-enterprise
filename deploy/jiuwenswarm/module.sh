@@ -165,11 +165,9 @@ _jiuwenswarm_set_env_value() {
     mv "${tmp}" "${file}"
 }
 
-# 将 AgentOS 的 trace_otlp_endpoints 开关同步到 Gateway：
-# 非空 -> telemetry.enabled/endpoint 打开；空 -> 关闭。
-# 写 Gateway 模板而不是部署后的用户 config，deploy.sh 会按模板重新生成 config。
+# 从 AgentOS 统一入口生成 Gateway 和新用户的 Trace 配置。
 jiuwenswarm_apply_trace_settings() {
-    local py config_py trace_py template env_file endpoints first env_enabled
+    local py config_py trace_py template endpoints first
     py=$(command -v "python${YR_PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || true)
     if [ -z "${py}" ]; then
         warning "Python not found; skip Gateway tracing switch"
@@ -177,9 +175,8 @@ jiuwenswarm_apply_trace_settings() {
     fi
 
     config_py="${SCRIPT_DIR}/scripts/config.py"
-    trace_py="${SCRIPT_DIR}/scripts/gateway_trace.py"
+    trace_py="${SCRIPT_DIR}/scripts/agentos_trace.py"
     template="${JIUWENSWARM_DEPLOY_DIR}/conf/gateway-config-yuanrong.template.yaml"
-    env_file="${JIUWENSWARM_DEPLOY_DIR}/.env.custom"
 
     if [ ! -f "${template}" ] || [ ! -f "${trace_py}" ]; then
         warning "Gateway trace template/helper not found; skip tracing switch"
@@ -194,25 +191,16 @@ jiuwenswarm_apply_trace_settings() {
         || { warning "Failed to read trace_otlp_endpoints; Gateway tracing stays unchanged"; return 0; }
     first="${endpoints%% *}"
 
-    # .env.custom 属于用户配置，部署脚本不代写；但 OTEL_ENABLED 优先级高于
-    # telemetry.enabled，已有显式配置时必须提示，避免统一开关被静默覆盖。
-    if [ -f "${env_file}" ]; then
-        env_enabled=$(_jwsw_env_value "${env_file}" "OTEL_ENABLED")
-        if [ -n "${env_enabled}" ]; then
-            warning "OTEL_ENABLED=${env_enabled} in .env.custom overrides trace_otlp_endpoints; remove it to use the unified switch"
-        fi
-    fi
-
     if [ -n "${first}" ]; then
         if ! "${py}" "${trace_py}" --template "${template}" --endpoint "${first}"; then
             warning "Invalid trace_otlp_endpoints; Gateway tracing stays unchanged"
             return 0
         fi
-        info "Gateway tracing enabled from trace_otlp_endpoints: ${first}"
+        info "Gateway and new-user tracing enabled with OTLP gRPC: ${first}"
     else
         "${py}" "${trace_py}" --template "${template}" --endpoint "" \
             || { warning "Failed to disable Gateway tracing"; return 0; }
-        info "Gateway tracing disabled: trace_otlp_endpoints is empty"
+        info "Gateway and new-user tracing disabled: trace_otlp_endpoints is empty"
     fi
 }
 
