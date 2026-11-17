@@ -34,7 +34,7 @@ export AGENTOS_ETCD_ROOT
 etcd_install() {
     local py arch archive
     local -a args=(--root "${AGENTOS_ETCD_ROOT}")
-    py=$(command -v "python${YR_PYTHON_VERSION}" || command -v python3) || return 1
+    py=$(command -v "python${PYTHON_VERSION}" || command -v python3) || return 1
     arch=$(uname -m)
     case "${arch}" in
         amd64) arch=x86_64 ;;

@@ -3,17 +3,20 @@
 
 读取 ~/.agentos/deploy/config.yaml，提供：
 - 本机 IP 获取
-- 角色推导（is_etcd_node / is_function_master）
+- 角色推导（is_etcd_node / is_master_node）
 - etcd initial-cluster 字符串生成
-- executor 所需 etcd address 列表生成
 
 供 generate-systemd-units.py 和 agentos.sh 调用。
 """
 import sys
 import json
+import ipaddress
 import socket
+import subprocess
 import argparse
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path.home() / ".agentos" / "deploy" / "config.yaml"
@@ -126,6 +129,15 @@ def _parse_yaml_v2(text: str) -> dict:
                     if i + 1 < len(tokens) and tokens[i + 1][0] > indent:
                         sub, i = parse_block(i + 1, indent)
                         obj[key] = sub
+                    elif i + 1 < len(tokens) and tokens[i + 1][:2] == (indent, "list_item"):
+                        # PyYAML's default output places sequence dashes at the
+                        # mapping key's indentation (e.g. cluster_nodes:\n- IP).
+                        sequence = []
+                        i += 1
+                        while i < len(tokens) and tokens[i][:2] == (indent, "list_item"):
+                            sequence.append(_strip_quotes(tokens[i][2]))
+                            i += 1
+                        obj[key] = sequence
                     else:
                         obj[key] = {}
                         i += 1
@@ -224,6 +236,117 @@ def get_local_ip() -> str:
     return "127.0.0.1"
 
 
+def select_adx_node_ip(cluster: dict, local_ips: str, requested_ip: str = "") -> str:
+    """Select only a configured, locally owned, non-loopback node address."""
+    nodes = cluster.get("cluster_nodes")
+    if nodes is None:
+        nodes = list(dict.fromkeys([*cluster["master_nodes"], *cluster["etcd_nodes"]]))
+    configured = set()
+    for value in nodes:
+        if value == "localhost":
+            value = "127.0.0.1"
+        configured.add(str(ipaddress.IPv4Address(value)))
+    local = set()
+    for value in local_ips.split():
+        try:
+            local.add(str(ipaddress.IPv4Address(value)))
+        except ipaddress.AddressValueError:
+            continue
+    candidates = {value for value in configured
+                  if not ipaddress.IPv4Address(value).is_loopback
+                  and not ipaddress.IPv4Address(value).is_unspecified}
+    if not candidates:
+        raise ValueError("Configure a non-loopback node IP in cluster.cluster_nodes "
+                         "(or master_nodes/etcd_nodes for legacy inventories)")
+    if requested_ip:
+        requested = str(ipaddress.IPv4Address(requested_ip))
+        if requested not in candidates:
+            raise ValueError(f"Requested node IP {requested} is not a configured non-loopback node address")
+        if requested not in local:
+            raise ValueError(f"Requested node IP {requested} is not a local interface address")
+        return requested
+    matches = sorted(candidates & local)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        # Routing only chooses among configured, locally owned addresses.
+        try:
+            route = subprocess.run(["ip", "-4", "route", "get", cluster.get("master_nodes", [])[0]],
+                                   capture_output=True, text=True, check=False)
+            fields = route.stdout.split() if route.returncode == 0 else []
+            source = fields[fields.index("src") + 1] if "src" in fields else ""
+        except (OSError, IndexError):
+            source = ""
+        if source in matches:
+            return source
+        raise ValueError("Multiple configured node IPs are local: " + ", ".join(matches)
+                         + "; specify --ip to select this node")
+    raise ValueError("No configured node IP matches a local interface; check cluster.cluster_nodes and --ip")
+
+
+def _write_config_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".config-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.fchmod(stream.fileno(), mode)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _loopback_inventory(cluster: dict) -> bool:
+    addresses = [value for key in ("cluster_nodes", "master_nodes", "etcd_nodes")
+                 for value in cluster.get(key, [])]
+    return bool(addresses) and all(
+        ipaddress.IPv4Address("127.0.0.1" if value == "localhost" else value).is_loopback
+        for value in addresses)
+
+
+def prepare_deploy_config(source: Path, destination: Path, local_ips: str, requested_ip: str = "") -> str:
+    """Reconcile edits since install before any service consumes the inventory."""
+    source, destination = source.resolve(), destination.resolve()
+    baseline = destination.with_name(".config.yaml.last-sync")
+    selected = destination
+    if source == destination or not source.exists():
+        return select_adx_node_ip(load_config(destination), local_ips, requested_ip)
+    incoming = source.read_text(encoding="utf-8")
+    if not destination.exists():
+        selected = source
+    else:
+        current = destination.read_text(encoding="utf-8")
+        if incoming == current:
+            pass
+        elif baseline.exists():
+            previous = baseline.read_text(encoding="utf-8")
+            if current == previous:
+                selected = source
+            elif incoming != previous:
+                raise ValueError(f"Deployment configs changed on both sides: {source} and {destination}; "
+                                 "reconcile these files before init/up/restart")
+        elif _loopback_inventory(load_config(destination)):
+            selected = source
+        elif not _loopback_inventory(load_config(source)):
+            raise ValueError(f"Deployment configs differ without an install baseline: {source} and {destination}; "
+                             "reconcile these files before init/up/restart")
+    node_ip = select_adx_node_ip(load_config(selected), local_ips, requested_ip)
+    content = incoming if selected == source else current
+    peer = destination if selected == source else source
+    if not peer.exists() or peer.read_text(encoding="utf-8") != content:
+        _write_config_atomic(peer, content)
+        print(f"Deployment config synchronized: {selected} -> {peer}", file=sys.stderr)
+    if not baseline.exists() or baseline.read_text(encoding="utf-8") != content:
+        _write_config_atomic(baseline, content)
+    return node_ip
+
+
 def find_ip_index(ip: str, ip_list: list) -> int:
     """返回 ip 在 ip_list 中的索引，未找到返回 -1。"""
     for i, node_ip in enumerate(ip_list):
@@ -252,8 +375,19 @@ def is_etcd_node(local_ip: str, cluster: dict) -> bool:
     return find_local_match_index(local_ip, cluster["etcd_nodes"]) >= 0
 
 
-def is_function_master(local_ip: str, cluster: dict) -> bool:
-    return find_local_match_index(local_ip, cluster["master_nodes"]) >= 0
+def is_single_node(cluster: dict) -> bool:
+    nodes = cluster.get("cluster_nodes")
+    if nodes is not None:
+        if len(nodes) == 1 and len(cluster["master_nodes"]) != 1:
+            raise ValueError("single-node cluster requires exactly one master node")
+        return len(nodes) == 1
+    # Older configurations omit the full inventory. Only the local wildcard
+    # is unambiguous because a multi-node cluster can have one master.
+    return len(cluster["master_nodes"]) == 1 and cluster["master_nodes"][0] in (*WILDCARD_IPS, "localhost")
+
+
+def is_master_node(local_ip: str, cluster: dict) -> bool:
+    return is_single_node(cluster) or find_local_match_index(local_ip, cluster["master_nodes"]) >= 0
 
 
 def etcd_node_name(index: int) -> str:
@@ -272,21 +406,8 @@ def build_initial_cluster(etcd_nodes: list) -> str:
     return ",".join(parts)
 
 
-def build_etcd_address_list(etcd_nodes: list) -> str:
-    """生成 yr 配置所需的 etcd address 列表字符串。
-
-    格式：[{ip="IP0",peer_port=32380,port=32379},...]
-    yr 的 -s 覆盖语法要求 Python 字面量格式。
-    """
-    parts = ",".join(
-        f'{{ip="{ip}",peer_port={ETCD_PEER_PORT},port={ETCD_CLIENT_PORT}}}'
-        for ip in etcd_nodes
-    )
-    return f"[{parts}]"
-
-
-def get_function_master_ip(cluster: dict) -> str:
-    """返回 master_nodes[0]，agent 节点的 --master_address 用。"""
+def get_coordinator_ip(cluster: dict) -> str:
+    """返回 master_nodes[0]，Worker 引导连接使用。"""
     return cluster["master_nodes"][0]
 
 
@@ -316,14 +437,19 @@ def main():
         default="",
         help="Override local IP detection (for multi-NIC environments)",
     )
+    parser.add_argument("--local-ips", default="", help="Local interface addresses for ADX node selection")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    prepare = sub.add_parser("prepare", help="Reconcile deployment configs and validate this node before startup")
+    prepare.add_argument("--destination", type=Path, default=DEFAULT_CONFIG_PATH)
+    sub.add_parser("adx-node-ip", help="Select a configured node IP from local interfaces")
     sub.add_parser("local-ip", help="Print local IP")
     sub.add_parser("is-etcd-node", help="Exit 0 if local IP is in etcd_nodes")
     sub.add_parser("is-master-node", help="Exit 0 if local IP is in master_nodes")
     sub.add_parser("etcd-name", help="Print etcd node name for this host")
     sub.add_parser("initial-cluster", help="Print etcd --initial-cluster value")
-    sub.add_parser("etcd-address-list", help="Print yr etcd address list value")
-    sub.add_parser("master-ip", help="Print master_nodes[0]")
+    sub.add_parser("coordinator-ip", help="Print master_nodes[0]")
+    sub.add_parser("single-node", help="Print 1 for single-node topology or 0 otherwise")
+    sub.add_parser("master-nodes", help="Print all master node IPs, space-separated")
     sub.add_parser("etcd-advertise-ip", help="Print this host's etcd advertise IP")
     sub.add_parser("etcd-nodes", help="Print all etcd node IPs, space-separated")
     sub.add_parser("cluster-nodes", help="Print all cluster node IPs (cluster_nodes), space-separated")
@@ -335,7 +461,13 @@ def main():
     sub.add_parser("all", help="Print all derived values as JSON")
 
     args = parser.parse_args()
+    if args.cmd == "prepare":
+        _LOGGER.info(prepare_deploy_config(Path(args.config), args.destination, args.local_ips, args.ip))
+        return
     cluster = load_config(Path(args.config))
+    if args.cmd == "adx-node-ip":
+        _LOGGER.info(select_adx_node_ip(cluster, args.local_ips, args.ip))
+        return
     local_ip = args.ip if args.ip else get_local_ip()
 
     if args.cmd == "local-ip":
@@ -344,7 +476,7 @@ def main():
     if args.cmd == "is-etcd-node":
         sys.exit(0 if is_etcd_node(local_ip, cluster) else 1)
     if args.cmd == "is-master-node":
-        sys.exit(0 if is_function_master(local_ip, cluster) else 1)
+        sys.exit(0 if is_master_node(local_ip, cluster) else 1)
     if args.cmd == "etcd-name":
         idx = find_local_match_index(local_ip, cluster["etcd_nodes"])
         if idx < 0:
@@ -355,11 +487,14 @@ def main():
     if args.cmd == "initial-cluster":
         _LOGGER.info(build_initial_cluster(cluster["etcd_nodes"]))
         return
-    if args.cmd == "etcd-address-list":
-        _LOGGER.info(build_etcd_address_list(cluster["etcd_nodes"]))
+    if args.cmd == "coordinator-ip":
+        _LOGGER.info(get_coordinator_ip(cluster))
         return
-    if args.cmd == "master-ip":
-        _LOGGER.info(get_function_master_ip(cluster))
+    if args.cmd == "single-node":
+        _LOGGER.info("1" if is_single_node(cluster) else "0")
+        return
+    if args.cmd == "master-nodes":
+        _LOGGER.info(" ".join(cluster["master_nodes"]))
         return
     if args.cmd == "etcd-advertise-ip":
         _LOGGER.info(get_etcd_advertise_ip(local_ip, cluster))
@@ -385,12 +520,11 @@ def main():
         result = {
             "local_ip": local_ip,
             "is_etcd_node": is_etcd_node(local_ip, cluster),
-            "is_master_node": is_function_master(local_ip, cluster),
+            "is_master_node": is_master_node(local_ip, cluster),
             "etcd_name": etcd_node_name(etcd_idx) if etcd_idx >= 0 else None,
             "etcd_index": etcd_idx,
             "initial_cluster": build_initial_cluster(cluster["etcd_nodes"]),
-            "etcd_address_list": build_etcd_address_list(cluster["etcd_nodes"]),
-            "master_ip": get_function_master_ip(cluster),
+            "coordinator_ip": get_coordinator_ip(cluster),
             "ingress_virtual_ip": cluster["ingress_virtual_ip"],
             "etcd_nodes": cluster["etcd_nodes"],
             "master_nodes": cluster["master_nodes"],

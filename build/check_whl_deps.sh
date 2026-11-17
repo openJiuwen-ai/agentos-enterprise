@@ -74,7 +74,13 @@ REQ_FILE="deploy/requirements.txt"
 pushd "${TARGET_DIR}" >/dev/null
 
 echo "[Step 3] searching *.whl files under . ..."
-WHL_FILES=( $(find . -type f -name "*.whl" -not -name "openyuanrong*.whl") )
+# The A4P wheelhouse includes wheels for several Python ABIs. Let pip choose
+# compatible wheels just as the offline installer does.
+if [ -d wheels/a4p ]; then
+    python3 -m pip install --dry-run --ignore-installed --no-index \
+        --find-links wheels/a4p wheels/a4p/a4p-*.whl
+fi
+WHL_FILES=( $(find . -path './wheels/a4p' -prune -o -type f -name "*.whl" -not -name "openyuanrong*.whl" -print) )
 
 if [ ${#WHL_FILES[@]} -eq 0 ]; then
     echo "[Step 3] no .whl files found, nothing to check."
@@ -93,16 +99,16 @@ for f in "${WHL_FILES[@]}"; do
     echo "  - ${f}"
 done
 
-# 数组 → 空格分隔字符串(数组展开后元素之间天然用 IFS 拼接,这里是空格)
-WHL_ARGS="${WHL_FILES[*]}"
-
 # 拼出最终要执行的完整 pip 命令,便于在日志中直接查看与复现
 PIP_CMD=( python3 -m pip install --dry-run
     -i "${PIP_INDEX_URL}"
     --trusted-host "${PIP_TRUSTED_HOST}"
     -r "${REQ_FILE}" )
+if [ -d wheels/a4p ]; then
+    PIP_CMD+=( --find-links wheels/a4p )
+fi
 # 把 whl 列表追加到命令数组(每个元素独立,无需再做转义)
-PIP_CMD+=( ${WHL_ARGS} )
+PIP_CMD+=( "${WHL_FILES[@]}" )
 
 echo "[Step 4] full command: ${PIP_CMD[*]}"
 

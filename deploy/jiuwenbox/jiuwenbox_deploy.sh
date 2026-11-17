@@ -226,18 +226,13 @@ remove_stale_uds_socket() {
 
 # ===== policy / 前置检查 =====
 resolve_extensions_dir() {
-  local py pip_cmd name location="" ext_dir
+  local py ext_dir
   require_python
   py="$(python_bin)"
-  pip_cmd="${py} -m pip"
-  # 发行包名：0.2.8 起为 workswarm，旧包/日构建为 jiuwenswarm
-  for name in workswarm jiuwenswarm; do
-    location="$(${pip_cmd} show "${name}" 2>/dev/null | awk '/^Location:/{print $2}')" || true
-    [ -n "${location}" ] && break
-  done
-  [ -n "${location}" ] || error "Cannot resolve jiuwenswarm via '${pip_cmd} show workswarm|jiuwenswarm'. Is it installed?"
-  ext_dir="${location}/jiuwenswarm/extensions"
-  [ -d "${ext_dir}" ] || warning "extensions directory not found: ${ext_dir} (binding anyway)"
+  # Resolve the installed module with the service interpreter.
+  ext_dir="$("${py}" -c 'import importlib.util; from pathlib import Path; spec = importlib.util.find_spec("jiuwenswarm"); locations = spec.submodule_search_locations if spec else None; print(Path(next(iter(locations))).resolve() / "extensions") if locations else exit(1)' 2>/dev/null)" \
+    || error "Cannot resolve installed jiuwenswarm extensions via ${py}"
+  [ -d "${ext_dir}" ] || error "extensions directory not found: ${ext_dir}"
   echo "${ext_dir}"
 }
 
@@ -281,6 +276,7 @@ generate_policy() {
   info "policy mounts: ${mounted:-none}${skipped:+; skipped: ${skipped}}" >&2
 
   while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
     case "${line}" in
       __DYNAMIC_READ_ONLY__)  printf '%s' "${ro_lines}" ;;
       __DYNAMIC_BIND_MOUNTS__) printf '%s' "${bind_lines}" ;;
@@ -500,8 +496,8 @@ EOF
   mkdir -p "${JIUWENBOX_DROPIN_DIR}"
   cat > "${JIUWENBOX_DROPIN}" <<EOF
 [Service]
-Environment=PATH=${py_bindir}:${PATH}
-Environment=LD_LIBRARY_PATH=${py_libdir}:${LD_LIBRARY_PATH:-}
+Environment="PATH=${py_bindir}:${PATH}"
+Environment="LD_LIBRARY_PATH=${py_libdir}:${LD_LIBRARY_PATH:-}"
 Environment=JIUWENBOX_LISTEN=${LISTEN_URI}
 Environment=JIUWENBOX_POLICY_PATH=${POLICY_ABS}
 # 0.2.8 起：数据面 etcd 同步与默认策略持久化只在 agentos 运行标识下启用
@@ -969,18 +965,9 @@ deploy_jiuwenbox_status() {
   command -v jiuwenbox >/dev/null 2>&1 && has_cli=1 || has_cli=0
 
   # 探测 jiuwenbox 版本号：jiuwenbox-server 随 jiuwenswarm whl 安装
-  # importlib.metadata 比 pip show 快约 30 倍；发行包名 0.2.8 起为 workswarm。
-  # 两个包名在单个 Python 进程内按序探测，避免只有旧包的存量环境启动两个进程。
+  # importlib.metadata 比 pip show 快约 30 倍。
   local jwb_ver
-  jwb_ver=$("$(python_bin)" -c "
-from importlib.metadata import version, PackageNotFoundError
-for pkg in ('workswarm', 'jiuwenswarm'):
-    try:
-        print(version(pkg))
-        break
-    except PackageNotFoundError:
-        continue
-" 2>/dev/null || true)
+  jwb_ver=$("$(python_bin)" -c "from importlib.metadata import version; print(version('jiuwenswarm'))" 2>/dev/null || true)
   [ -z "${jwb_ver}" ] && jwb_ver="-"
 
   # systemd 模式

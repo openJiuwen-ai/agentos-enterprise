@@ -9,8 +9,8 @@
 | 产物 | 说明 |
 |------|------|
 | `AgentOS-Client.tgz` | 客户端 TUI（含全平台 jiuwenswarm_tui，不区分架构；daily/release 同逻辑） |
-| `AgentOS-Server-${ARCH}.tgz` | 服务端（`deploy/` + jiuwenswarm + openyuanrong + a2x_registry wheels + 对应架构 etcd/etcdctl） |
-| `AgentOS-Buildinfo.tgz` | 各部件构建信息汇总（收集 jiuwenswarm/openyuanrong/agent-protocol/conch/credential_router 各 archive 内名字含 buildinfo 关键字的文件，归入 `AgentOS-Buildinfo/` 目录后压缩；保留源文件时间戳，与 AgentOS-Server/Client 同级目录） |
+| `AgentOS-Server-${ARCH}.tgz` | 服务端（`deploy/` + jiuwenswarm + agent-dx + a2x_registry wheels + 沙箱/凭证路由产物 + 对应架构 etcd/etcdctl） |
+| `AgentOS-Buildinfo.tgz` | 各部件构建信息汇总（收集 jiuwenswarm/agent-dx/agent-protocol/conch/credential_router 各 archive 内名字含 buildinfo 关键字的文件，归入 `AgentOS-Buildinfo/` 目录后压缩；保留源文件时间戳，与 AgentOS-Server/Client 同级目录） |
 
 脚本只在 linux 上运行（无交叉编译）。client 包内含 OBS 预编译的全平台 wheel（macosx/win/linux_aarch64/linux_x86_64），server 包仅 linux 平台。
 
@@ -28,7 +28,7 @@
 可用 `ETCD_ARCHIVE=/path/to/archive.tar.gz` 指定另一份本地包，但仍须通过固定校验。
 安装仍校验本机架构及可执行版本，并原子切换 `current`；已有 etcd 数据目录及服务启停流程保持原有行为。
 
-## daily/release 共用 jiuwenswarm/openyuanrong/agent-protocol 获取逻辑
+## daily/release 共用 jiuwenswarm/agent-dx/agent-protocol 获取逻辑
 
 两个模式都从 OBS `last_successful_build` 下载 `archive.tar.gz` 解压取 wheel（和 jiuwenswarm 的 deploy），不再 git clone、不再逐包下载、不再依赖版本号/git tag/时间戳、不再逐小时探测。
 
@@ -36,7 +36,7 @@
 
 ```
 jiuwenswarm:     https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/jiuwenswarm/package/<build_type>/<build_target>/last_successful_build/archive.tar.gz
-openyuanrong:    https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/<build_type>/<build_target>/last_successful_build/archive.tar.gz
+agent-dx:        https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-dx/artifacts/<build_type>/<build_target>/last_successful_build/archive.tar.gz
 agent-protocol:  https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-protocol/package/<build_type>/<build_target>/last_successful_build/archive.tar.gz
 conch:           https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/conch/package/<build_type>/<build_target>/last_successful_build/archive.tar.gz
 ```
@@ -52,13 +52,17 @@ pack 阶段按此取用：
 ```
 archive/jiuwenswarm-*-py3-none-any.whl                        -> server 包（平台无关 wheel）
 archive/<x86_64|aarch64>/jiuwenswarm_tui-*.whl                 -> client 包（不区分架构，两个目录下所有 jiuwenswarm_tui wheel 一并打入）
-archive/deploy.tar.gz                                        -> 解压后取 deploy/yuanrong 合入 server 的 deploy/jiuwenswarm
+本仓库 deploy/                                               -> Server 包的集群编排与固定 ADX 配置
+archive/deploy.tar.gz 中 deploy/yuanrong/                          -> 合入 Server deploy/jiuwenswarm/
 ```
 
-**openyuanrong archive**：
+打包优先使用 Swarm 的 `deploy/yuanrong/`，同时接受此前 ADX 产物中的 `deploy/adx/`。Server 安装路径仍为 `deploy/jiuwenswarm/`。
+
+
+**agent-dx archive**：
 ```
-archive/<x86_64|aarch64>/*.whl                  -> server 包（平台相关：openyuanrong/sdk/runtime/datasystem/functionsystem/faas）
-archive/agent_dx_executor-*-py3-none-any.whl   -> server 包（平台无关，在 archive 根目录）
+archive/<x86_64|aarch64>/adx-release.tar.gz   -> server 包（平台相关整包，按 ${ARCH} 取对应架构）
+archive/agent-dx_buildinfo                    -> AgentOS-Buildinfo 包（collect_buildinfo 收集）
 ```
 
 **agent-protocol archive**：
@@ -78,7 +82,7 @@ archive/*.rpm                    -> server 包（平台无关 none rpm，在 arc
 ## daily 与 release 的唯一差异
 
 - `BUILD_TYPE` 拼 OBS archive 路径（`daily` vs `release` 段）
-- 四个 archive（jiuwenswarm/openyuanrong/agent-protocol/conch）路径里该段分别为 `daily`/`release`
+- 四个 archive（jiuwenswarm/agent-dx/agent-protocol/conch）路径里该段分别为 `daily`/`release`
 
 ## 命令行参数
 
@@ -115,6 +119,7 @@ archive/*.rpm                    -> server 包（平台无关 none rpm，在 arc
 
 - jiuwenswarm release/daily 都改从 OBS archive 获取，删 git clone 和逐包下载
 - openyuanrong release/daily 都改从 OBS archive 获取，删逐包下载和版本号/cp_tag 拼文件名逻辑
+- 部件替换：openyuanrong 包不再使用，改为 agent-dx（`agent-dx/artifacts/<build_type>/<build_target>/last_successful_build/archive.tar.gz`），按 `${ARCH}` 取 `adx-release.tar.gz` 打入 server 包根目录，`agent-dx_buildinfo` 纳入 AgentOS-Buildinfo
 - agent-protocol/a2x_registry release/daily 都改从 OBS archive 获取，删逐小时探测（72h）和版本号拼文件名逻辑
 - 删 `--jiuwenswarm-release-version` / `--jiuwenswarm-release-git-tag` / `--yuanrong-release-version` / `--yuanrong-daily-version` / `--yr-schedule-time` / `--yr-release-download-base` / `--cp-tag` 等死参数及相关死数组
 - daily 删时间戳拼路径逻辑（`$(date +%Y%m%d)17`）和 yuanrong index 解析（`fetch_latest_yr_schedule_time`），jiuwenswarm/openyuanrong/agent-protocol 都改用 `last_successful_build`
@@ -130,16 +135,16 @@ archive/*.rpm                    -> server 包（平台无关 none rpm，在 arc
 
 - 本地目录：`deploy/`（server deploy 来源）
 - 工具：`curl` 或 `wget`、`git`、GNU `tar`、`python3`
-- 网络：访问 OBS（openjiuwen-ci、openyuanrong 和 artifacts.json 中固定的 etcd 来源）
+- 网络：访问 OBS（openjiuwen-ci 和 artifacts.json 中固定的 etcd 来源）
 
 ## 构建流程（main 顺序）
 
 1. `clean` — 清空 `build/dist/`（含 downloads 和 staging）
 2. `build_etcd` — 按目标架构下载、校验固定版本 etcd，记录来源信息
-3. `build_openyuanrong` — 下载并解压 OBS `archive.tar.gz`（openyuanrong wheels）
+3. `build_agent_dx` — 下载并解压 OBS `archive.tar.gz`（agent-dx 平台相关 `adx-release.tar.gz`）
 4. `build_jiuwenswarm` — 下载并解压 OBS `archive.tar.gz`（jiuwenswarm wheels + deploy）
 5. `build_agent_gateway` — 下载并解压 OBS `archive.tar.gz`（a2x_registry wheel）
-6. `build_conch` — 下载并解压 OBS `archive.tar.gz`（conch 沙箱模块 rpm：平台相关按 `${ARCH}` 取 + 平台无关 none；erofs.ko 版本目录如有则一并打入，均进 server 包根目录与各 whl 同级）
+6. `build_conch` — 下载并解压 OBS `archive.tar.gz`（conch 沙箱模块 rpm：平台相关按 `${ARCH}` 取 + 平台无关 none，打入 server 包根目录与各 whl 同级）
 7. `build_credential_router` — 下载并解压 OBS `archive.tar.gz`（credential-router 平台相关 tar.gz）
 8. `pack` — 组装 client/server 两个 tgz 产物
 9. `collect_buildinfo` — 收集各部件 archive 内名字含 buildinfo 关键字的构建信息文件，以及 `build/` 目录顶层名字含 buildinfo 关键字的文件（agent-os 主仓 buildinfo 由 CI 流水线生成于此），到 `AgentOS-Buildinfo/` 目录，`cp -p` + `tar --atime-preserve` 保留源文件时间戳，压缩为 `AgentOS-Buildinfo.tgz`（与 AgentOS-Server/Client 同级；须在 pack 之后，pack 会清空 staging）
@@ -170,7 +175,7 @@ AgentOS-Server日构建/release构建（定时或者手动启动之后）
   |会传递2个参数：build_target=agentos_b050(传给部件需要构建的产品分支名称，也是obs编译产物归档地址)，
   |另外一个参数：build_type=daily（如果是发布传release）
 ---------------------
-jiuwenswarm yuanrong  agent-protocol 等部件CI工程
+jiuwenswarm agent-dx  agent-protocol 等部件CI工程
 ```
 
 ## 3.1、build_target和代码仓分支的关系
@@ -257,55 +262,30 @@ tar -czf archive.tar.gz archive/ --atime-preserve，压缩之后上传到last_su
 "https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/jiuwenswarm/package/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
 
 
-## 6.2、yuanrong agentos B050构建计划归档成
-1、releae： https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/agentos_b050/last_successful_build/archive.tar.gz
-2、daily：  https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/daily/agentos_b050/last_successful_build/archive.tar.gz
+## 6.2、agent-dx agentos B050构建计划归档成
+1、daily：   https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-dx/artifacts/daily/agentos_b050/last_successful_build/archive.tar.gz
+2、release： https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-dx/artifacts/release/agentos_b050/last_successful_build/archive.tar.gz
 
 ```
 archive.tar.gz解压出来文件应该是
 archive
   |-aarch64
-  | |-openyuanrong_datasystem-9.9.9-cp311-cp311-manylinux_2_34_aarch64.whl
-  | |-openyuanrong_faas-9.9.9-cp311-cp311-manylinux_2_34_aarch64.whl
-  | |-openyuanrong_functionsystem-9.9.9-py3-none-manylinux_2_34_aarch64.whl
-  | |-openyuanrong_runtime-9.9.9-cp311-cp311-manylinux_2_34_aarch64.whl
-  | |-openyuanrong_sdk-9.9.9-cp311-cp311-manylinux_2_34_aarch64.whl
-  | |-openyuanrong-9.9.9-py3-none-manylinux_2_34_aarch64.whl
+  | |-adx-release.tar.gz          # aarch64 平台整包（adx-apiserver/adxlet/adxctl/runtime/sdk 等）
   |-x86_64
-  | |-openyuanrong_datasystem-9.9.9-cp311-cp311-manylinux_2_34_x86_64.whl
-  | |-openyuanrong_faas-9.9.9-cp311-cp311-manylinux_2_34_x86_64.whl
-  | |-openyuanrong_functionsystem-9.9.9-py3-none-manylinux_2_34_x86_64.whl
-  | |-openyuanrong_runtime-9.9.9-cp311-cp311-manylinux_2_34_x86_64.whl
-  | |-openyuanrong_sdk-9.9.9-cp311-cp311-manylinux_2_34_x86_64.whl
-  | |-openyuanrong-9.9.9-py3-none-manylinux_2_34_x86_64.whl
-  |-agent_dx_executor-9.9.9-py3-none-any.whl
-  |
+  | |-adx-release.tar.gz          # x86_64 平台整包
+  |-agent-dx_buildinfo            # 构建信息（repository/branch/commit/pr/storage）
+```
 
-/daily/agentos_b050/
-  |-202608281153
-    |-archive
-      | |-x86_64
-      | |-aarch64
-      | |-XXX.whl
-  |-last_successful_build
-    |-archive.tar.gz
-    
-    
-    
-/release/agentos_b050/
-  |-202608281153
-    |-archive
-      | |-x86_64
-      | |-aarch64
-      | |-XXX.whl
-  |-last_successful_build
-    |-archive.tar.gz
+打包取用规则：
+- server 包：按 `${ARCH}` 取 `archive/${ARCH}/adx-release.tar.gz`，放到 `AgentOS-Server-${ARCH}.tgz` 根目录（与各 whl/rpm 同级）
+- buildinfo 包：`archive/agent-dx_buildinfo` 由 `collect_buildinfo` 收集进 `AgentOS-Buildinfo.tgz`
 
+```
 #创建archive目录
 mkdir archive
 
-#拷贝不同平台whl包和deploy压缩文件到archive
-cp -fr x86_64 aarch64 *.whl ./archive
+#拷贝不同平台整包和buildinfo到archive
+cp -fr x86_64 aarch64 agent-dx_buildinfo ./archive
 
 #压缩archive.tar.gz文件，保持源文件时间，保证可追溯
 tar -czf archive.tar.gz archive/ --atime-preserve
@@ -403,3 +383,19 @@ archive.tar.gz
         | |-xxx
         |-XXX_none
 ```
+
+### Core wheel 交付
+
+Core 版本由 `deploy/requirements.txt` 中的 `openjiuwen==VERSION` 指定。
+`AGENT_CORE_FROM_OBS=1`（默认）复用原有下载函数，从以下目录获取
+`openjiuwen-VERSION-py3-none-any.whl` 并放入 Server 包：
+
+```text
+https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-os/dependencies/agent-core/dist/
+```
+
+可用 `AGENT_CORE_BASE_URL` 覆盖目录。设置 `AGENT_CORE_FROM_OBS=0` 时跳过下载和随包交付，
+用户在安装前按 requirements 预装同版本 Core。构建不再拉取或编译 Core 源码。
+
+Server 打包复用 Swarm 原有的启停、健康检查与手动模板刷新脚本；本仓库仅叠加 `agentos_handler.sh` 的目录、配置和 VIP 接线，历史配置迁移位于 `agent-runtime`。
+同时继续接受此前的 ADX 组件归档布局。

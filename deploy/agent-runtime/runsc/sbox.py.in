@@ -1,0 +1,48 @@
+#!@PYTHON@
+# AgentOS managed sbox launcher v1
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+import os
+from pathlib import Path
+import sys
+import tomllib
+
+binary = Path(@BINARY@)
+configuration = Path(@CONFIG@)
+socket = @SOCKET@
+
+
+def has_address(arguments):
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--" or not argument.startswith("-"):
+            break
+        if argument in ("-a", "--address") or argument.startswith(("-a=", "--address=")):
+            return True
+        index += 2 if argument == "--timeout" else 1
+    return False
+
+
+try:
+    data = tomllib.loads(configuration.read_text()) if configuration.exists() else {}
+    root = Path(data.get("rootDir", "/var/lib/agentos-sandboxd/root"))
+    runtime = data.get("plugin", {}).get("runtime", {})
+    binaries = runtime.get("runtime_binary", {})
+    defaults = {
+        "RUNSC_BINARY": binaries.get("runsc", str(binary.with_name("runsc"))),
+        "RUNSC_ROOT": str(root / "runsc"),
+        "RUNC_BINARY": binaries.get("runc", str(binary.with_name("runc"))),
+        "RUNC_ROOT": runtime.get("runc", {}).get("state_root", str(root.parent / "runc")),
+        "SANDBOXD_CONTAINERS_ROOT": str(root / "containers"),
+    }
+    if data.get("disableCgroup", False):
+        defaults["RUNSC_IGNORE_CGROUPS"] = "true"
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+    arguments = sys.argv[1:]
+    if not has_address(arguments):
+        arguments = ["--address", socket, *arguments]
+    os.execv(str(binary), [str(binary), *arguments])
+except (OSError, ValueError) as error:
+    print(f"sbox: {error}", file=sys.stderr)
+    raise SystemExit(1)

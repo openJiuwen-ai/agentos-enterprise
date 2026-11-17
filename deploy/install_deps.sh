@@ -27,7 +27,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENTOS_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-YR_PYTHON_VERSION="${YR_PYTHON_VERSION:-3.11}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 MOOSEFS_VERSION="4.59.2"
 REQUIREMENTS_FILE="${SCRIPT_DIR}/requirements.txt"
 
@@ -163,6 +163,7 @@ install_system_openeuler() {
     # autofs 为 workspace-storage 提供跨节点工作区自动挂载（NFSv4.1）
     local pkgs=(
         "iptables"
+        "ipset"
         "curl"
         "fuse3"
         "iproute"
@@ -175,8 +176,8 @@ install_system_openeuler() {
 
     # python3.11: openEuler 22.03 可能需要从 everything 仓库安装
     # openEuler 24.03 通常自带 python3.11 或可通过 dnf 安装
-    local python_pkg="python3${YR_PYTHON_VERSION#3}"
-    if [ "${YR_PYTHON_VERSION}" = "3.11" ]; then
+    local python_pkg="python3${PYTHON_VERSION#3}"
+    if [ "${PYTHON_VERSION}" = "3.11" ]; then
         python_pkg="python3.11"
     fi
 
@@ -184,7 +185,7 @@ install_system_openeuler() {
     dnf install -y --disablerepo=moosefs "${pkgs[@]}" || {
         # bubblewrap 可能在某些 openEuler 版本中叫 bwrap
         warning "dnf install failed, trying with bwrap instead of bubblewrap"
-        pkgs=("iptables" "curl" "fuse3" "iproute" "bwrap" "jq" "nfs-utils" "rpcbind" "autofs")
+        pkgs=("iptables" "ipset" "curl" "fuse3" "iproute" "bwrap" "jq" "nfs-utils" "rpcbind" "autofs")
         dnf install -y --disablerepo=moosefs "${pkgs[@]}" || error "Failed to install system packages via dnf"
     }
 
@@ -222,8 +223,8 @@ install_system_openeuler() {
     fi
 
     # 检查 python3.11 是否已安装
-    if ! command -v "python${YR_PYTHON_VERSION}" >/dev/null 2>&1; then
-        info "python${YR_PYTHON_VERSION} not found, trying to install ${python_pkg}"
+    if ! command -v "python${PYTHON_VERSION}" >/dev/null 2>&1; then
+        info "python${PYTHON_VERSION} not found, trying to install ${python_pkg}"
         dnf install -y --disablerepo=moosefs "${python_pkg}" 2>/dev/null || {
             warning "dnf install ${python_pkg} failed, trying alternatives"
             # openEuler 22.03 上 python3.11 可能需要特殊处理
@@ -232,8 +233,8 @@ install_system_openeuler() {
     fi
 
     # 确保 pip 可用
-    if command -v "python${YR_PYTHON_VERSION}" >/dev/null 2>&1; then
-        "python${YR_PYTHON_VERSION}" -m ensurepip 2>/dev/null || true
+    if command -v "python${PYTHON_VERSION}" >/dev/null 2>&1; then
+        "python${PYTHON_VERSION}" -m ensurepip 2>/dev/null || true
     fi
 
     success "openEuler system packages installed"
@@ -260,6 +261,7 @@ install_system_ubuntu() {
     # autofs 为 workspace-storage 提供跨节点工作区自动挂载（NFSv4.1）
     local pkgs=(
         "iptables"
+        "ipset"
         "curl"
         "fuse3"
         "iproute2"
@@ -273,13 +275,13 @@ install_system_ubuntu() {
     )
 
     # python3.11: Ubuntu 22.04 和 24.04 默认仓库均无 python3.11，需要 deadsnakes PPA
-    local python_pkg="python${YR_PYTHON_VERSION}"
+    local python_pkg="python${PYTHON_VERSION}"
 
     info "Installing packages: ${pkgs[*]}"
     apt-get install -y "${pkgs[@]}" || {
         # bubblewrap 可能在某些 Ubuntu 版本中叫 bwrap
         warning "apt install failed, trying with bwrap instead of bubblewrap"
-        pkgs=("iptables" "curl" "fuse3" "iproute2" "bwrap" "jq" "gpg" "nfs-kernel-server" "nfs-common" "rpcbind" "autofs")
+        pkgs=("iptables" "ipset" "curl" "fuse3" "iproute2" "bwrap" "jq" "gpg" "nfs-kernel-server" "nfs-common" "rpcbind" "autofs")
         apt-get install -y "${pkgs[@]}" || error "Failed to install system packages via apt"
     }
 
@@ -311,8 +313,8 @@ install_system_ubuntu() {
     fi
 
     # 检查 python3.11 是否已安装
-    if ! command -v "python${YR_PYTHON_VERSION}" >/dev/null 2>&1; then
-        info "python${YR_PYTHON_VERSION} not found, trying to install ${python_pkg}"
+    if ! command -v "python${PYTHON_VERSION}" >/dev/null 2>&1; then
+        info "python${PYTHON_VERSION} not found, trying to install ${python_pkg}"
 
         # Ubuntu 22.04 和 24.04 默认仓库都没有 python3.11，需要 deadsnakes PPA
         info "Adding deadsnakes PPA for ${python_pkg}"
@@ -326,15 +328,15 @@ install_system_ubuntu() {
         }
 
         # python3.11 需要 python3.11-venv 和 python3.11-distutils
-        if command -v "python${YR_PYTHON_VERSION}" >/dev/null 2>&1; then
+        if command -v "python${PYTHON_VERSION}" >/dev/null 2>&1; then
             apt-get install -y "${python_pkg}-venv" "${python_pkg}-distutils" 2>/dev/null || true
         fi
     fi
 
     # 确保 pip 可用
-    if command -v "python${YR_PYTHON_VERSION}" >/dev/null 2>&1; then
-        "python${YR_PYTHON_VERSION}" -m ensurepip 2>/dev/null || true
-        apt-get install -y "python${YR_PYTHON_VERSION}-distutils" 2>/dev/null || true
+    if command -v "python${PYTHON_VERSION}" >/dev/null 2>&1; then
+        "python${PYTHON_VERSION}" -m ensurepip 2>/dev/null || true
+        apt-get install -y "python${PYTHON_VERSION}-distutils" 2>/dev/null || true
     fi
 
     success "Ubuntu system packages installed"
@@ -459,9 +461,9 @@ install_python_deps() {
     fi
 
     local py_bin
-    py_bin=$(command -v "python${YR_PYTHON_VERSION}" 2>/dev/null || command -v python3 2>/dev/null || true)
+    py_bin=$(command -v "python${PYTHON_VERSION}" 2>/dev/null || command -v python3 2>/dev/null || true)
     if [ -z "${py_bin}" ]; then
-        error "python${YR_PYTHON_VERSION} not found, cannot install Python deps"
+        error "python${PYTHON_VERSION} not found, cannot install Python deps"
     fi
 
     info "Using: ${py_bin} ($("${py_bin}" --version 2>&1))"
@@ -469,7 +471,7 @@ install_python_deps() {
 
     "${py_bin}" -m ensurepip 2>/dev/null || true
     "${py_bin}" -m pip install --upgrade pip 2>/dev/null || true
-    "${py_bin}" -m pip install -r "${REQUIREMENTS_FILE}" \
+    "${py_bin}" -m pip install --find-links "${AGENTOS_ROOT}" -r "${REQUIREMENTS_FILE}" \
         || error "Failed to install Python dependencies from requirements.txt"
 
     success "Python dependencies installed"
@@ -518,7 +520,7 @@ Usage: ./$(basename "$0") [OPTIONS]
 注意: 工具脚本仅供参考，有需要请自行修改
 
 安装内容:
-  1. 系统包:   python${YR_PYTHON_VERSION}、ip (iproute/iproute2)、iptables、curl、fuse3、bwrap、jq、
+  1. 系统包:   python${PYTHON_VERSION}、ip (iproute/iproute2)、iptables、curl、fuse3、bwrap、jq、
                NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server + nfs-common)、autofs、
                Conch 沙箱依赖（virtiofsd/qemu/erofs-utils 等，随 OS 版本不同）
   2. MooseFS:  moosefs-master、moosefs-chunkserver、moosefs-client
@@ -532,7 +534,7 @@ Options:
   -h, --help         显示帮助信息
 
 Environment Variables:
-  YR_PYTHON_VERSION  Python 版本号（默认: 3.11）
+  PYTHON_VERSION  Python 版本号（默认: 3.11）
 
 Examples:
   # 安装全部依赖
@@ -542,7 +544,7 @@ Examples:
   ./install_deps.sh --skip-moosefs --skip-python
 
   # 指定 Python 版本
-  YR_PYTHON_VERSION=3.11 ./install_deps.sh
+  PYTHON_VERSION=3.11 ./install_deps.sh
 EOF
     exit 0
 }
@@ -552,7 +554,7 @@ EOF
 # ============================================================
 main() {
     info "AgentOS dependency installation starting"
-    info "Python version target: ${YR_PYTHON_VERSION}"
+    info "Python version target: ${PYTHON_VERSION}"
 
     parse_args "$@"
 
@@ -615,7 +617,7 @@ main() {
     echo "=========================================="
     echo "  OS:         ${DETECTED_OS} ${DETECTED_VERSION}"
     echo "  Arch:       $(uname -m)"
-    echo "  Python:     ${YR_PYTHON_VERSION}"
+    echo "  Python:     ${PYTHON_VERSION}"
     if [ "${SKIP_SYSTEM}" -eq 0 ]; then
         echo "  System pkgs: installed"
     fi

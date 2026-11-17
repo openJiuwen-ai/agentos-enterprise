@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import importlib.util
+import json
 import tempfile
 import unittest
 
@@ -94,6 +95,28 @@ class AgentOSTraceTests(unittest.TestCase):
             path.write_text("gateway:\n  x: 1\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 agentos_trace.apply_template(path, endpoint="collector:4317")
+
+    def test_prepared_gateway_and_user_seed_keep_the_cluster_trace_switch(self):
+        spec = importlib.util.spec_from_file_location("trace_runtime", ROOT / "deploy/agent-runtime/configure.py")
+        runtime = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runtime)
+        for endpoints, enabled in ((["collector:4317", "backup:4317"], True), ([], False), ("invalid", None)):
+            with self.subTest(endpoints=endpoints), tempfile.TemporaryDirectory() as directory:
+                template = Path(directory) / "gateway.yaml"
+                template.write_text(TEMPLATE)
+                cluster = Path(directory) / "cluster.yaml"
+                cluster.write_text(json.dumps({"trace_otlp_endpoints": endpoints}))
+                runtime.apply_deployment_tracing(template, cluster)
+                value = template.read_text()
+                if enabled is None:
+                    self.assertEqual(value, TEMPLATE)
+                else:
+                    self.assertIn("trace_enabled: " + str(enabled).lower(), value)
+                    self.assertIn("  protocol: grpc", value)
+                    self.assertIn("gateway:\n  session_map_scope: per_chat_bot_user", value)
+                    if enabled:
+                        self.assertIn("http://collector:4317", value)
+                        self.assertNotIn("backup:4317", value)
 
 
 if __name__ == "__main__":

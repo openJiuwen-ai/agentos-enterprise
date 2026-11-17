@@ -84,7 +84,7 @@ install_conch_wheel() {
     cp -f "${wheel_source}" "${wheel_dest}" \
         || error "Failed to copy Conch wheel to ${AGENTOS_ROOT}"
 
-    python_bin="python${YR_PYTHON_VERSION:-3.11}"
+    python_bin="python${PYTHON_VERSION:-3.11}"
     command -v "${python_bin}" >/dev/null 2>&1 \
         || error "${python_bin} not found; install Python before deploying Conch"
     "${python_bin}" -m ensurepip 2>/dev/null || true
@@ -539,7 +539,7 @@ conch_uninstall() {
         rm -f "${erofs_conf}"
     fi
 
-    local python_bin="python${YR_PYTHON_VERSION:-3.11}"
+    local python_bin="python${PYTHON_VERSION:-3.11}"
     if command -v "${python_bin}" >/dev/null 2>&1; then
         "${python_bin}" -m pip uninstall -y conch 2>/dev/null \
             && success "Conch wheel uninstalled" \
@@ -651,7 +651,7 @@ Options:
   -h, --help      显示帮助
 
 Environment Variables:
-  YR_PYTHON_VERSION  Python version used for Conch wheel (default: 3.11)
+  PYTHON_VERSION  Python version used for Conch wheel (default: 3.11)
   CONCH_LOG_FILE  conchd log file
   CONCH_SOCKET / CONCH_READY_TIMEOUT / CONCH_READY_POLL_INTERVAL
   CONCH_STOP_TIMEOUT  readiness and stop timeout settings

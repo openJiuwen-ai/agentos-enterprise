@@ -40,7 +40,7 @@ _agentos_etcd_resolve_root() {
 AGENTOS_ETCD_ROOT="$(_agentos_etcd_resolve_root)"
 export AGENTOS_ETCD_ROOT
 
-YR_PYTHON_VERSION="${YR_PYTHON_VERSION:-3.11}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 AGENT_RUNTIME_CONFIG_PY="${SCRIPT_DIR}/scripts/config.py"
 AGENT_RUNTIME_ETCD_SVC="agentos-etcd"
 AGENT_RUNTIME_ETCD_UNIT="/etc/systemd/system/${AGENT_RUNTIME_ETCD_SVC}.service"
@@ -61,8 +61,8 @@ _yr_has_systemd() {
 
 # ===== 定位 python 解释器 =====
 _yr_python() {
-    command -v "python${YR_PYTHON_VERSION}" 2>/dev/null || command -v python3 2>/dev/null \
-        || error "python not found (need python${YR_PYTHON_VERSION} or python3)"
+    command -v "python${PYTHON_VERSION}" 2>/dev/null || command -v python3 2>/dev/null \
+        || error "python not found (need python${PYTHON_VERSION} or python3)"
 }
 
 # ===== config.py 封装：角色推导 =====
@@ -151,12 +151,12 @@ _yr_etcdctl_path() {
     return 1
 }
 
-# ===== agent-runtime（openyuanrong）在 etcd 中写入的业务数据前缀 =====
-# 由 master 节点的 agent-runtime down 流程调用清理（agent 节点 down 不清；
-# 前提：写方 function-proxy/function-master 已退出）：
-# 清掉本次运行的业务数据，避免残留干扰下次启动；up/restart 启动侧与故障自愈不触发清理。
+# ===== 旧 openyuanrong 在 etcd 中写入的业务数据前缀 =====
+# yr stop --force 不会优雅退出清理 etcd 数据，down 后按前缀删除避免残留。
 # 不动 etcd 自身集群元数据（member/ 等），仅清业务层数据。
-AGENT_RUNTIME_ETCD_DATA_PREFIXES=("/datasystem/" "/scheduler/" "/sn/" "/yr/")
+# 默认前缀不含 /sn/：jiuwenswarm 的 FUNCTION_ID 仍使用 /sn/ 命名空间（误删不可逆），
+# 确认无 /sn/ 业务数据时用 clean-yr-data --include-sn 显式纳入。
+AGENT_RUNTIME_ETCD_DATA_PREFIXES=("/datasystem/" "/scheduler/" "/yr/")
 
 # ===== 生成 etcd unit（仅 etcd_nodes 节点调用） =====
 # advertise IP 必须用本机在 etcd_nodes 中匹配到的 config IP（通配匹配时用通配 IP 本身），
@@ -305,16 +305,31 @@ EOF
     success "etcd data cleaned: ${AGENT_RUNTIME_ETCD_DATA_DIR}"
 }
 
-# ===== clean-yr-data: 清理 agent-runtime（openyuanrong）在 etcd 中的业务数据 =====
-# 由 master 节点的 agent-runtime down 流程调用（agent 节点 down 不清）：清掉本次运行的
-# 业务数据，避免下次启动读到旧拓扑/旧实例路由导致失败。调用前提：写方
-# （function-proxy/function-master）已退出——写方存活时清理会破坏运行中集群的数据；
-# up 与故障自愈路径不触发本命令。
-# 按前缀删除 /datasystem/、/scheduler/、/sn/、/yr/ 开头的 key，
+# ===== clean-yr-data: 清理旧 openyuanrong 在 etcd 中残留的业务数据（迁移后使用） =====
+# yr stop --force 是强制停止，不会优雅退出清理 etcd 业务数据。
+# 按前缀删除 /datasystem/、/scheduler/、/yr/ 开头的 key（--include-sn 额外纳入 /sn/），
+# 避免下次 up 时读到旧拓扑/旧实例路由导致路由失败。
 # 不动 etcd 自身集群元数据（member/ 等），仅清业务层数据。
-# etcd 服务必须正在运行（本命令不启停 etcd）。
+# etcd 服务必须正在运行（本命令不启停 etcd）；执行前交互确认（-y/--yes 跳过）。
 etcd_clean_yr_data() {
-    local etcdctl endpoints node prefix
+    local include_sn=0 assume_yes=0 etcdctl endpoints node prefix
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --include-sn) include_sn=1; shift ;;
+            -y|--yes) assume_yes=1; shift ;;
+            -h|--help)
+                cat << EOF
+Usage: ./$(basename "$0") clean-yr-data [--include-sn] [-y|--yes]
+  清理旧 openyuanrong 在 etcd 中残留的业务数据（仅在确认已迁移到 ADX 后使用）
+  --include-sn  额外删除 /sn/ 前缀（jiuwenswarm 仍在用，确认无业务数据才开启）
+  -y, --yes     跳过交互确认
+EOF
+                return 0
+                ;;
+            *) error "Unknown option for clean-yr-data: $1" ;;
+        esac
+    done
 
     etcdctl=$(_yr_etcdctl_path) \
         || error "Cannot locate etcdctl binary (tried: PATH, yr config dump, yr third_party)"
@@ -332,14 +347,29 @@ etcd_clean_yr_data() {
         endpoints="${endpoints}http://${node}:${YR_ETCD_CLIENT_PORT}"
     done
 
-    info "Cleaning agent-runtime (openyuanrong) etcd data (endpoints: ${endpoints})..."
-    for prefix in "${AGENT_RUNTIME_ETCD_DATA_PREFIXES[@]}"; do
+    local -a prefixes=("${AGENT_RUNTIME_ETCD_DATA_PREFIXES[@]}")
+    [ "${include_sn}" = "1" ] && prefixes+=("/sn/")
+
+    # 交互确认（与 clean 一致，-y/--yes 跳过）
+    if [ "${assume_yes}" != "1" ]; then
+        info "WARNING: This will DELETE legacy openyuanrong etcd data by prefix: ${prefixes[*]}"
+        info "Only use after confirming the ADX migration is complete and jiuwenswarm has no /sn/ business data."
+        local confirm
+        read -r -p "Type 'yes' to confirm deletion: " confirm
+        if [ "${confirm}" != "yes" ]; then
+            warning "Aborted, etcd data preserved"
+            return 0
+        fi
+    fi
+
+    info "Cleaning legacy openyuanrong etcd data (endpoints: ${endpoints})..."
+    for prefix in "${prefixes[@]}"; do
         local deleted
         deleted=$(ETCDCTL_API=3 "${etcdctl}" --endpoints="${endpoints}" del "${prefix}" --prefix 2>/dev/null) \
             && info "  cleaned prefix: ${prefix} (${deleted} keys)" \
             || warning "  failed to clean prefix: ${prefix} (may not exist)"
     done
-    success "agent-runtime (openyuanrong) etcd data cleaned"
+    success "legacy openyuanrong etcd data cleaned"
 }
 
 # ===== check: 探测 etcd 集群是否可达（供 agentos.sh up 前置检查调用） =====
@@ -456,16 +486,17 @@ Commands:
   clean           清理 etcd 数据目录（交互确认，-y/--yes 跳过确认）
                   适用场景：etcd 拓扑变更、数据损坏修复、全新 re-bootstrap
                   平滑重启不需 clean，down + up 即可保留数据恢复
-  clean-yr-data   清理 agent-runtime（openyuanrong）在 etcd 中的业务数据（按前缀删除）
-                  删除 /datasystem/、/scheduler/、/sn/、/yr/ 开头的 key
-                  由 master 节点的 agent-runtime down 调用（前提：function-proxy/function-master 已退出）；etcd 服务必须正在运行；不影响 etcd 集群元数据
+  clean-yr-data   清理旧 openyuanrong 在 etcd 中残留的业务数据（仅在确认已迁移到 ADX 后使用）
+                  默认删除 /datasystem/、/scheduler/、/yr/ 前缀；/sn/（jiuwenswarm 在用）
+                  需 --include-sn 显式纳入；交互确认（-y/--yes 跳过）
+                  etcd 服务必须正在运行；不影响 etcd 集群元数据
 
 Environment:
   AGENTOS_ETCD_ROOT          独立 etcd 安装根目录（默认 /opt/agentos/etcd；
                              install 时持久化到 /etc/agentos/etcd-root，后续命令自动复用）
   ETCD_BIN_PATH              显式指定 etcd 二进制（优先级最高）
   ETCDCTL_PATH               显式指定 etcdctl 二进制
-  YR_PYTHON_VERSION          Python 版本（默认 3.11）
+  PYTHON_VERSION          Python 版本（默认 3.11）
   YR_HEALTH_CHECK_RETRIES    up 健康检查重试次数（默认 30，每次 1s）
 
 Examples:

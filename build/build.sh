@@ -554,7 +554,9 @@ pack() {
   done
 
   cp -a "${DEPLOY_DIR}/." "${server_staging}/deploy/"
-  cp -a "${DOWNLOAD_DIR}/jiuwenswarm_src/deploy/yuanrong/." "${server_staging}/deploy/jiuwenswarm/"
+  local swarm_deploy_source="${DOWNLOAD_DIR}/jiuwenswarm_src/deploy/adx"
+  [[ -d "${swarm_deploy_source}" ]] || swarm_deploy_source="${DOWNLOAD_DIR}/jiuwenswarm_src/deploy/yuanrong"
+  cp -a "${swarm_deploy_source}/." "${server_staging}/deploy/jiuwenswarm/"
 
   local client_tgz="${BUILD_DIR}/AgentOS-Client.tgz"
   local server_tgz="${BUILD_DIR}/AgentOS-Server-${ARCH}.tgz"

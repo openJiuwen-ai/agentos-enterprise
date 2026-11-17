@@ -1,0 +1,61 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+profile: agentos
+business_env_file: ${ADX_BUSINESS_ENV_FILE}
+python: ${ADX_BUSINESS_PYTHON}
+tenant: agentos
+namespace: ${ADX_NAMESPACE}
+token_file: ${ADX_CONFIG_DIR}/secrets/agentos-tenant-key
+ca_file: ${ADX_CA_BUNDLE_FILE}
+ingress_url: http://127.0.0.1:8080
+workspace_root: /home/agentos/users
+shared_workspace_sqlite: true
+gateway:
+  home: ${ADX_GATEWAY_HOME}
+  host: 0.0.0.0
+  port: 19001
+  web_host: 0.0.0.0
+  web_port: 19000
+  static_port: 5173
+  agentos:
+    auth_enabled: true
+    auth_service_url: http://${ADX_INGRESS_VIP}:8090
+    registry:
+      endpoint: http://${ADX_INGRESS_VIP}:4003
+runtime:
+  user: agentos
+  # Builtin AgentServer only: host Python, commands and libraries mounted read-only.
+  python_mounts: ${ADX_PYTHON_MOUNTS}
+  # Explicit workspace semantics; ADXlet normalizes runsc's NFS/FUSE auto-append.
+  workspace_mount_options: [rw, disable_file_handle_sharing]
+  node_ingress_url: ${ADX_NODE_INGRESS_URL}
+  agent_runtime: supervisor
+  tool_runtime: runsc
+  # Missing policies default to 3 node-local restarts (backoff 1s, capped at 30s).
+  # Optional deployment overrides; null disables automatic restart for that role.
+  # Existing gateway/workspace restart_policy overrides remain effective.
+  # agent_restart_policy: {maxAttempts: 3, initialBackoffSeconds: 1, maxBackoffSeconds: 30}
+  # tool_restart_policy: {maxAttempts: 3, initialBackoffSeconds: 1, maxBackoffSeconds: 30}
+  # Default above; both backends remain available for historical workspaces.
+  tool_runtimes: [runsc, conch]
+  conch_image: agentos-tools:v1
+  local_image_bindings_file: ${ADX_LOCAL_IMAGE_BINDINGS_FILE}
+  # Optional offline Docker archive paths, keyed by their original image reference.
+  # local_images:
+  #   ubuntu:24.04:
+  #     archive: /root/resources/images/ubuntu-24.04.tar
+  # Supervisor uses its registered builtin binding; runsc tools use the default local rootfs.
+  # Explicit agent_image/tool_image values must match the selected runtime.
+  # Optional native ADX checkpoint_storage mapping; cross-node restore requires shared storage.
+  # Keep checkpoint files outside user workspace mounts.
+  runtime_control:
+    key_file: ${ADX_CONFIG_DIR}/secrets/runtime-control-key
+network:
+  # Outbound business access: N0 closed, N1 explicit origins, N2 public Internet.
+  # These presets apply to the managed runsc AgentServer and tool runtimes.
+  agent_profile: N2
+  tool_profile: N2
+  ingress_policy_peer: agentos-ingress.node.invalid
+  ingress_port: 8080
+  runtime_control_port: 19103
+  allowed_internal_origins: []
+  tool_origins: []

@@ -1,0 +1,113 @@
+{
+  "ociVersion": "1.0.0",
+  "process": {
+    "user": {
+      "uid": 1000,
+      "gid": 1000
+    },
+    "args": [
+      "node",
+      "index.js"
+    ],
+    "cwd": "/var/task",
+    "env": [
+      "PATH=/var/lang/bin:/usr/local/bin:/usr/bin/:/bin:/opt/bin",
+      "LD_LIBRARY_PATH=/var/lang/lib:/lib64:/var/runtime:/var/task:/var/task/lib:/opt/lib",
+      "LANG=en_US.UTF-8",
+      "TERM=xterm"
+    ],
+    "capabilities": {
+      "bounding": [
+        "CAP_CHOWN",
+        "CAP_AUDIT_WRITE",
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_SETUID",
+        "CAP_SETGID"
+      ],
+      "effective": [
+        "CAP_CHOWN",
+        "CAP_AUDIT_WRITE",
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_SETUID",
+        "CAP_SETGID"
+      ],
+      "inheritable": [
+        "CAP_CHOWN",
+        "CAP_AUDIT_WRITE",
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_SETUID",
+        "CAP_SETGID"
+      ],
+      "permitted": [
+        "CAP_CHOWN",
+        "CAP_AUDIT_WRITE",
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_SETUID",
+        "CAP_SETGID"
+      ],
+      "ambient": [
+        "CAP_CHOWN",
+        "CAP_SETUID",
+        "CAP_SETGID"
+      ]
+    },
+    "rlimits": [
+      {
+        "type": "RLIMIT_NOFILE",
+        "hard": 1024,
+        "soft": 1024
+      }
+    ]
+  },
+  "root": {
+    "path": "rootfs",
+    "readonly": true
+  },
+  "hostname": "akernel",
+  "mounts": [
+    {
+      "destination": "/proc",
+      "type": "proc",
+      "source": "proc"
+    },
+    {
+      "destination": "/dev",
+      "type": "tmpfs",
+      "source": "tmpfs"
+    },
+    {
+      "destination": "/sys",
+      "type": "sysfs",
+      "source": "sysfs",
+      "options": [
+        "nosuid",
+        "noexec",
+        "nodev",
+        "ro"
+      ]
+    }
+  ],
+  "linux": {
+    "namespaces": [
+      {
+        "type": "pid"
+      },
+      {
+        "type": "network"
+      },
+      {
+        "type": "ipc"
+      },
+      {
+        "type": "uts"
+      },
+      {
+        "type": "mount"
+      }
+    ]
+  }
+}

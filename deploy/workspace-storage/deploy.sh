@@ -3,8 +3,8 @@
 set -euo >/dev/null 2>&1
 
 # ============================================================
-# Workspace Storage 部署脚本 (NFS + autofs)
-# 替代 MooseFS 分布式存储部署
+# Workspace 存储部署脚本 (NFS + autofs)
+# 每节点一个 agentos-workspace 服务，归属关系存于 etcd 单键
 #
 # 用法:
 #   ./deploy.sh install
@@ -13,7 +13,6 @@ set -euo >/dev/null 2>&1
 #   ./deploy.sh restart
 #   ./deploy.sh uninstall
 #   ./deploy.sh status
-#   ./deploy.sh migrate --ip 192.168.1.1
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -108,6 +107,31 @@ _ws_load_config() {
     local _env_etcd_endpoint="${ETCD_ENDPOINT:-}"
     local _env_bind_ip="${BIND_IP:-}"
     local _env_negative_timeout="${AUTOFS_NEGATIVE_TIMEOUT:-}"
+    local _env_etcd_endpoints="${WORKSPACE_ETCD_ENDPOINTS:-}"
+    local _env_etcd_tls="${WORKSPACE_ETCD_TLS:-}"
+    local _env_etcd_tls_ca="${WORKSPACE_ETCD_TLS_CA:-}"
+    local _env_etcd_tls_cert="${WORKSPACE_ETCD_TLS_CERT:-}"
+    local _env_etcd_tls_key="${WORKSPACE_ETCD_TLS_KEY:-}"
+    local _env_etcd_timeout="${WORKSPACE_ETCD_TIMEOUT:-}"
+    local _env_etcdctl_path="${ETCDCTL_PATH:-}"
+    local _env_enable_tls="${ENABLE_TLS:-}"
+    local _env_etcd_ssl_base="${ETCD_SSL_BASE_PATH:-}"
+    local _env_candidate_nodes="${WORKSPACE_CANDIDATE_NODES:-}"
+    local _env_workspace_enabled="${WORKSPACE_ENABLED:-}"
+    local _env_service_enabled="${WORKSPACE_SERVICE_ENABLED:-}"
+    local _env_node_id="${WORKSPACE_NODE_ID:-}"
+    local _env_api_listen="${WORKSPACE_API_LISTEN:-}"
+    local _env_internal_port="${WORKSPACE_INTERNAL_PORT:-}"
+    local _env_internal_allow="${WORKSPACE_INTERNAL_ALLOW:-}"
+    local _env_internal_timeout="${WORKSPACE_INTERNAL_TIMEOUT:-}"
+    local _env_internal_retries="${WORKSPACE_INTERNAL_RETRIES:-}"
+    local _env_watchdog_interval="${WORKSPACE_WATCHDOG_INTERVAL:-}"
+    local _env_trash_retention="${WORKSPACE_TRASH_RETENTION:-}"
+    local _env_cache_file="${WORKSPACE_CACHE_FILE:-}"
+    local _env_workspace_user="${WORKSPACE_USER:-}"
+    local _env_default_uid="${WORKSPACE_DEFAULT_UID:-}"
+    local _env_default_gid="${WORKSPACE_DEFAULT_GID:-}"
+    local _env_python="${WORKSPACE_PYTHON:-}"
 
     # 读取配置文件
     local conf_file="${SCRIPT_DIR}/workspace_storage.conf"
@@ -125,6 +149,31 @@ _ws_load_config() {
     [ -n "${_env_etcd_endpoint}" ] && ETCD_ENDPOINT="${_env_etcd_endpoint}"
     [ -n "${_env_bind_ip}" ]       && BIND_IP="${_env_bind_ip}"
     [ -n "${_env_negative_timeout}" ] && AUTOFS_NEGATIVE_TIMEOUT="${_env_negative_timeout}"
+    [ -n "${_env_etcd_endpoints}" ]      && WORKSPACE_ETCD_ENDPOINTS="${_env_etcd_endpoints}"
+    [ -n "${_env_etcd_tls}" ]            && WORKSPACE_ETCD_TLS="${_env_etcd_tls}"
+    [ -n "${_env_etcd_tls_ca}" ]         && WORKSPACE_ETCD_TLS_CA="${_env_etcd_tls_ca}"
+    [ -n "${_env_etcd_tls_cert}" ]       && WORKSPACE_ETCD_TLS_CERT="${_env_etcd_tls_cert}"
+    [ -n "${_env_etcd_tls_key}" ]        && WORKSPACE_ETCD_TLS_KEY="${_env_etcd_tls_key}"
+    [ -n "${_env_etcd_timeout}" ]        && WORKSPACE_ETCD_TIMEOUT="${_env_etcd_timeout}"
+    [ -n "${_env_etcdctl_path}" ]        && ETCDCTL_PATH="${_env_etcdctl_path}"
+    [ -n "${_env_enable_tls}" ]          && ENABLE_TLS="${_env_enable_tls}"
+    [ -n "${_env_etcd_ssl_base}" ]       && ETCD_SSL_BASE_PATH="${_env_etcd_ssl_base}"
+    [ -n "${_env_candidate_nodes}" ]     && WORKSPACE_CANDIDATE_NODES="${_env_candidate_nodes}"
+    [ -n "${_env_workspace_enabled}" ]   && WORKSPACE_ENABLED="${_env_workspace_enabled}"
+    [ -n "${_env_service_enabled}" ]     && WORKSPACE_SERVICE_ENABLED="${_env_service_enabled}"
+    [ -n "${_env_node_id}" ]             && WORKSPACE_NODE_ID="${_env_node_id}"
+    [ -n "${_env_api_listen}" ]          && WORKSPACE_API_LISTEN="${_env_api_listen}"
+    [ -n "${_env_internal_port}" ]       && WORKSPACE_INTERNAL_PORT="${_env_internal_port}"
+    [ -n "${_env_internal_allow}" ]      && WORKSPACE_INTERNAL_ALLOW="${_env_internal_allow}"
+    [ -n "${_env_internal_timeout}" ]    && WORKSPACE_INTERNAL_TIMEOUT="${_env_internal_timeout}"
+    [ -n "${_env_internal_retries}" ]    && WORKSPACE_INTERNAL_RETRIES="${_env_internal_retries}"
+    [ -n "${_env_watchdog_interval}" ]   && WORKSPACE_WATCHDOG_INTERVAL="${_env_watchdog_interval}"
+    [ -n "${_env_trash_retention}" ]     && WORKSPACE_TRASH_RETENTION="${_env_trash_retention}"
+    [ -n "${_env_cache_file}" ]          && WORKSPACE_CACHE_FILE="${_env_cache_file}"
+    [ -n "${_env_workspace_user}" ]      && WORKSPACE_USER="${_env_workspace_user}"
+    [ -n "${_env_default_uid}" ]         && WORKSPACE_DEFAULT_UID="${_env_default_uid}"
+    [ -n "${_env_default_gid}" ]         && WORKSPACE_DEFAULT_GID="${_env_default_gid}"
+    [ -n "${_env_python}" ]              && WORKSPACE_PYTHON="${_env_python}"
 
     # 设置默认值
     : "${WORKSPACE_STORAGE_ROOT:="/home/agentos/.users"}"
@@ -133,11 +182,39 @@ _ws_load_config() {
     : "${WORKSPACE_ETCD_PREFIX:="/agent-runtime/workspace"}"
     : "${WORKSPACE_STORAGE_ENABLED:="auto"}"
     : "${WORKSPACE_STORAGE_USE_SYSTEMD:="auto"}"
+    : "${WORKSPACE_ETCD_ENDPOINTS:=""}"
+    : "${WORKSPACE_ETCD_TLS:="false"}"
+    : "${WORKSPACE_ETCD_TLS_CA:=""}"
+    : "${WORKSPACE_ETCD_TLS_CERT:=""}"
+    : "${WORKSPACE_ETCD_TLS_KEY:=""}"
+    : "${WORKSPACE_ETCD_TIMEOUT:="2"}"
+    : "${ETCDCTL_PATH:=""}"
+    : "${ENABLE_TLS:="false"}"
+    : "${ETCD_SSL_BASE_PATH:=""}"
+    : "${WORKSPACE_CANDIDATE_NODES:=""}"
+    : "${WORKSPACE_ENABLED:="true"}"
+    : "${WORKSPACE_NODE_ID:=""}"
+    : "${WORKSPACE_NODE_IP:=""}"
+    : "${WORKSPACE_API_LISTEN:="0.0.0.0:18889"}"
+    : "${WORKSPACE_INTERNAL_PORT:="18889"}"
+    : "${WORKSPACE_INTERNAL_ALLOW:=""}"
+    : "${WORKSPACE_INTERNAL_TIMEOUT:="3"}"
+    : "${WORKSPACE_INTERNAL_RETRIES:="1"}"
+    : "${WORKSPACE_WATCHDOG_INTERVAL:="60"}"
+    : "${WORKSPACE_TRASH_RETENTION:="86400"}"
+    : "${WORKSPACE_CACHE_FILE:="/var/lib/agentos-workspace/owners.cache"}"
+    : "${WORKSPACE_USER:="agentos"}"
+    : "${WORKSPACE_DEFAULT_UID:=""}"
+    : "${WORKSPACE_DEFAULT_GID:=""}"
+    : "${WORKSPACE_SERVICE_ENABLED:="auto"}"
+    : "${WORKSPACE_LOG_FILE:="/var/log/agentos/workspace-storage/workspace-api.log"}"
+    : "${WORKSPACE_LOG_GROUP:="agentos"}"
+    : "${WORKSPACE_PYTHON:=""}"
     : "${AUTOFS_NEGATIVE_TIMEOUT:="1"}"
 
     # 负缓存（negative timeout）须保持极短: program map 查询失败（key 无 etcd 归属
-    # 记录）会被 automount 缓存为 ENOENT。新用户/迁移场景中归属记录写入后，若负缓存
-    # 未过期，首次访问仍会失败。autofs 默认值为 60s，故默认压到 1s。
+    # 记录）会被 automount 缓存为 ENOENT。新用户归属记录写入后，若负缓存未过期，
+    # 首次访问仍会失败。autofs 默认值为 60s，故默认压到 1s。
     # 校验必须先于任何破坏性操作完成（fail-fast），故放此处而非 master 条目拼接处
     case "${AUTOFS_NEGATIVE_TIMEOUT}" in
         ''|*[!0-9]*)
@@ -146,6 +223,51 @@ _ws_load_config() {
     esac
     [ "${AUTOFS_NEGATIVE_TIMEOUT}" -gt 0 ] \
         || error "Invalid AUTOFS_NEGATIVE_TIMEOUT value: ${AUTOFS_NEGATIVE_TIMEOUT} (expected: positive integer, in seconds)"
+
+    # agentos-workspace 服务参数
+    case "${WORKSPACE_TRASH_RETENTION}" in
+        ''|*[!0-9]*|0)
+            error "Invalid WORKSPACE_TRASH_RETENTION value: ${WORKSPACE_TRASH_RETENTION} (expected: positive integer, in seconds)"
+            ;;
+    esac
+    case "${WORKSPACE_WATCHDOG_INTERVAL}" in
+        ''|*[!0-9]*|0)
+            error "Invalid WORKSPACE_WATCHDOG_INTERVAL value: ${WORKSPACE_WATCHDOG_INTERVAL} (expected: positive integer, in seconds)"
+            ;;
+    esac
+    case "${WORKSPACE_INTERNAL_TIMEOUT}" in
+        ''|*[!0-9]*|0)
+            error "Invalid WORKSPACE_INTERNAL_TIMEOUT value: ${WORKSPACE_INTERNAL_TIMEOUT} (expected: positive integer, in seconds)"
+            ;;
+    esac
+    case "${WORKSPACE_INTERNAL_RETRIES}" in
+        ''|*[!0-9]*|0)
+            error "Invalid WORKSPACE_INTERNAL_RETRIES value: ${WORKSPACE_INTERNAL_RETRIES} (expected: positive integer)"
+            ;;
+    esac
+    case "${WORKSPACE_ETCD_TIMEOUT}" in
+        ''|*[!0-9]*|0)
+            error "Invalid WORKSPACE_ETCD_TIMEOUT value: ${WORKSPACE_ETCD_TIMEOUT} (expected: positive integer, in seconds)"
+            ;;
+    esac
+    if [ -n "${WORKSPACE_DEFAULT_UID}" ]; then
+        case "${WORKSPACE_DEFAULT_UID}" in
+            *[!0-9]*)
+                error "Invalid WORKSPACE_DEFAULT_UID value: ${WORKSPACE_DEFAULT_UID} (expected: empty or non-negative integer)"
+                ;;
+        esac
+    fi
+    if [ -n "${WORKSPACE_DEFAULT_GID}" ]; then
+        case "${WORKSPACE_DEFAULT_GID}" in
+            *[!0-9]*)
+                error "Invalid WORKSPACE_DEFAULT_GID value: ${WORKSPACE_DEFAULT_GID} (expected: empty or non-negative integer)"
+                ;;
+        esac
+    fi
+    case "${WORKSPACE_ENABLED}" in
+        true|false) ;;
+        *) error "Invalid WORKSPACE_ENABLED value: ${WORKSPACE_ENABLED} (expected: true/false)" ;;
+    esac
 }
 
 # ===== systemd 三态检测函数 =====
@@ -374,6 +496,507 @@ _ws_stop_autofs() {
     fi
 }
 
+# ===== agentos-workspace 服务（api + watchdog + cache writer 同进程）=====
+_WS_SERVICE_NAME="agentos-workspace"
+_WS_SERVICE_UNIT="/etc/systemd/system/agentos-workspace.service"
+_WS_SERVICE_HOME="/opt/agentos/workspace-storage"
+_WS_SERVICE_ENV_DIR="/etc/agentos/workspace-storage"
+_WS_LOGROTATE_CONF="/etc/logrotate.d/agentos-workspace"
+_WS_SERVICE_ENV_FILE="${_WS_SERVICE_ENV_DIR}/service.env"
+# 无 systemd 时的进程模式（nohup）：PID 文件与 systemd 模式共用同一日志文件
+_WS_RUN_DIR="/var/run/agentos"
+_WS_PID_FILE="${_WS_RUN_DIR}/agentos-workspace.pid"
+
+_ws_service_enabled() {
+    case "${WORKSPACE_SERVICE_ENABLED}" in
+        yes|auto) return 0 ;;
+        no)       return 1 ;;
+        *) error "Invalid WORKSPACE_SERVICE_ENABLED value: ${WORKSPACE_SERVICE_ENABLED} (expected: auto/yes/no)" ;;
+    esac
+}
+
+# 可用于运行服务的解释器：workspace_service.py 仅依赖标准库
+_ws_python_bin() {
+    local candidate resolved
+    for candidate in "${WORKSPACE_PYTHON}" "python${PYTHON_VERSION:-3.11}" python3; do
+        [ -n "${candidate}" ] || continue
+        resolved=$(command -v "${candidate}" 2>/dev/null || true)
+        [ -n "${resolved}" ] || continue
+        if "${resolved}" -c "import sys" >/dev/null 2>&1; then
+            echo "${resolved}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 稳定 node_id：WORKSPACE_NODE_ID > ADX_NODE_ID > node-<本机IP去点>。
+# 与 ADX 同时存在且不一致时拒绝继续：node_id 必须稳定且与 ADX 一致。
+# 服务身份 IP：优先显式 WORKSPACE_NODE_IP；否则按候选集校正后的本机 IP。
+# 单机默认配置的候选集只有 127.0.0.1，而 get_local_ip 会返回网卡 IP；
+# 若直接用网卡 IP 作为服务身份，归属记录仍会按 HRW 写成 127.0.0.1，
+# 删除/代理时的"归属是否本机"自检永远不成立。此时统一采用回环身份。
+_ws_effective_node_ip() {
+    if [ -n "${WORKSPACE_NODE_IP:-}" ]; then
+        echo "${WORKSPACE_NODE_IP}"
+        return 0
+    fi
+    local ip candidate
+    ip=$(get_local_ip)
+    candidate=$(_ws_effective_candidate_nodes 2>/dev/null || true)
+    if [ -n "${candidate}" ]; then
+        case ",${candidate}," in
+            *",${ip},"*) ;;
+            *,127.0.0.1,*)
+                echo "workspace: local IP ${ip} not in candidate nodes [${candidate}]; using 127.0.0.1 as node identity (single-node default config)" >&2
+                ip="127.0.0.1"
+                ;;
+        esac
+    fi
+    echo "${ip}"
+}
+
+_ws_resolve_node_id() {
+    if [ -n "${WORKSPACE_NODE_ID}" ] && [ -n "${ADX_NODE_ID:-}" ] \
+        && [ "${WORKSPACE_NODE_ID}" != "${ADX_NODE_ID}" ]; then
+        error "WORKSPACE_NODE_ID (${WORKSPACE_NODE_ID}) != ADX_NODE_ID (${ADX_NODE_ID}); workspace ownership keys are grouped by node_id and would never converge"
+    fi
+    local ip
+    ip=$(_ws_effective_node_ip)
+    _WS_NODE_IP="${ip}"
+    local node_id="${WORKSPACE_NODE_ID:-${ADX_NODE_ID:-}}"
+    if [ -z "${node_id}" ]; then
+        node_id="node-${ip//./-}"
+    fi
+    case "${node_id}" in
+        ''|.*|*..*|*[!A-Za-z0-9._:-]*)
+            error "Invalid workspace node_id: ${node_id} (allowed: letters, digits, '.', '_', ':', '-')"
+            ;;
+    esac
+    _WS_NODE_ID="${node_id}"
+}
+
+# autofs 挂载点必须与 agent 实际解析的 HOME 根一致，否则 agent 看到的是空目录
+_ws_validate_access_root() {
+    local expected="${AGENTOS_HOME_BASE:-}"
+    [ -n "${expected}" ] || return 0
+    if [ "${expected%/}" != "${WORKSPACE_ACCESS_ROOT%/}" ]; then
+        error "WORKSPACE_ACCESS_ROOT (${WORKSPACE_ACCESS_ROOT}) != AGENTOS_HOME_BASE (${AGENTOS_HOME_BASE}); agents resolve HOME under AGENTOS_HOME_BASE, autofs must mount the same path"
+    fi
+}
+
+# 服务侧 etcd 端点：显式 WORKSPACE_ETCD_ENDPOINTS / ETCD_ENDPOINT 优先，
+# 否则从 config.py etcd-nodes 推导；最终回落本机 etcd client 端口。
+_ws_effective_etcd_endpoints() {
+    local endpoints="" ep scheme="http" _ifs_old
+    if [ "X$(_ws_effective_etcd_tls)" = "Xtrue" ]; then
+        scheme="https"
+    fi
+    # 1) 显式 WORKSPACE_ETCD_ENDPOINTS（逗号分隔，可省略 scheme）
+    if [ -n "${WORKSPACE_ETCD_ENDPOINTS:-}" ]; then
+        _ifs_old="${IFS}"
+        IFS=','
+        for ep in ${WORKSPACE_ETCD_ENDPOINTS}; do
+            [ -n "${ep}" ] || continue
+            case "${ep}" in
+                http://*|https://*) ;;
+                *) ep="${scheme}://${ep}" ;;
+            esac
+            if [ -n "${endpoints}" ]; then
+                endpoints="${endpoints},${ep}"
+            else
+                endpoints="${ep}"
+            fi
+        done
+        IFS="${_ifs_old}"
+    fi
+    # 2) 回落 ETCD_ENDPOINT / config.py etcd-nodes
+    if [ -z "${endpoints}" ]; then
+        endpoints=$(_ws_etcd_endpoints 2>/dev/null || true)
+    fi
+    # 3) 最终回落本机 etcd client 端口
+    if [ -z "${endpoints}" ]; then
+        endpoints="${scheme}://127.0.0.1:${YR_ETCD_CLIENT_PORT:-32379}"
+    fi
+    echo "${endpoints}"
+}
+
+# HRW 候选集：显式 WORKSPACE_CANDIDATE_NODES 优先，否则 cluster-nodes；逗号分隔输出。
+_ws_effective_candidate_nodes() {
+    local raw
+    if [ -n "${WORKSPACE_CANDIDATE_NODES}" ]; then
+        raw="${WORKSPACE_CANDIDATE_NODES}"
+    else
+        raw=$(_ws_get_cluster_nodes 2>/dev/null || true)
+    fi
+    [ -n "${raw}" ] || return 1
+    printf '%s\n' "${raw}" | tr ',[:space:]' '\n' | awk 'NF { if (n++) printf ","; printf "%s", $1 } END { print "" }'
+}
+
+# etcd TLS 生效开关与证书路径（兼容旧 ENABLE_TLS/ETCD_SSL_BASE_PATH）
+_ws_effective_etcd_tls() {
+    if [ "X${WORKSPACE_ETCD_TLS}" = "Xtrue" ] || [ "X${ENABLE_TLS}" = "Xtrue" ]; then
+        echo "true"
+    else
+        echo "false"
+    fi
+}
+
+_ws_effective_etcd_tls_file() {
+    local kind="$1" configured
+    case "${kind}" in
+        ca)   configured="${WORKSPACE_ETCD_TLS_CA}" ;;
+        cert) configured="${WORKSPACE_ETCD_TLS_CERT}" ;;
+        key)  configured="${WORKSPACE_ETCD_TLS_KEY}" ;;
+    esac
+    if [ -n "${configured}" ]; then
+        echo "${configured}"
+        return 0
+    fi
+    if [ "X$(_ws_effective_etcd_tls)" = "Xtrue" ] && [ -n "${ETCD_SSL_BASE_PATH}" ]; then
+        case "${kind}" in
+            ca)   echo "${ETCD_SSL_BASE_PATH}/ca.crt" ;;
+            cert) echo "${ETCD_SSL_BASE_PATH}/client.crt" ;;
+            key)  echo "${ETCD_SSL_BASE_PATH}/client.key" ;;
+        esac
+    fi
+}
+
+# 固化的 etcdctl 路径与 LD_LIBRARY_PATH（autofs 运行环境无 PATH/环境变量）
+_ws_effective_etcdctl_path() {
+    _ws_find_etcdctl 2>/dev/null || true
+}
+
+_ws_effective_etcd_ld_path() {
+    local etcdctl="$1"
+    case "${etcdctl}" in
+        */third_party/etcd/etcdctl)
+            echo "$(dirname "${etcdctl}")/lib:${LD_LIBRARY_PATH:-}"
+            ;;
+        *)
+            echo "${ETCD_LD_PATH:-}"
+            ;;
+    esac
+}
+
+_ws_write_service_env() {
+    install -d -m 755 "${_WS_SERVICE_ENV_DIR}"
+    local etcd_endpoints candidate_nodes etcdctl ld_path
+    etcd_endpoints=$(_ws_effective_etcd_endpoints)
+    candidate_nodes=$(_ws_effective_candidate_nodes || true)
+    etcdctl=$(_ws_effective_etcdctl_path)
+    ld_path=$(_ws_effective_etcd_ld_path "${etcdctl}")
+    (
+        umask 077
+        cat > "${_WS_SERVICE_ENV_FILE}" <<EOF
+# Generated by agentos workspace-storage deploy.sh at install time — do not edit manually
+WORKSPACE_ETCD_ENDPOINTS="${etcd_endpoints}"
+WORKSPACE_ETCD_TLS="$(_ws_effective_etcd_tls)"
+WORKSPACE_ETCD_TLS_CA="$(_ws_effective_etcd_tls_file ca)"
+WORKSPACE_ETCD_TLS_CERT="$(_ws_effective_etcd_tls_file cert)"
+WORKSPACE_ETCD_TLS_KEY="$(_ws_effective_etcd_tls_file key)"
+WORKSPACE_ETCD_PREFIX="${WORKSPACE_ETCD_PREFIX}"
+WORKSPACE_ETCD_TIMEOUT="${WORKSPACE_ETCD_TIMEOUT}"
+ETCDCTL_PATH="${etcdctl}"
+ETCD_LD_PATH="${ld_path}"
+WORKSPACE_CANDIDATE_NODES="${candidate_nodes}"
+WORKSPACE_ENABLED="${WORKSPACE_ENABLED}"
+WORKSPACE_NODE_ID="${_WS_NODE_ID}"
+WORKSPACE_NODE_IP="${_WS_NODE_IP:-}"
+WORKSPACE_API_LISTEN="${WORKSPACE_API_LISTEN}"
+WORKSPACE_INTERNAL_PORT="${WORKSPACE_INTERNAL_PORT}"
+WORKSPACE_INTERNAL_ALLOW="${WORKSPACE_INTERNAL_ALLOW}"
+WORKSPACE_INTERNAL_TIMEOUT="${WORKSPACE_INTERNAL_TIMEOUT}"
+WORKSPACE_INTERNAL_RETRIES="${WORKSPACE_INTERNAL_RETRIES}"
+WORKSPACE_ACCESS_ROOT="${WORKSPACE_ACCESS_ROOT}"
+WORKSPACE_STORAGE_ROOT="${WORKSPACE_STORAGE_ROOT}"
+WORKSPACE_CACHE_FILE="${WORKSPACE_CACHE_FILE}"
+WORKSPACE_TRASH_RETENTION="${WORKSPACE_TRASH_RETENTION}"
+WORKSPACE_WATCHDOG_INTERVAL="${WORKSPACE_WATCHDOG_INTERVAL}"
+WORKSPACE_USER="${WORKSPACE_USER:-agentos}"
+WORKSPACE_APPLICATION_CONFIG="${_WS_SERVICE_ENV_DIR}/application.json"
+${WORKSPACE_DEFAULT_UID:+WORKSPACE_DEFAULT_UID="${WORKSPACE_DEFAULT_UID}"}
+${WORKSPACE_DEFAULT_GID:+WORKSPACE_DEFAULT_GID="${WORKSPACE_DEFAULT_GID}"}
+BIND_IP="${BIND_IP:-}"
+EOF
+    )
+    chmod 600 "${_WS_SERVICE_ENV_FILE}"
+}
+
+# 日志目录与文件：unit 用 StandardOutput/StandardError append 到这里。
+# 属组默认 agentos（运维/平台侧可读），该组不存在时回落 root。
+_ws_ensure_log_file() {
+    local file="${WORKSPACE_LOG_FILE}"
+    local dir group="${WORKSPACE_LOG_GROUP:-agentos}"
+    dir="$(dirname "${file}")"
+    if ! getent group "${group}" >/dev/null 2>&1; then
+        group="root"
+    fi
+    install -d -m 750 "${dir}"
+    [ -e "${file}" ] || install -m 640 /dev/null "${file}"
+    # 已存在的文件只校正属主/权限，不截断内容（install 幂等）
+    chown "root:${group}" "${dir}" "${file}" 2>/dev/null || true
+    chmod 750 "${dir}" 2>/dev/null || true
+    chmod 640 "${file}" 2>/dev/null || true
+}
+
+# logrotate：copytruncate 原地截断，服务持有 append fd 也能继续写，无需重启。
+_ws_write_logrotate() {
+    local target="${1:-${_WS_LOGROTATE_CONF}}"
+    local dir
+    dir="$(dirname "${target}")"
+    if [ ! -d "${dir}" ]; then
+        warning "logrotate directory ${dir} not found; skip logrotate config (${WORKSPACE_LOG_FILE} will grow unbounded)"
+        return 0
+    fi
+    cat > "${target}" <<EOF
+# Generated by agentos workspace-storage deploy.sh — do not edit manually
+${WORKSPACE_LOG_FILE} {
+    daily
+    maxsize 100M
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF
+    chmod 644 "${target}"
+}
+
+_ws_write_service_unit() {
+    local python_bin="$1"
+    cat > "${_WS_SERVICE_UNIT}" <<EOF
+[Unit]
+Description=AgentOS Workspace Service (API + Watchdog)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# api + watchdog + cache writer 同进程
+EnvironmentFile=${_WS_SERVICE_ENV_FILE}
+# 落固定文件，便于留存与采集；logrotate 用 copytruncate，无需重启服务
+StandardOutput=append:${WORKSPACE_LOG_FILE}
+StandardError=append:${WORKSPACE_LOG_FILE}
+ExecStart=${python_bin} ${_WS_SERVICE_HOME}/workspace_service.py --listen ${WORKSPACE_API_LISTEN}
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "${_WS_SERVICE_UNIT}"
+}
+
+# 健康检查：GET /healthz（本机回环，不经过防火墙；etcd 不可用时返回 503）
+_ws_health_check() {
+    local port="${WORKSPACE_API_LISTEN##*:}"
+    local url="http://127.0.0.1:${port}/healthz"
+    local i rc
+    for i in $(seq 1 10); do
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsS --max-time 2 "${url}" >/dev/null 2>&1
+            rc=$?
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -T 2 -O /dev/null "${url}" >/dev/null 2>&1
+            rc=$?
+        else
+            # 没有 HTTP 客户端时不做判定，避免把“无法检查”误报为失败
+            return 0
+        fi
+        [ "${rc}" -eq 0 ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+_ws_install_service() {
+    if ! _ws_service_enabled; then
+        info "agentos-workspace service disabled (WORKSPACE_SERVICE_ENABLED=no), skipping"
+        return 0
+    fi
+
+    _ws_validate_access_root
+    _ws_resolve_node_id
+
+    # 1. 运行期依赖：python（workspace_service.py 仅使用标准库）
+    local python_bin
+    python_bin=$(_ws_python_bin) \
+        || error "No usable python interpreter found (tried WORKSPACE_PYTHON, python${PYTHON_VERSION:-3.11}, python3); workspace_service.py only requires the standard library"
+
+    # 2. 安装代码到稳定路径（不得指向安装包解压目录）
+    install -d -m 755 "${_WS_SERVICE_HOME}"
+    local module
+    for module in workspace_service.py workspace_api.py workspace_store.py workspace_etcd.py workspace_watchdog.py workspace_mount.py; do
+        if [ ! -f "${SCRIPT_DIR}/${module}" ]; then
+            error "workspace service module not found: ${SCRIPT_DIR}/${module} (deployment package incomplete?)"
+        fi
+        install -m 644 "${SCRIPT_DIR}/${module}" "${_WS_SERVICE_HOME}/${module}"
+    done
+
+    install -m 644 "${SCRIPT_DIR}/../jiuwenswarm/workspace_init.py" "${_WS_SERVICE_HOME}/application_workspace.py" \
+        || error "Application workspace initializer is missing from the deployment package"
+
+    # 3. 缓存目录
+    install -d -m 700 "$(dirname "${WORKSPACE_CACHE_FILE}")"
+
+    # 4. 配置与 unit
+    _ws_write_service_env
+    if _ws_should_use_systemd; then
+        _ws_ensure_log_file
+        _ws_write_service_unit "${python_bin}"
+        _ws_write_logrotate
+        systemctl daemon-reload
+        systemctl enable "${_WS_SERVICE_NAME}" >/dev/null 2>&1 || true
+        success "agentos-workspace service installed (node_id=${_WS_NODE_ID}, listen=${WORKSPACE_API_LISTEN})"
+    else
+        # 与 agent-gateway / jiuwenbox 一致：无 systemd 时由 'up' 用 nohup 拉起
+        install -d -m 755 "${_WS_RUN_DIR}"
+        _ws_ensure_log_file
+        _ws_write_logrotate
+        info "systemd not available; ${_WS_SERVICE_NAME} will be started with nohup on 'up' (pid ${_WS_PID_FILE}, log ${WORKSPACE_LOG_FILE})"
+        success "agentos-workspace service prepared for nohup mode (node_id=${_WS_NODE_ID}, listen=${WORKSPACE_API_LISTEN})"
+    fi
+
+    # 端口/防火墙提示（脚本不自动改防火墙，避免覆盖现场策略）
+    info "Firewall/ports: workspace API tcp/${WORKSPACE_API_LISTEN##*:} (no auth, /internal/* must be cluster-internal); NFS needs rpcbind + tcp/2049"
+}
+
+# ===== 无 systemd：nohup 进程模式（与 agent-gateway / jiuwenbox 保持一致）=====
+_ws_service_pattern() {
+    echo "${_WS_SERVICE_HOME}/workspace_service.py --listen"
+}
+
+# 返回存活的服务 PID；PID 文件失效时回落到命令行匹配
+_ws_service_pid() {
+    local pid=""
+    [ -f "${_WS_PID_FILE}" ] && pid=$(cat "${_WS_PID_FILE}" 2>/dev/null || true)
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+        echo "${pid}"
+        return 0
+    fi
+    pid=$(pgrep -f "$(_ws_service_pattern)" 2>/dev/null | head -n1 || true)
+    if [ -n "${pid}" ]; then
+        echo "${pid}"
+        return 0
+    fi
+    return 1
+}
+
+_ws_start_service_nohup() {
+    local python_bin pid i
+    python_bin=$(_ws_python_bin) \
+        || error "No usable python interpreter found (tried WORKSPACE_PYTHON, python${PYTHON_VERSION:-3.11}, python3)."
+    [ -f "${_WS_SERVICE_ENV_FILE}" ] \
+        || error "${_WS_SERVICE_ENV_FILE} not found; run './deploy.sh install' first"
+
+    if pid=$(_ws_service_pid); then
+        info "${_WS_SERVICE_NAME} already running (pid ${pid})"
+        return 0
+    fi
+
+    install -d -m 755 "${_WS_RUN_DIR}"
+    _ws_ensure_log_file
+    info "Starting ${_WS_SERVICE_NAME} with nohup (systemd not available)..."
+    (
+        set -a
+        # shellcheck source=/dev/null
+        . "${_WS_SERVICE_ENV_FILE}"
+        set +a
+        nohup "${python_bin}" "${_WS_SERVICE_HOME}/workspace_service.py" \
+            --listen "${WORKSPACE_API_LISTEN}" >>"${WORKSPACE_LOG_FILE}" 2>&1 &
+        echo $! >"${_WS_PID_FILE}"
+    )
+
+    # 等待进程完成启动并校验 PID，避免把“拉起失败”误报为成功
+    for i in $(seq 1 5); do
+        if pid=$(_ws_service_pid); then
+            success "${_WS_SERVICE_NAME} started (pid ${pid}, log ${WORKSPACE_LOG_FILE})"
+            return 0
+        fi
+        sleep 1
+    done
+    rm -f "${_WS_PID_FILE}"
+    warning "${_WS_SERVICE_NAME} failed to start; see ${WORKSPACE_LOG_FILE}"
+    return 1
+}
+
+_ws_stop_service_nohup() {
+    local pid i
+    if pid=$(_ws_service_pid); then
+        kill "${pid}" 2>/dev/null || true
+        for i in $(seq 1 10); do
+            kill -0 "${pid}" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "${pid}" 2>/dev/null; then
+            warning "${_WS_SERVICE_NAME} did not exit on SIGTERM, sending SIGKILL"
+            kill -9 "${pid}" 2>/dev/null || true
+        fi
+        success "${_WS_SERVICE_NAME} stopped (pid ${pid})"
+    else
+        warning "${_WS_SERVICE_NAME} not running"
+    fi
+    rm -f "${_WS_PID_FILE}"
+}
+
+# 服务当前是否在跑（systemd 与非 systemd 统一判定）
+_ws_service_running() {
+    if _ws_should_use_systemd; then
+        systemctl is-active --quiet "${_WS_SERVICE_NAME}"
+        return
+    fi
+    _ws_service_pid >/dev/null 2>&1
+}
+
+_ws_start_service() {
+    _ws_service_enabled || return 0
+    if _ws_should_use_systemd; then
+        if [ ! -f "${_WS_SERVICE_UNIT}" ]; then
+            error "${_WS_SERVICE_NAME} unit not found (${_WS_SERVICE_UNIT}); run './deploy.sh install' first"
+        fi
+        systemctl start "${_WS_SERVICE_NAME}" 2>/dev/null || true
+        systemctl is-active "${_WS_SERVICE_NAME}" >/dev/null 2>&1
+        return
+    fi
+    _ws_start_service_nohup
+}
+
+_ws_stop_service() {
+    _ws_service_enabled || return 0
+    if _ws_should_use_systemd; then
+        systemctl stop "${_WS_SERVICE_NAME}" 2>/dev/null || true
+        return
+    fi
+    _ws_stop_service_nohup
+}
+
+_ws_remove_service() {
+    _ws_service_enabled || return 0
+    if _ws_should_use_systemd; then
+        systemctl stop "${_WS_SERVICE_NAME}" 2>/dev/null || true
+        systemctl disable "${_WS_SERVICE_NAME}" >/dev/null 2>&1 || true
+        rm -f "${_WS_SERVICE_UNIT}"
+        systemctl daemon-reload 2>/dev/null || true
+    else
+        _ws_stop_service_nohup
+        rm -f "${_WS_PID_FILE}"
+    fi
+    rm -rf "${_WS_SERVICE_HOME}" 2>/dev/null || true
+    rm -f "${_WS_SERVICE_ENV_FILE}" "${_WS_SERVICE_ENV_DIR}/application.json" "${WORKSPACE_CACHE_FILE}" /etc/agentos/workspace-token 2>/dev/null || true
+    # 保留历史日志文件便于事后排查，只移除轮转配置
+    rm -f "${_WS_LOGROTATE_CONF}" 2>/dev/null || true
+    rmdir "${_WS_SERVICE_ENV_DIR}" 2>/dev/null || true
+}
+
 # ===== 配置文件路径 =====
 _WS_EXPORTS_FILE="/etc/exports.d/workspace-storage.exports"
 _WS_AUTOFS_MASTER="/etc/auto.master"
@@ -388,6 +1011,37 @@ _WS_AUTOFS_HOME="/etc/agentos/workspace-storage"
 # AUTOFS_NEGATIVE_TIMEOUT 的合法性已在 _ws_load_config() 中校验
 _ws_autofs_master_entry() {
     echo "${WORKSPACE_ACCESS_ROOT} /etc/auto.workspace-storage --timeout=300 --negative-timeout=${AUTOFS_NEGATIVE_TIMEOUT}"
+}
+
+# autofs program map 的独立配置（automount 无环境变量，只能读文件）
+_ws_write_autofs_conf() {
+    local etcd_endpoints etcdctl ld_path
+    etcd_endpoints=$(_ws_effective_etcd_endpoints)
+    etcdctl=$(_ws_effective_etcdctl_path)
+    ld_path=$(_ws_effective_etcd_ld_path "${etcdctl}")
+    # Owner access remains a local bind; remote nodes use NFS. The AgentServer
+    # workspace explicitly requests runsc file-handle semantics, normalized by
+    # ADXlet on the destination node without forcing owner I/O through NFS.
+    cat > "${_WS_AUTOFS_HOME}/workspace_storage.conf" <<EOF
+# Generated by agentos workspace-storage deploy.sh — do not edit manually
+# Consumed by autofs_program_map.sh, which runs under automount with no env/relative paths
+WORKSPACE_STORAGE_ROOT="${WORKSPACE_STORAGE_ROOT}"
+WORKSPACE_ACCESS_ROOT="${WORKSPACE_ACCESS_ROOT}"
+NFS_VERSION="${NFS_VERSION}"
+LOCAL_OWNER_MOUNT_MODE="bind"
+BIND_IP="${BIND_IP:-}"
+WORKSPACE_ETCD_ENDPOINTS="${etcd_endpoints}"
+WORKSPACE_ETCD_TLS="$(_ws_effective_etcd_tls)"
+WORKSPACE_ETCD_TLS_CA="$(_ws_effective_etcd_tls_file ca)"
+WORKSPACE_ETCD_TLS_CERT="$(_ws_effective_etcd_tls_file cert)"
+WORKSPACE_ETCD_TLS_KEY="$(_ws_effective_etcd_tls_file key)"
+WORKSPACE_ETCD_PREFIX="${WORKSPACE_ETCD_PREFIX}"
+WORKSPACE_ETCD_TIMEOUT="${WORKSPACE_ETCD_TIMEOUT}"
+ETCDCTL_PATH="${etcdctl}"
+ETCD_LD_PATH="${ld_path}"
+WORKSPACE_CACHE_FILE="${WORKSPACE_CACHE_FILE}"
+EOF
+    chmod 644 "${_WS_AUTOFS_HOME}/workspace_storage.conf"
 }
 
 # ===== install 逻辑 =====
@@ -475,53 +1129,9 @@ EOF
         || error "Failed to install autofs program map to ${_WS_AUTOFS_HOME}"
 
     # program map 由 automount 调用，既无环境变量、也无安装包相对路径上下文，
-    # 故 install 期把 etcd 访问参数解析并固化到同目录的独立 conf
-    local resolved_endpoint resolved_etcdctl resolved_ld
-    resolved_endpoint=$(_ws_etcd_endpoints 2>/dev/null || true)
-    if [ -z "${resolved_endpoint}" ]; then
-        warning "Failed to resolve etcd endpoints from config.yaml; autofs program map will fall back to 127.0.0.1:32379"
-    fi
-    # etcd 安装钩子导出的配套路径在此固化，支持自定义安装根目录。
-    # 单独安装 workspace-storage 时，回退读取 install 持久化的根目录。
-    resolved_ld="${ETCD_LD_PATH:-}"
-    resolved_etcdctl="${ETCDCTL_PATH:-}"
-    if [ -z "${resolved_etcdctl}" ] || [ ! -x "${resolved_etcdctl}" ]; then
-        local _etcd_root="" _etcd_root_file
-        for _etcd_root_file in /etc/agentos/etcd-root "${HOME:-/root}/.agentos/etcd-root"; do
-            if [ -r "${_etcd_root_file}" ]; then
-                _etcd_root="$(cat "${_etcd_root_file}")"
-                if [ -n "${_etcd_root}" ]; then
-                    break
-                fi
-            fi
-        done
-        _etcd_root="${AGENTOS_ETCD_ROOT:-${_etcd_root:-/opt/agentos/etcd}}"
-        if [ -x "${_etcd_root}/current/bin/etcdctl" ]; then
-            resolved_etcdctl="${_etcd_root}/current/bin/etcdctl"
-        fi
-    fi
-    if [ -z "${resolved_ld}" ]; then
-        case "${resolved_etcdctl}" in
-            */third_party/etcd/etcdctl)
-                resolved_ld="$(dirname "${resolved_etcdctl}")/lib"
-                ;;
-        esac
-    fi
-
-    cat > "${_WS_AUTOFS_HOME}/workspace_storage.conf" <<EOF
-# Generated by agentos workspace-storage deploy.sh at install time — do not edit manually
-# Consumed by autofs_program_map.sh, which runs under automount with no env/relative paths
-WORKSPACE_STORAGE_ROOT="${WORKSPACE_STORAGE_ROOT}"
-WORKSPACE_ETCD_PREFIX="${WORKSPACE_ETCD_PREFIX}"
-NFS_VERSION="${NFS_VERSION}"
-BIND_IP="${BIND_IP:-}"
-ETCD_ENDPOINT="${resolved_endpoint}"
-ETCDCTL_PATH="${resolved_etcdctl}"
-ETCD_LD_PATH="${resolved_ld}"
-ENABLE_TLS="${ENABLE_TLS:-false}"
-ETCD_SSL_BASE_PATH="${ETCD_SSL_BASE_PATH:-}"
-EOF
-    chmod 644 "${_WS_AUTOFS_HOME}/workspace_storage.conf"
+    # 故把 etcd 访问参数固化到同目录的独立 conf。install 与 up 都会重写：
+    # 若 install 时 etcd 尚未就绪，端点会先落到回环地址，up 时再刷新为真实地址。
+    _ws_write_autofs_conf
 
     cat > "${_WS_AUTOFS_MAP}" <<EOF
 #!/bin/bash
@@ -547,6 +1157,10 @@ EOF
     fi
     success "autofs configured and started"
 
+    # 9. 安装并启用 agentos-workspace 服务（api + watchdog + cache writer 同进程）
+    info "Installing agentos-workspace service..."
+    _ws_install_service
+
     success "Workspace storage install completed! Use 'up' to start services."
 }
 
@@ -558,6 +1172,19 @@ deploy_ws_up() {
     fi
 
     info "Starting workspace storage services (NFS + autofs)"
+
+    # etcd 地址/证书随集群就绪可能变化，重新固化 autofs 配置（幂等）
+    if [ -d "${_WS_AUTOFS_HOME}" ]; then
+        _ws_write_autofs_conf
+        install -m 755 -o root -g root "${SCRIPT_DIR}/autofs_program_map.sh" "${_WS_AUTOFS_HOME}/autofs_program_map.sh" \
+            || error "Failed to refresh the autofs program map"
+    fi
+    # 服务环境同理：install 时 etcd 可能尚未就绪，up 时按当前地址重写
+    if _ws_service_enabled && [ -f "${_WS_SERVICE_ENV_FILE}" ]; then
+        _ws_validate_access_root
+        _ws_resolve_node_id
+        _ws_write_service_env
+    fi
 
     # 启动 NFS server
     info "Starting NFS server..."
@@ -577,6 +1204,19 @@ deploy_ws_up() {
     fi
     success "autofs started"
 
+    # 启动 agentos-workspace（api + watchdog + cache writer）
+    if _ws_service_enabled; then
+        info "Starting ${_WS_SERVICE_NAME}..."
+        if ! _ws_start_service; then
+            error "Failed to start ${_WS_SERVICE_NAME} (systemd: 'systemctl status ${_WS_SERVICE_NAME}'; nohup: see ${WORKSPACE_LOG_FILE})"
+        fi
+        if _ws_health_check; then
+            success "${_WS_SERVICE_NAME} started (healthz OK)"
+        else
+            warning "${_WS_SERVICE_NAME} is running but /healthz did not succeed yet (etcd unreachable?); check ${WORKSPACE_LOG_FILE}"
+        fi
+    fi
+
     success "Workspace storage services are up"
 }
 
@@ -589,7 +1229,11 @@ deploy_ws_down() {
 
     info "Stopping workspace storage services (NFS + autofs)"
 
-    # 先停 autofs（会自动卸载所有 autofs 管理的挂载点）
+    # 先停 agentos-workspace：watchdog 会在 autofs 卸载过程中继续巡检本机目录
+    info "Stopping ${_WS_SERVICE_NAME}..."
+    _ws_stop_service
+
+    # 再停 autofs（会自动卸载所有 autofs 管理的挂载点）
     info "Stopping autofs..."
     _ws_stop_autofs
 
@@ -626,6 +1270,10 @@ deploy_ws_uninstall() {
 
     info "Uninstalling workspace storage (NFS + autofs)"
 
+    # 0. 停止并移除 agentos-workspace 服务（不删除 workspace 数据）
+    info "Removing ${_WS_SERVICE_NAME} service..."
+    _ws_remove_service
+
     # 1. 停止 autofs 并移除配置
     info "Stopping autofs and removing config..."
     _ws_stop_autofs
@@ -659,6 +1307,8 @@ deploy_ws_uninstall() {
 
     # 4. 不删除数据目录（保留数据以便恢复）
     info "Preserving storage data at ${WORKSPACE_STORAGE_ROOT} for recovery"
+    # 5. 不删除 etcd 归属（/agent-runtime/workspace/<owner>）：重新 install/up 后可继续使用
+    info "Preserving etcd workspace ownership under ${WORKSPACE_ETCD_PREFIX} (delete manually only if the data is gone)"
 
     success "Workspace storage uninstall completed!"
 }
@@ -739,6 +1389,29 @@ deploy_ws_status() {
         fi
     fi
     echo "workspace-storage|autofs|${autofs_state}|${autofs_detail}|-"
+
+    # agentos-workspace 服务（api + watchdog + cache writer）
+    if ! _ws_service_enabled; then
+        echo "workspace-storage|${_WS_SERVICE_NAME}|disabled|WORKSPACE_SERVICE_ENABLED=no|-"
+    elif _ws_should_use_systemd; then
+        local svc_state="stopped" svc_detail="inactive"
+        if systemctl is-active "${_WS_SERVICE_NAME}" >/dev/null 2>&1; then
+            svc_state="running"
+            svc_detail="active"
+        elif systemctl is-failed "${_WS_SERVICE_NAME}" >/dev/null 2>&1; then
+            svc_state="failed"
+            svc_detail="failed"
+            rc=1
+        fi
+        echo "workspace-storage|${_WS_SERVICE_NAME}|${svc_state}|${svc_detail}|-"
+    else
+        local svc_state="stopped" svc_detail="inactive" pid
+        if pid=$(_ws_service_pid); then
+            svc_state="running"
+            svc_detail="active (pid ${pid})"
+        fi
+        echo "workspace-storage|${_WS_SERVICE_NAME}|${svc_state}|${svc_detail}|-"
+    fi
 
     # 挂载状态
     local mount_detail="not mounted"
@@ -835,7 +1508,7 @@ _ws_etcd_endpoints() {
     # 2) 从 config.py etcd-nodes 推导
     local config_py="${SCRIPT_DIR}/../scripts/config.py"
     local python_bin
-    python_bin=$(command -v "python${YR_PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || echo python3)
+    python_bin=$(command -v "python${PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || echo python3)
     if [ -f "${config_py}" ]; then
         local nodes
         if [ -n "${BIND_IP:-}" ]; then
@@ -875,7 +1548,7 @@ _ws_etcd_tls_params() {
     fi
 }
 
-# 封装 etcdctl get（endpoints 已含 scheme，TLS 时附加证书参数）
+# 读取单个 etcd key 的值（供 migrate 写归属前的存在性判断使用）
 _ws_etcd_get() {
     local key="$1"
     local etcdctl endpoints tls_params
@@ -889,7 +1562,7 @@ _ws_etcd_get() {
         get "${key}" --print-value-only 2>/dev/null
 }
 
-# 封装 etcdctl put（endpoints 已含 scheme，TLS 时附加证书参数）
+# 写入单个 etcd key（供 migrate 写归属使用）
 _ws_etcd_put() {
     local key="$1"
     local value="$2"
@@ -913,7 +1586,7 @@ _ws_hrw_select() {
     shift
     local node_ips=("$@")
     local python_bin
-    python_bin=$(command -v "python${YR_PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || echo python3)
+    python_bin=$(command -v "python${PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || echo python3)
 
     "${python_bin}" -c "
 import sys, struct
@@ -957,7 +1630,7 @@ _ws_get_cluster_nodes() {
     local config_py="${SCRIPT_DIR}/../scripts/config.py"
     local ws_config="${SCRIPT_DIR}/../config.yaml"
     local python_bin
-    python_bin=$(command -v "python${YR_PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || echo python3)
+    python_bin=$(command -v "python${PYTHON_VERSION:-3.11}" 2>/dev/null || command -v python3 2>/dev/null || echo python3)
     [ -f "${config_py}" ] || return 1
     [ -f "${ws_config}" ] || return 1
     local nodes
@@ -1002,7 +1675,9 @@ deploy_ws_migrate() {
     fi
 
     local self_ip
-    self_ip=$(get_local_ip)
+    # 与服务身份保持一致：候选集只含回环时（单机默认配置）统一采用 127.0.0.1，
+    # 否则会因"网卡 IP 不在 cluster_nodes"而中止，归属记录也可能与服务身份不一致
+    self_ip=$(_ws_effective_node_ip)
 
     # 1. 获取集群全部节点 IP（来自 config.yaml 的 cluster_nodes）
     info "Fetching cluster node list from config.yaml (cluster_nodes)..."
@@ -1180,7 +1855,8 @@ _ws_write_ownership() {
     # 重复调用结果不变；跳过可避免无谓写入与误报）
     local user owning_ip etcd_key existing_ip existing_rc=0 written=0 up_to_date=0 kept=0
     local self_ip
-    self_ip=$(get_local_ip)
+    # 与 deploy_ws_migrate 一致：写归属用的本机身份必须与服务身份相同
+    self_ip=$(_ws_effective_node_ip)
     # node_ips 为多行字符串（每行一个 IP）。read -r -a 对多行输入只读首行
     # 会截断列表，导致 existing 记录的 in-list 判定误判 → 错误覆盖本应
     # keep-existing 的记录；须逐行解析
@@ -1298,18 +1974,19 @@ print_help() {
     cat << EOF
 Usage: ./$(basename "$0") [COMMAND] [OPTIONS]
 
-部署 workspace 存储 (NFS + autofs)，替代 MooseFS 分布式文件系统。
+部署 workspace 存储 (NFS + autofs)：etcd 单键归属 + 每节点 agentos-workspace 服务。
 本脚本不依赖 deploy 目录下其他文件，可独立执行。
 
 Commands (Required):
-  install   安装 NFS server + autofs，创建配置（不启动服务，由 up 启动）
-  up        启动 NFS server 和 autofs 服务
-  down      停止 NFS server 和 autofs 服务
+  install   安装 NFS server + autofs + agentos-workspace 服务，创建配置（不启动服务，由 up 启动）
+  up        启动 NFS server、autofs 和 agentos-workspace 服务
+  down      停止 agentos-workspace、autofs 和 NFS server 服务
   restart   重启所有服务
   uninstall 停止服务 + 清理配置（不卸载软件包，可重新 install 还原）
   status    显示服务和挂载状态
-  migrate   数据迁移: 从 config.yaml 的 cluster_nodes 取节点 → HRW 归属 →
-            rsync 本节点归属用户 → 写 etcd 归属记录（须先于 down 执行，幂等可重跑）
+  migrate   数据迁移：从 config.yaml 的 cluster_nodes 取节点 → HRW 归属 →
+            rsync 本机归属用户到存储目录 → 写 etcd 归属记录
+            （须先于 down 执行；须在新安装包目录中执行；幂等可重跑）
 
 Options:
   --ip IP            指定本机使用的 IP 地址（多网卡环境必用）。
@@ -1319,16 +1996,41 @@ Environment Variables:
   WORKSPACE_STORAGE_ROOT       存储根目录（NFS 导出源，默认 /home/agentos/.users）
   WORKSPACE_ACCESS_ROOT        访问根目录（autofs 间接挂载点，默认 /home/agentos/users）
   NFS_VERSION                  NFS 版本（默认 4.1）
-  WORKSPACE_ETCD_PREFIX        etcd 键前缀（默认 /agent-runtime/workspace）
+  WORKSPACE_ETCD_PREFIX        workspace 归属键前缀（默认 /agent-runtime/workspace；
+                               每个 owner 一个键，值为归属节点 IP）
+  WORKSPACE_ETCD_ENDPOINTS     etcd 端点，逗号分隔，可省略 scheme；留空时按
+                               ETCD_ENDPOINT → config.yaml etcd-nodes → 127.0.0.1:32379 推导
+  WORKSPACE_ETCD_TLS           是否启用 etcd TLS（true/false，默认 false）
+  WORKSPACE_ETCD_TLS_CA/CERT/KEY etcd TLS 证书路径（留空时回落 ETCD_SSL_BASE_PATH）
+  WORKSPACE_ETCD_TIMEOUT       etcd 查询超时，秒，正整数（默认 2）
   WORKSPACE_STORAGE_ENABLED    是否启用（auto/yes/no，默认 auto）
   WORKSPACE_STORAGE_USE_SYSTEMD 是否使用 systemd（auto/yes/no，默认 auto）
   AUTOFS_NEGATIVE_TIMEOUT      autofs 负缓存时长，单位秒，正整数（默认 1；
                                修改后需重新 install 使 master map 生效）
   ETCDCTL_PATH                 etcdctl 路径（由调用环境设置）
   ETCD_LD_PATH                 etcd 库路径（由调用环境设置）
-  ENABLE_TLS                   是否启用 TLS（true/false）
-  ETCD_SSL_BASE_PATH           TLS 证书路径
-  ETCD_ENDPOINT                etcd 端点地址
+  ENABLE_TLS                   兼容旧配置：是否启用 TLS（true/false）
+  ETCD_SSL_BASE_PATH           兼容旧配置：TLS 证书路径
+  ETCD_ENDPOINT                兼容旧配置：etcd 端点地址
+  WORKSPACE_CANDIDATE_NODES    HRW 归属候选节点，逗号分隔；留空取 config.yaml cluster_nodes
+  WORKSPACE_CACHE_FILE         autofs 回落缓存路径（TSV: owner<TAB>node_ip）
+  WORKSPACE_SERVICE_ENABLED    是否部署 agentos-workspace 服务（auto/yes/no，默认 auto）
+  WORKSPACE_ENABLED            服务内部功能开关（true/false，默认 true）
+  WORKSPACE_NODE_ID            稳定节点 ID；留空取 ADX_NODE_ID，再回落 node-<本机IP>
+  WORKSPACE_API_LISTEN         API 监听地址（默认 0.0.0.0:18889）
+  WORKSPACE_INTERNAL_PORT      节点间内部调用端口（默认 18889）
+  WORKSPACE_INTERNAL_ALLOW     /internal/* 允许的来源网段，逗号分隔 CIDR
+                               （留空取内置默认：回环 + RFC1918 + 链路本地 + IPv6 ULA）
+  WORKSPACE_INTERNAL_TIMEOUT   节点间内部调用超时，秒，正整数（默认 3）
+  WORKSPACE_INTERNAL_RETRIES   节点间内部调用重试次数，正整数（默认 1）
+  WORKSPACE_LOG_FILE           服务日志文件（默认 /var/log/agentos/workspace-storage/workspace-api.log）
+  WORKSPACE_LOG_GROUP          日志可读组（默认 agentos；文件 0640、目录 0750）
+  WORKSPACE_WATCHDOG_INTERVAL  watchdog 巡检周期，秒，正整数（默认 60）
+  WORKSPACE_TRASH_RETENTION    删除后 .trash 保留秒数，正整数（默认 86400）
+  WORKSPACE_USER               目录属主名（默认 agentos）
+  WORKSPACE_DEFAULT_UID/GID    新建目录的固定 uid/gid（留空则由 WORKSPACE_USER 解析）
+  WORKSPACE_PYTHON             运行服务的 Python 解释器（留空自动探测，仅需标准库）
+  AGENTOS_HOME_BASE            agent HOME 根；设置时须与 WORKSPACE_ACCESS_ROOT 一致
 
 Configuration File:
   ${SCRIPT_DIR}/workspace_storage.conf  配置文件，可通过环境变量覆盖
@@ -1346,6 +2048,10 @@ Examples:
 
   # 查看状态
   ./$(basename "$0") status
+
+  # 数据迁移（升级工作流第 1 步：须在新安装包目录中执行，且先于 down）
+  ./$(basename "$0") migrate
+  ./$(basename "$0") --ip 192.168.1.1 migrate
 
   # 关闭 workspace 存储
   WORKSPACE_STORAGE_ENABLED=no ./$(basename "$0") up

@@ -3,7 +3,7 @@
 set -e
 
 # AgentOS b050 交付产物打包脚本。详细说明（产物清单/archive 结构/路径规则/重构要点/依赖）见 README-v2.zh.md。
-# daily/release 共用 OBS archive.tar.gz 获取 jiuwenswarm/openyuanrong/agent-protocol/conch，client 包不区分架构（含全平台 jiuwenswarm_tui），server 包按 ${ARCH} 打。
+# daily/release 共用 OBS archive.tar.gz 获取 jiuwenswarm/agent-dx/agent-protocol/conch，client 包不区分架构（含全平台 jiuwenswarm_tui），server 包按 ${ARCH} 打。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -20,16 +20,22 @@ ARCH="${ARCH:-$(uname -m)}"
 
 JIUWENSWARM_BASE=""             # jiuwenswarm archive 下载基址（configure_* 设置）
 JIUWENSWARM_ARCHIVE_ROOT=""     # jiuwenswarm archive.tar.gz 解压根目录（pack 取 wheel）
-JIUWENSWARM_DEPLOY_DIR=""       # jiuwenswarm archive 内 deploy.tar.gz 解压出的 deploy 目录（pack 取 deploy/yuanrong）
+JIUWENSWARM_DEPLOY_DIR=""       # selected application deployment scripts from the Swarm archive
 
-OPENYUANRONG_BASE=""            # openyuanrong archive 下载基址（configure_* 设置）
-OPENYUANRONG_ARCHIVE_ROOT=""    # openyuanrong archive.tar.gz 解压根目录（pack 取 wheel）
+SELECTED_CORE_WHEEL=""
+A4P_WHEELHOUSE=""
+
+AGENT_DX_BASE=""                # agent-dx archive 下载基址（configure_* 设置）
+AGENT_DX_ARCHIVE_ROOT=""        # agent-dx archive.tar.gz 解压根目录（pack 取 ${ARCH}/adx-release.tar.gz）
 
 AGENT_GATEWAY_BASE=""           # agent-protocol archive 下载基址（configure_* 设置）
 AGENT_GATEWAY_ARCHIVE_ROOT=""    # agent-protocol archive.tar.gz 解压根目录（pack 取 wheel）
 
 CONCH_BASE=""                   # conch archive 下载基址（configure_* 设置）
 CONCH_ARCHIVE_ROOT=""           # conch archive.tar.gz 解压根目录（pack 取 rpm，沙箱模块）
+
+ETCD_ARCHIVE_ROOT=""            # 固定版本 etcd 下载目录（含目标架构压缩包及来源信息）
+ETCD_ARCHIVE=""
 
 CREDENTIAL_ROUTER_BASE=""       # credential_router archive 下载基址（configure_* 设置）
 CREDENTIAL_ROUTER_ARCHIVE_ROOT=""  # credential_router archive.tar.gz 解压根目录（pack 取 credential-router*.tar.gz，平台相关）
@@ -45,6 +51,11 @@ Options:
   --build-type=TYPE      daily or release (必填)
   --build-target=TARGET  交付产品线分支 (必填)
   -h, --help             Show this help
+
+Environment:
+  A4P_BUILD_PYTHON       Python 3.11+ executable for A4P packaging (default: python3.11)
+  AGENT_CORE_FROM_OBS    Download and bundle Core: 1 (default) or 0 (use preinstalled Core)
+  AGENT_CORE_BASE_URL    Core wheel download directory (default: AgentOS OBS dependencies/agent-core/dist)
 
 Examples:
   $(basename "$0") --build-type=daily --build-target=agentos_b050
@@ -95,7 +106,7 @@ parse_args() {
 
 configure_daily() {
   JIUWENSWARM_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/jiuwenswarm/package/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
-  OPENYUANRONG_BASE="https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
+  AGENT_DX_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-dx/artifacts/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
   AGENT_GATEWAY_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-protocol/package/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
   CONCH_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/conch/package/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
   CREDENTIAL_ROUTER_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/credential_router/package/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
@@ -104,7 +115,7 @@ configure_daily() {
 
 configure_release() {
   JIUWENSWARM_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/jiuwenswarm/package/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
-  OPENYUANRONG_BASE="https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
+  AGENT_DX_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-dx/artifacts/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
   AGENT_GATEWAY_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-protocol/package/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
   CONCH_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/conch/package/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
   CREDENTIAL_ROUTER_BASE="https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/credential_router/package/${BUILD_TYPE}/${BUILD_TARGET}/last_successful_build"
@@ -197,19 +208,28 @@ build_jiuwenswarm() {
   if [[ -d "${tmp_dir}/archive" ]]; then
     JIUWENSWARM_ARCHIVE_ROOT="${tmp_dir}/archive"
   fi
-
-  # 解压 deploy.tar.gz 获取 deploy 目录
   if [[ ! -f "${JIUWENSWARM_ARCHIVE_ROOT}/deploy.tar.gz" ]]; then
-    echo "error: deploy.tar.gz not found in ${JIUWENSWARM_ARCHIVE_ROOT}" >&2
+    echo "error: Swarm archive is missing deploy.tar.gz" >&2
     return 1
   fi
-  mkdir -p "${tmp_dir}/deploy_src"
-  tar --atime-preserve -xzf "${JIUWENSWARM_ARCHIVE_ROOT}/deploy.tar.gz" -C "${tmp_dir}/deploy_src"
-  JIUWENSWARM_DEPLOY_DIR="${tmp_dir}/deploy_src/deploy"
-  if [[ ! -d "${JIUWENSWARM_DEPLOY_DIR}" ]]; then
-    echo "error: deploy directory not found after extracting deploy.tar.gz" >&2
-    return 1
+  JIUWENSWARM_DEPLOY_DIR="${tmp_dir}/swarm-deploy"
+  mkdir -p "${JIUWENSWARM_DEPLOY_DIR}"
+  tar --atime-preserve -xzf "${JIUWENSWARM_ARCHIVE_ROOT}/deploy.tar.gz" -C "${JIUWENSWARM_DEPLOY_DIR}"
+  # Prefer the renamed entrypoint while accepting previously released layouts.
+  if [[ -f "${JIUWENSWARM_DEPLOY_DIR}/deploy/adx/gateway_handler.sh" ]] \
+      && { grep -q -- 'agentos_handler.sh' "${JIUWENSWARM_DEPLOY_DIR}/deploy/adx/deploy.sh" \
+          || grep -q -- '--require-adx-router' "${JIUWENSWARM_DEPLOY_DIR}/deploy/adx/gateway_handler.sh"; }; then
+    JIUWENSWARM_DEPLOY_DIR="${JIUWENSWARM_DEPLOY_DIR}/deploy/adx"
+  else
+    JIUWENSWARM_DEPLOY_DIR="${JIUWENSWARM_DEPLOY_DIR}/deploy/yuanrong"
   fi
+  [[ -f "${JIUWENSWARM_DEPLOY_DIR}/deploy.sh" && -f "${JIUWENSWARM_DEPLOY_DIR}/gateway_handler.sh" && -f "${JIUWENSWARM_DEPLOY_DIR}/web_handler.sh" ]] \
+    && { grep -q -- 'agentos_handler.sh' "${JIUWENSWARM_DEPLOY_DIR}/deploy.sh" \
+        || grep -q -- '--require-adx-router' "${JIUWENSWARM_DEPLOY_DIR}/gateway_handler.sh"; } || {
+    echo "error: Swarm deploy artifact does not provide ADX-capable deploy/yuanrong or deploy/adx" >&2
+    return 1
+  }
+
 }
 
 build_etcd() {
@@ -239,14 +259,15 @@ PY
   python3 "${DEPLOY_DIR}/etcd/install.py" --verify-only --arch "${ARCH}" --archive "${ETCD_ARCHIVE}"
 }
 
-build_openyuanrong() {
-  echo "==> build_openyuanrong (${BUILD_TYPE})"
+build_agent_dx() {
+  echo "==> build_agent_dx (${BUILD_TYPE})"
 
   # 下载 archive.tar.gz 到带时间戳的临时目录解压（与 build_jiuwenswarm 同模式）
+  # agent-dx 产物为整包 tar.gz：archive/<arch>/adx-release.tar.gz（平台相关，按 ${ARCH} 取）+ archive/agent-dx_buildinfo
   local timestamp tmp_dir archive_url
   timestamp="$(date +%Y%m%d%H%M%S)"
-  tmp_dir="${BUILD_DIR}/tmp_openyuanrong_${timestamp}"
-  archive_url="${OPENYUANRONG_BASE}/archive.tar.gz"
+  tmp_dir="${BUILD_DIR}/tmp_agent_dx_${timestamp}"
+  archive_url="${AGENT_DX_BASE}/archive.tar.gz"
 
   mkdir -p "${tmp_dir}"
   download_file "${archive_url}" "${tmp_dir}/archive.tar.gz"
@@ -255,14 +276,18 @@ build_openyuanrong() {
   rm -f "${tmp_dir}/archive.tar.gz"
 
   # archive.tar.gz 含 archive/ 顶层目录
-  OPENYUANRONG_ARCHIVE_ROOT="${tmp_dir}"
+  AGENT_DX_ARCHIVE_ROOT="${tmp_dir}"
   if [[ -d "${tmp_dir}/archive" ]]; then
-    OPENYUANRONG_ARCHIVE_ROOT="${tmp_dir}/archive"
+    AGENT_DX_ARCHIVE_ROOT="${tmp_dir}/archive"
   fi
 
-  # 校验平台目录存在
-  if [[ ! -d "${OPENYUANRONG_ARCHIVE_ROOT}/${ARCH}" ]]; then
-    echo "error: ${ARCH} directory not found in ${OPENYUANRONG_ARCHIVE_ROOT}" >&2
+  # 校验平台目录存在（按 ${ARCH} 取平台相关 adx-release.tar.gz）
+  if [[ ! -d "${AGENT_DX_ARCHIVE_ROOT}/${ARCH}" ]]; then
+    echo "error: ${ARCH} directory not found in ${AGENT_DX_ARCHIVE_ROOT}" >&2
+    return 1
+  fi
+  if [[ ! -f "${AGENT_DX_ARCHIVE_ROOT}/${ARCH}/adx-release.tar.gz" ]]; then
+    echo "error: adx-release.tar.gz not found in ${AGENT_DX_ARCHIVE_ROOT}/${ARCH}" >&2
     return 1
   fi
 }
@@ -270,7 +295,7 @@ build_openyuanrong() {
 build_agent_gateway() {
   echo "==> build_agent_gateway (${BUILD_TYPE})"
 
-  # 下载 archive.tar.gz 到带时间戳的临时目录解压（与 build_jiuwenswarm/build_openyuanrong 同模式）
+  # 下载 archive.tar.gz 到带时间戳的临时目录解压（与 build_agent_dx/build_jiuwenswarm 同模式）
   local timestamp tmp_dir archive_url
   timestamp="$(date +%Y%m%d%H%M%S)"
   tmp_dir="${BUILD_DIR}/tmp_agent_gateway_${timestamp}"
@@ -292,7 +317,7 @@ build_agent_gateway() {
 build_conch() {
   echo "==> build_conch (${BUILD_TYPE})"
 
-  # 下载 archive.tar.gz 到带时间戳的临时目录解压（与 build_jiuwenswarm/build_openyuanrong 同模式）
+  # 下载 archive.tar.gz 到带时间戳的临时目录解压（与 build_agent_dx/build_jiuwenswarm 同模式）
   # conch 为沙箱相关模块，产物为 rpm：archive/<arch>/*.rpm（平台相关）+ archive/*.rpm（平台无关 none）
   local timestamp tmp_dir archive_url
   timestamp="$(date +%Y%m%d%H%M%S)"
@@ -321,7 +346,7 @@ build_conch() {
 build_credential_router() {
   echo "==> build_credential_router (${BUILD_TYPE})"
 
-  # 下载 archive.tar.gz 到带时间戳的临时目录解压（与 build_jiuwenswarm/build_openyuanrong 同模式）
+  # 下载 archive.tar.gz 到带时间戳的临时目录解压（与 build_agent_dx/build_jiuwenswarm 同模式）
   # credential_router 产物为 tar.gz：archive/<arch>/credential-router*.tar.gz（平台相关，按 ${ARCH} 取）
   local timestamp tmp_dir archive_url
   timestamp="$(date +%Y%m%d%H%M%S)"
@@ -347,8 +372,60 @@ build_credential_router() {
   fi
 }
 
+prepare_core_wheel() {
+  SELECTED_CORE_WHEEL=""
+  case "${AGENT_CORE_FROM_OBS:-1}" in
+    0) echo "  Core OBS bundling disabled; deployment requires preinstalled Core"; return 0 ;;
+    1) ;;
+    *) echo "error: AGENT_CORE_FROM_OBS must be 0 or 1" >&2; return 1 ;;
+  esac
+  local core_version core_base
+  core_version=$(sed -nE 's/^[[:space:]]*openjiuwen[[:space:]]*==[[:space:]]*([^[:space:]#]+).*/\1/p' "${DEPLOY_DIR}/requirements.txt")
+  if [[ -z "${core_version}" || "${core_version}" == *$'\n'* ]]; then
+    echo "error: requirements.txt must contain one openjiuwen==VERSION pin" >&2
+    return 1
+  fi
+  core_base="${AGENT_CORE_BASE_URL:-https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-os/dependencies/agent-core/dist}"
+  mkdir -p "${DOWNLOAD_DIR}/agent-core"
+  SELECTED_CORE_WHEEL="${DOWNLOAD_DIR}/agent-core/openjiuwen-${core_version}-py3-none-any.whl"
+  download_file "${core_base%/}/$(basename "${SELECTED_CORE_WHEEL}")" "${SELECTED_CORE_WHEEL}"
+}
+
+build_a4p_wheels() {
+  local python_version
+  local build_python="${A4P_BUILD_PYTHON:-python3.11}"
+  if ! command -v "${build_python}" >/dev/null 2>&1; then
+    echo "error: A4P build Python not found: ${build_python} (set A4P_BUILD_PYTHON to a Python 3.11+ executable)" >&2
+    return 1
+  fi
+  "${build_python}" -c '
+import sys
+
+print("A4P build Python: {} ({})".format(sys.executable, sys.version.split()[0]))
+if sys.version_info < (3, 11):
+    sys.exit("error: A4P packaging requires Python 3.11 or newer")
+' || return 1
+  A4P_WHEELHOUSE="${DOWNLOAD_DIR}/a4p"
+  mkdir -p "${A4P_WHEELHOUSE}"
+  # Keep dependency versions in the release requirements rather than duplicating
+  # an older A4P Git tag here. The wheelhouse supports the deployed Linux baseline.
+  for python_version in 3.11 3.12 3.13; do
+    "${build_python}" -m pip download --only-binary=:all: \
+      --platform "manylinux_2_28_${ARCH}" --platform "manylinux2014_${ARCH}" \
+      --implementation cp --python-version "${python_version}" --abi "cp${python_version/./}" \
+      --dest "${A4P_WHEELHOUSE}" --constraint "${DEPLOY_DIR}/requirements.txt" \
+      a4p webauthn cbor2 pyOpenSSL tzdata || return 1
+  done
+}
+
 pack() {
   echo "==> pack"
+  prepare_core_wheel || return 1
+  local -a a4p_wheels=("${A4P_WHEELHOUSE}"/a4p-*-py3-none-any.whl)
+  [[ -n "${A4P_WHEELHOUSE}" && "${#a4p_wheels[@]}" -eq 1 && -f "${a4p_wheels[0]}" ]] || {
+    echo "error: A4P wheelhouse is missing" >&2
+    return 1
+  }
   mkdir -p "${BUILD_DIR}"
 
   if [[ ! -d "${DEPLOY_DIR}" ]]; then
@@ -366,10 +443,9 @@ pack() {
   mkdir -p "${client_staging}"
 
   # jiuwenswarm_tui：OBS archive 按 CPU 架构族归类（x86_64/ 含 linux_x86_64+win_amd64，aarch64/ 含 linux_aarch64+macosx_arm64）
-  # 收齐两个架构目录下所有 jiuwenswarm_tui wheel 一并打入 client 包（不再按 ${ARCH} 单取 linux 平台）
+  # 收齐两个架构目录下的 jiuwenswarm_tui wheel，一并打入 client 包。
   local tui_whl tui_found=0
-  for tui_whl in "${JIUWENSWARM_ARCHIVE_ROOT}/x86_64"/jiuwenswarm_tui-*.whl \
-                 "${JIUWENSWARM_ARCHIVE_ROOT}/aarch64"/jiuwenswarm_tui-*.whl; do
+  for tui_whl in "${JIUWENSWARM_ARCHIVE_ROOT}"/{x86_64,aarch64}/jiuwenswarm_tui-*.whl; do
     [[ -e "${tui_whl}" ]] || continue
     cp -p "${tui_whl}" "${client_staging}/"
     tui_found=1
@@ -383,7 +459,7 @@ pack() {
   echo "  created: ${BUILD_DIR}/AgentOS-Client.tgz"
 
   # ---- server 打包 ----
-  # jiuwenswarm 平台无关 wheel 从 jiuwenswarm archive 根目录取
+  # Swarm 平台无关 wheel 从 archive 根目录取。
   local server_whl found=0
   for server_whl in "${JIUWENSWARM_ARCHIVE_ROOT}"/jiuwenswarm-*-py3-none-any.whl; do
     [[ -e "${server_whl}" ]] || continue
@@ -395,11 +471,16 @@ pack() {
     exit 1
   fi
 
-  # openyuanrong：平台相关 wheel 从 openyuanrong archive ${ARCH} 目录取，平台无关（agent_dx_executor）从根目录取
-  cp -p "${OPENYUANRONG_ARCHIVE_ROOT}/${ARCH}"/*.whl "${server_staging}/"
-  cp -p "${OPENYUANRONG_ARCHIVE_ROOT}"/*.whl "${server_staging}/"
+  if [[ -n "${SELECTED_CORE_WHEEL}" ]]; then
+    cp -p "${SELECTED_CORE_WHEEL}" "${server_staging}/"
+  fi
+  mkdir -p "${server_staging}/wheels/a4p"
+  cp -p "${A4P_WHEELHOUSE}"/*.whl "${server_staging}/wheels/a4p/"
 
+  # agent-dx：平台相关整包 adx-release.tar.gz 从 agent-dx archive ${ARCH} 目录取（build_agent_dx 已校验），打入 server 包根目录与各 whl/rpm 同级
+  cp -p "${AGENT_DX_ARCHIVE_ROOT}/${ARCH}/adx-release.tar.gz" "${server_staging}/"
   cp -p "${ETCD_ARCHIVE}" "${server_staging}/"
+
 
   cp -p "${AGENT_GATEWAY_ARCHIVE_ROOT}"/*.whl "${server_staging}/"
 
@@ -429,8 +510,18 @@ pack() {
   done
 
   cp -a "${DEPLOY_DIR}/." "${server_staging}/deploy/"
-  # deploy/jiuwenswarm 取自 jiuwenswarm archive 内 deploy.tar.gz
-  cp -a "${JIUWENSWARM_DEPLOY_DIR}/yuanrong/." "${server_staging}/deploy/jiuwenswarm/"
+  [[ -f "${JIUWENSWARM_DEPLOY_DIR:-}/deploy.sh" && -f "${JIUWENSWARM_DEPLOY_DIR:-}/gateway_handler.sh" && -f "${JIUWENSWARM_DEPLOY_DIR:-}/web_handler.sh" ]] \
+    && { grep -q -- 'agentos_handler.sh' "${JIUWENSWARM_DEPLOY_DIR}/deploy.sh" \
+        || grep -q -- '--require-adx-router' "${JIUWENSWARM_DEPLOY_DIR}/gateway_handler.sh"; } || {
+    echo "error: an ADX-capable Swarm deploy artifact is required" >&2
+    return 1
+  }
+  cp -a "${JIUWENSWARM_DEPLOY_DIR}/." "${server_staging}/deploy/jiuwenswarm/"
+  # AgentOS owns configuration preparation, including when repacking older Swarm artifacts.
+  cp -a "${DEPLOY_DIR}/jiuwenswarm/." "${server_staging}/deploy/jiuwenswarm/"
+  # Historical artifacts carried these runtime helpers in the application directory.
+  rm -f "${server_staging}/deploy/jiuwenswarm/configure.py" \
+        "${server_staging}/deploy/jiuwenswarm/migration.py"
 
   local server_tgz="${BUILD_DIR}/AgentOS-Server-${ARCH}.tgz"
 
@@ -453,7 +544,7 @@ collect_buildinfo() {
   # 各部件名称与其 archive 根目录（名称仅用于同名冲突时加前缀，避免覆盖丢失）
   local -a components=(
     "jiuwenswarm|${JIUWENSWARM_ARCHIVE_ROOT}"
-    "openyuanrong|${OPENYUANRONG_ARCHIVE_ROOT}"
+    "agent-dx|${AGENT_DX_ARCHIVE_ROOT}"
     "agent-gateway|${AGENT_GATEWAY_ARCHIVE_ROOT}"
     "conch|${CONCH_ARCHIVE_ROOT}"
     "credential-router|${CREDENTIAL_ROUTER_ARCHIVE_ROOT}"
@@ -523,9 +614,10 @@ main() {
   echo "AgentOS build (build_type=${BUILD_TYPE}, build_target=${BUILD_TARGET}, arch=${ARCH})"
   clean                                # 清空 build/dist/（含 downloads 和 staging）
   build_etcd                           # 下载并校验固定版本 etcd，供部署离线安装
-  build_openyuanrong                   # 下载并解压 OBS archive.tar.gz（openyuanrong wheels）
+  build_agent_dx                       # 下载并解压 OBS archive.tar.gz（agent-dx adx-release.tar.gz）
   build_jiuwenswarm                    # 下载并解压 OBS archive.tar.gz（jiuwenswarm wheels + deploy）
   build_agent_gateway                  # 下载并解压 OBS archive.tar.gz（a2x_registry wheel）
+  build_a4p_wheels                      # 构建 A4P 并下载目标架构的离线依赖
   build_conch                          # 下载并解压 OBS archive.tar.gz（conch 沙箱模块 rpm）
   build_credential_router             # 下载并解压 OBS archive.tar.gz（credential-router 平台相关 tar.gz）
   pack                                 # 组装 client/server 两个 tgz 产物

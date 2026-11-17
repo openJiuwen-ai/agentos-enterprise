@@ -19,6 +19,10 @@ workspace-storage_down() {
     _ws_run down "$@"
 }
 
+workspace-storage_restart() {
+    _ws_run restart "$@"
+}
+
 workspace-storage_install() {
     _ws_run install "$@"
 }

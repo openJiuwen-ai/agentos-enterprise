@@ -30,7 +30,7 @@ A2X_REGISTRY_ETCD_TLS_CERT="${A2X_REGISTRY_ETCD_TLS_CERT:-}"
 A2X_REGISTRY_ETCD_TLS_KEY="${A2X_REGISTRY_ETCD_TLS_KEY:-}"
 
 # ===== 公共常量 =====
-YR_PYTHON_VERSION="${YR_PYTHON_VERSION:-3.11}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 HEALTH_CHECK_RETRIES="${HEALTH_CHECK_RETRIES:-15}"
 STOP_WAIT_RETRIES="${STOP_WAIT_RETRIES:-10}"
 
@@ -100,7 +100,7 @@ _agentregistry_bind() {
     fi
     local config_file="${HOME:-/root}/.agentos/deploy/config.yaml"
     if [ -f "${config_file}" ]; then
-        local py="python${YR_PYTHON_VERSION}" vip=""
+        local py="python${PYTHON_VERSION}" vip=""
         if command -v "${py}" >/dev/null 2>&1 && "${py}" -c 'import yaml' >/dev/null 2>&1; then
             vip=$("${py}" -c '
 import sys, yaml
@@ -129,7 +129,7 @@ except Exception:
 # etcd 是注册中心唯一的存储后端：探测不到直接报错失败。
 _agentregistry_detect_etcd() {
     local config_file="${HOME:-/root}/.agentos/deploy/config.yaml"
-    local py="python${YR_PYTHON_VERSION}" nodes="" node endpoint=""
+    local py="python${PYTHON_VERSION}" nodes="" node endpoint=""
 
     if [ -f "${config_file}" ] \
         && command -v "${py}" >/dev/null 2>&1 && "${py}" -c 'import yaml' >/dev/null 2>&1; then
@@ -213,27 +213,27 @@ agent-gateway_install() {
     [ -n "${whl}" ] || error "registry whl not found in ${AGENTOS_ROOT}"
 
     # 校验 Python（与 agent-runtime 共用同一 Python 环境）
-    info "Checking Python ${YR_PYTHON_VERSION}..."
+    info "Checking Python ${PYTHON_VERSION}..."
     local py_check
-    py_check=$("python${YR_PYTHON_VERSION}" --version 2>&1 || echo "not_installed")
+    py_check=$("python${PYTHON_VERSION}" --version 2>&1 || echo "not_installed")
     case "${py_check}" in
         *"not_installed"*|*"command not found"*|*"No module"*)
-            error "Python ${YR_PYTHON_VERSION} is not installed. Please install it manually before deploying."
+            error "Python ${PYTHON_VERSION} is not installed. Please install it manually before deploying."
             ;;
     esac
-    success "Python ${YR_PYTHON_VERSION} available: ${py_check}"
+    success "Python ${PYTHON_VERSION} available: ${py_check}"
 
     # 确保 pip 可用（与 agent-runtime 一致）
     info "Ensuring pip..."
-    "python${YR_PYTHON_VERSION}" -m ensurepip 2>/dev/null || true
+    "python${PYTHON_VERSION}" -m ensurepip 2>/dev/null || true
 
     # 安装 a2x-registry whl。
     # agent-gateway 在 agent-runtime 之后安装，Python 依赖已由 agent-runtime 装好，
     # pip install 仅作检查用（依赖满足则无需公网）。
     info "Installing a2x-registry whl: $(basename "${whl}")"
-    if "python${YR_PYTHON_VERSION}" -m pip install "${whl}" --quiet; then
+    if "python${PYTHON_VERSION}" -m pip install "${whl}" --quiet; then
         # 加固：pip show 确认包确实已注册到当前 Python 环境
-        if "python${YR_PYTHON_VERSION}" -m pip show a2x-registry >/dev/null 2>&1; then
+        if "python${PYTHON_VERSION}" -m pip show a2x-registry >/dev/null 2>&1; then
             success "a2x-registry whl installed/verified"
         else
             error "pip install returned success but 'pip show a2x-registry' failed (wheel may be corrupted or installed to wrong env)"
@@ -242,7 +242,7 @@ agent-gateway_install() {
         error "Failed to install a2x-registry whl"
     fi
 
-    py=$(command -v "python${YR_PYTHON_VERSION}") || error "python${YR_PYTHON_VERSION} not found"
+    py=$(command -v "python${PYTHON_VERSION}") || error "python${PYTHON_VERSION} not found"
 
     mkdir -p "${A2X_REGISTRY_RUN_DIR}" "${A2X_REGISTRY_LOG_DIR}"
     if _agentgw_has_systemd; then
@@ -373,7 +373,7 @@ EOF
             warning "agent-registry already running; run 'down' first to restart"
             return 0
         fi
-        py=$(command -v "python${YR_PYTHON_VERSION}") || error "python${YR_PYTHON_VERSION} not found"
+        py=$(command -v "python${PYTHON_VERSION}") || error "python${PYTHON_VERSION} not found"
         py_bindir=$(dirname "${py}")
         py_libdir=$(dirname "${py}")/lib
 
@@ -410,7 +410,7 @@ agent-gateway_down() {
         systemctl stop "${AGENTREGISTRY_SVC}" 2>/dev/null \
             && success "agent-registry stopped" || warning "agent-registry not running"
     else
-        _stop_bg agent-registry "${REGISTRY_PID_FILE}" "python${YR_PYTHON_VERSION}" -m a2x_registry.backend || true
+        _stop_bg agent-registry "${REGISTRY_PID_FILE}" "python${PYTHON_VERSION}" -m a2x_registry.backend || true
         success "agent-registry stopped"
     fi
 }
@@ -424,10 +424,10 @@ agent-gateway_uninstall() {
         systemctl reset-failed "${AGENTREGISTRY_SVC}" 2>/dev/null || true
         systemctl daemon-reload
     else
-        _stop_bg agent-registry "${REGISTRY_PID_FILE}" "python${YR_PYTHON_VERSION}" -m a2x_registry.backend || true
+        _stop_bg agent-registry "${REGISTRY_PID_FILE}" "python${PYTHON_VERSION}" -m a2x_registry.backend || true
         rm -rf "${A2X_REGISTRY_RUN_DIR}"
     fi
-    "python${YR_PYTHON_VERSION}" -m pip uninstall -y a2x-registry || true
+    "python${PYTHON_VERSION}" -m pip uninstall -y a2x-registry || true
     success "agent-registry uninstalled"
 }
 
@@ -443,7 +443,7 @@ agent-gateway_status() {
     # 探测 a2x-registry 版本号：importlib.metadata 比 pip show 快约 30 倍
     local gw_ver="-"
     local pkg_ver
-    pkg_ver=$(python${YR_PYTHON_VERSION} -c "from importlib.metadata import version; print(version('a2x-registry'))" 2>/dev/null || true)
+    pkg_ver=$(python${PYTHON_VERSION} -c "from importlib.metadata import version; print(version('a2x-registry'))" 2>/dev/null || true)
     [ -n "${pkg_ver}" ] && gw_ver="${pkg_ver}"
 
     # 角色判定: 复用 ingress master 检查脚本; 不存在则视为非 master

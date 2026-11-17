@@ -1,0 +1,59 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+schema_version: 1
+package_dir: ${ADX_PACKAGE_DIR}
+state_dir: ${ADX_STATE_DIR}
+redis_url: ${ADX_DEPLOY_REDIS_URL}
+namespace: ${ADX_NAMESPACE}
+restart_delay_ms: 1000
+stop_timeout_seconds: 90
+services:
+- id: coordinator
+  role: coordinator
+  config:
+    listen: 0.0.0.0:19100
+    scheduler_shards: 1
+    placement: pack
+    rpc_timeout_seconds: 30
+    tls:
+      mode: network
+    bootstrap_credentials:
+    - key_file: ${ADX_CONFIG_DIR}/secrets/admin-key
+      tenant_id: admin
+      administrator: true
+      expires_at_unix_seconds: 0
+    - key_file: ${ADX_CONFIG_DIR}/secrets/agentos-tenant-key
+      tenant_id: agentos
+      administrator: false
+      expires_at_unix_seconds: 0
+    advertised_address: http://${ADX_NODE_IP}:19100
+    heartbeat_timeout_seconds: 30
+    discovery_ttl_seconds: 15
+    metrics_listen: 127.0.0.1:19090
+logging:
+  enabled: true
+  max_file_bytes: 104857600
+  rotate_seconds: 86400
+  compress: true
+  max_files: 5
+  max_age_seconds: 604800
+  max_total_bytes: 1073741824
+runtime_profile:
+  rootfs:
+    runtime_class: runsc
+    type: local
+    path: ${ADX_RUNTIME_ROOTFS}
+    readonly: false
+  bootstrap:
+    type: erofs
+    root: ${ADX_RUNTIME_ROOTFS}
+    target: /__adx
+    entrypoint:
+    - /__adx/usr/local/bin/adx-execd
+    image_process_config: /etc/adx-image-process.json
+  env:
+    PATH: ${ADX_BUSINESS_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    HOME: /home/agentos
+    JIUWENSWARM_HOME: /home/agentos
+    AGENT_SERVER_HOST: 0.0.0.0
+    SSL_CERT_FILE: ${ADX_CA_BUNDLE_FILE}
+    PYTHONDONTWRITEBYTECODE: '1'

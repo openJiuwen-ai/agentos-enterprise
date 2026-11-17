@@ -12,6 +12,22 @@
 JIUWENBOX_DEPLOY_DIR="${SCRIPT_DIR}/jiuwenbox"
 
 _jiuwenbox_run() {
+    local phase
+    for phase in "$@"; do
+        case "${phase}" in
+            up|install)
+                if [ -z "${AGENTOS_MODULES:-}" ]; then
+                    local selected
+                    selected=$("${ADX_BUSINESS_PYTHON:-python3.11}" "${SCRIPT_DIR}/agent-runtime/adx_integration.py" backend-enabled --backend jiuwenbox) || return
+                    case "${selected}" in
+                        disabled) info "Jiuwenbox backend is not selected"; return 0 ;;
+                        enabled) ;;
+                        *) error "Cannot determine whether Jiuwenbox is selected" ;;
+                    esac
+                fi
+                ;;
+        esac
+    done
     local jiuwenbox_script="${JIUWENBOX_DEPLOY_DIR}/jiuwenbox_deploy.sh"
     if [ ! -f "${jiuwenbox_script}" ]; then
         error "jiuwenbox deploy script not found: ${jiuwenbox_script}"
@@ -20,21 +36,30 @@ _jiuwenbox_run() {
 }
 
 jiuwenbox_up() {
-    _jiuwenbox_run --python "python${YR_PYTHON_VERSION}" up "$@"
+    local status
+    if status=$(_jiuwenbox_run --python "python${PYTHON_VERSION}" status 2>/dev/null); then
+        case "${status}" in
+            jiuwenbox\|*\|running\|*)
+                info "Jiuwenbox is already running; retaining the existing service"
+                return 0
+                ;;
+        esac
+    fi
+    _jiuwenbox_run --python "python${PYTHON_VERSION}" up "$@"
 }
 
 jiuwenbox_down() {
-    _jiuwenbox_run --python "python${YR_PYTHON_VERSION}" down "$@"
+    _jiuwenbox_run --python "python${PYTHON_VERSION}" down "$@"
 }
 
 jiuwenbox_install() {
-    _jiuwenbox_run --python "python${YR_PYTHON_VERSION}" install "$@"
+    _jiuwenbox_run --python "python${PYTHON_VERSION}" install "$@"
 }
 
 jiuwenbox_uninstall() {
-    _jiuwenbox_run --python "python${YR_PYTHON_VERSION}" uninstall "$@"
+    _jiuwenbox_run --python "python${PYTHON_VERSION}" uninstall "$@"
 }
 
 jiuwenbox_status() {
-    _jiuwenbox_run --python "python${YR_PYTHON_VERSION}" status "$@"
+    _jiuwenbox_run --python "python${PYTHON_VERSION}" status "$@"
 }

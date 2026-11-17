@@ -1,7 +1,11 @@
-# AgentOS 集群配置文件（默认单机开发模式）
+# AgentOS 集群配置文件（单机模板）
+# up 前请将下面的 127.0.0.1 替换为本机实际部署 IP；ADX 不从网卡列表猜测节点地址。
+# --ip / BIND_IP 只能选择 cluster_nodes 中由本机持有的非回环、非通配地址。
 #
 # 此配置随 deploy 目录一起持久化到 ~/.agentos/deploy/config.yaml
 # ansible 部署时会修改此文件后再执行 install
+# 安装后仅修改本文件时，init/up/restart 会校验并同步到持久配置；
+# 仅修改持久配置时保留该修改，两份均修改且不一致时需先手动统一。
 #
 # 配置格式说明：
 #   etcd_nodes: etcd 集群节点列表（单机 1 节点 / 4 机 HA 3 节点）

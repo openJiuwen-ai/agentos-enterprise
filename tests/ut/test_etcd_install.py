@@ -153,7 +153,7 @@ class EtcdInstallTests(unittest.TestCase):
             path.write_text("#!/bin/sh\nexit 0\n")
             path.chmod(0o755)
         service = (ROOT / "deploy/etcd.sh").read_text()
-        functions = service[service.index("_yr_etcd_bin_path() {"):service.index("# ===== agent-runtime（openyuanrong）")]
+        functions = service[service.index("_yr_etcd_bin_path() {"):service.index("# ===== 旧 openyuanrong")]
         workspace = (ROOT / "deploy/workspace-storage/deploy.sh").read_text()
         functions += workspace[workspace.index("_ws_find_etcdctl() {"):workspace.index("# 获取 etcd endpoints")]
         env = dict(os.environ, AGENTOS_ETCD_ROOT=str(self.root), ETCD_BIN_PATH="", ETCDCTL_PATH="")

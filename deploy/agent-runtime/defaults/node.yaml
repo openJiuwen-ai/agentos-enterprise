@@ -1,0 +1,103 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+schema_version: 1
+profile: node
+internal_security: network
+package_dir: ${ADX_PACKAGE_DIR}
+state_dir: ${ADX_NODE_RUN_DIR}
+redis_url: ${ADX_DEPLOY_REDIS_URL}
+namespace: ${ADX_NAMESPACE}
+restart_delay_ms: 1000
+stop_timeout_seconds: 90
+service_overrides:
+  adxlet:
+    config:
+      node_id: ${ADX_NODE_ID}
+      listen: 0.0.0.0:19101
+      advertised_address: ${ADX_NODE_IP}:19101
+      proxy_address: ${ADX_NODE_IP}:19102
+      runtime_logs:
+        directory: ${ADX_LOG_DIR_PREFIX}/runtime
+      proxy_socket: ${ADX_NODE_RUN_DIR}/route.sock
+      report_interval_seconds: 5
+      rpc_timeout_seconds: 30
+      execd_port: 50090
+      execd_env: {}
+      checkpoint_dir: ${ADX_DATA_DIR}/checkpoints
+      resource_source:
+        kind: auto
+        disk_path: ${ADX_DATA_DIR}
+        valid_for_seconds: 30
+      metrics_listen: 127.0.0.1:19091
+      runtime_control:
+        listen: 0.0.0.0:19103
+        advertised_address: http://${ADX_NODE_IP}:19103
+        key_file: ${ADX_CONFIG_DIR}/secrets/runtime-control-key
+      degradation_journal: ${ADX_NODE_RUN_DIR}/degraded/results.sqlite
+      sandboxd_socket: null
+      runtime_ready_timeout_seconds: 180
+      jiuwenbox:
+        socket: /run/jiuwenbox/jiuwenbox.sock
+        conch_socket: /var/run/conch/conchd.sock
+        state_dir: ${ADX_DATA_DIR}/jiuwenbox
+        bootstrap:
+          image: ${ADX_RUNTIME_ROOTFS}
+          sha256: ${ADX_BOOTSTRAP_SHA256}
+          target: /__adx
+          command:
+          - /__adx/usr/local/bin/adx-execd
+        classes:
+          supervisor:
+            policy:
+              process:
+                run_as_user: root
+                run_as_group: root
+              namespace:
+                user: false
+            images:
+              agentos-supervisor:v1:
+                process:
+                  args:
+                  - ${ADX_BUSINESS_PYTHON}
+                  - ${ADX_BUSINESS_BIN}/agentos-adx-agentserver.py
+                  - --node-ingress
+                  - ${ADX_NODE_INGRESS_URL}
+                  - --port
+                  - '18092'
+                  cwd: /home/agentos
+                  user: agentos
+          conch:
+            images:
+              agentos-tools:v1:
+                template_name: ${ADX_TOOL_TEMPLATE}
+                process:
+                  args:
+                  - /bin/sleep
+                  - '86400'
+                  cwd: /
+                  user: 0:0
+    env:
+      ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR: ${ADX_NODE_RUN_DIR}
+      ADX_DATA_PLANE_RELAY_BIND: 0.0.0.0:19102
+      ADX_DATA_PLANE_RELAY_ADVERTISE_ADDRESS: ${ADX_NODE_IP}:19102
+      ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS: ${ADX_SANDBOX_CIDR},10.12.0.0/20,100.64.0.0/10,${ADX_RELAY_PEERS}
+      ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS: ${ADX_RELAY_PEERS}
+runtime_profile:
+  rootfs:
+    path: ${ADX_RUNTIME_ROOTFS}
+    runtime_class: runsc
+    type: local
+    readonly: false
+  bootstrap:
+    root: ${ADX_RUNTIME_ROOTFS}
+    type: erofs
+    target: /__adx
+    entrypoint:
+    - /__adx/usr/local/bin/adx-execd
+    image_process_config: /etc/adx-image-process.json
+  env:
+    PATH: ${ADX_BUSINESS_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    HOME: /home/agentos
+    JIUWENSWARM_HOME: /home/agentos
+    AGENT_SERVER_HOST: 0.0.0.0
+    SSL_CERT_FILE: ${ADX_CA_BUNDLE_FILE}
+    PYTHONDONTWRITEBYTECODE: '1'

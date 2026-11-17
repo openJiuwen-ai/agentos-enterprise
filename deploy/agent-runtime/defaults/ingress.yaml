@@ -1,0 +1,48 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+schema_version: 1
+profile: ingress-api
+internal_security: network
+package_dir: ${ADX_PACKAGE_DIR}
+state_dir: ${ADX_INGRESS_STATE_DIR}
+redis_url: ${ADX_DEPLOY_REDIS_URL}
+namespace: ${ADX_NAMESPACE}
+restart_delay_ms: 1000
+stop_timeout_seconds: 90
+service_overrides:
+  apiserver:
+    config:
+      listen: 127.0.0.1:8888
+      loopback_http: true
+      # Workspace 亲和：按 /home/agentos/users/<owner> 查本机 Workspace API 取归属节点。
+      # 每节点 API 共享 etcd 归属，查询本机即可回答全部 owner；解析失败按 fail_open 降级。
+      workspace_affinity:
+        root: /home/agentos/users
+        endpoints:
+        - http://127.0.0.1:18889
+        on_error: fail_open
+  ingress:
+    env:
+      ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES: exact:/,exact:/healthz,prefix:/api/instances,prefix:/api/environment,prefix:/api/admin/v1/keys,prefix:/global-scheduler
+      ADX_DATA_PLANE_INGRESS_LISTENERS: ${ADX_INGRESS_LISTENERS}
+      ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS: 0.0.0.0/0
+      ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS: 127.0.0.1:8888
+runtime_profile:
+  rootfs:
+    path: ${ADX_RUNTIME_ROOTFS}
+    runtime_class: runsc
+    type: local
+    readonly: false
+  bootstrap:
+    root: ${ADX_RUNTIME_ROOTFS}
+    type: erofs
+    target: /__adx
+    entrypoint:
+    - /__adx/usr/local/bin/adx-execd
+    image_process_config: /etc/adx-image-process.json
+  env:
+    PATH: ${ADX_BUSINESS_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    HOME: /home/agentos
+    JIUWENSWARM_HOME: /home/agentos
+    AGENT_SERVER_HOST: 0.0.0.0
+    SSL_CERT_FILE: ${ADX_CA_BUNDLE_FILE}
+    PYTHONDONTWRITEBYTECODE: '1'

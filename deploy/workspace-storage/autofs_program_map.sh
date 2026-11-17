@@ -4,26 +4,39 @@
 # autofs program map script for workspace storage
 #
 # autofs calls this script with a single argument (the key) when it needs to
-# mount /home/agentos/users/<key>.  The script queries etcd for the owning IP
-# and outputs a mount entry line that autofs interprets:
-#   - Local owner  →  -fstype=bind :/home/agentos/.users/<key>
-#   - Remote owner →  -fstype=nfs,vers=4.1 <owning_ip>:/home/agentos/.users/<key>
+# mount <WORKSPACE_ACCESS_ROOT>/<key>.  The script queries etcd for the owning
+# node IP and outputs one mount entry:
+#   - Local owner  →  local bind; remote owner → NFS
+#   - Remote owner →  -fstype=nfs,vers=<NFS_VERSION> <owning_ip>:<WORKSPACE_STORAGE_ROOT>/<key>
 #   - No record    →  empty output (no mount)
 #
-# 归属+目录的创建由 frontend POST /workspace 接口显式触发：
-#   frontend → HRW + CAS etcd + gRPC PrepareWorkspace → function_proxy mkdir
-# 管理面在创建用户前调 frontend POST /workspace，创建完成后再 Path.mkdir
-# 触发 autofs 挂载。program_map 只负责查记录+输出挂载规格，不自动创建。
+# 数据来源：
+#   1) etcd 单 key /agent-runtime/workspace/<owner> → node_ip（权威）
+#   2) etcd 传输层失败/超时 → 回落 watchdog 维护的本地 TSV 缓存（owner<TAB>node_ip）
+#      etcd 明确返回“无记录”时以 etcd 为准，不读缓存。
+#
+# 归属与目录的创建由 agentos-workspace 服务同步完成，本脚本只读、不创建目录。
+# automount 调用时没有环境变量，全部参数来自同目录的 workspace_storage.conf。
 
 # --- This script is invoked by automount(8); keep it lightweight and robust ---
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- Load config ---
+# --- Defaults (overridden by workspace_storage.conf) ---
 WORKSPACE_STORAGE_ROOT="/home/agentos/.users"
-WORKSPACE_ETCD_PREFIX="/agent-runtime/workspace"
 WORKSPACE_ACCESS_ROOT="/home/agentos/users"
 NFS_VERSION="4.1"
+LOCAL_OWNER_MOUNT_MODE="bind"
+WORKSPACE_ETCD_PREFIX="/agent-runtime/workspace"
+WORKSPACE_ETCD_ENDPOINTS=""
+WORKSPACE_ETCD_TLS="false"
+WORKSPACE_ETCD_TLS_CA=""
+WORKSPACE_ETCD_TLS_CERT=""
+WORKSPACE_ETCD_TLS_KEY=""
+WORKSPACE_ETCD_TIMEOUT="2"
+ETCDCTL_PATH=""
+ETCD_LD_PATH=""
+WORKSPACE_CACHE_FILE="/var/lib/agentos-workspace/owners.cache"
 
 _conf_file="${SCRIPT_DIR}/workspace_storage.conf"
 if [ -f "${_conf_file}" ]; then
@@ -73,14 +86,14 @@ if [ -z "${ETCDCTL_PATH}" ] || [ ! -x "${ETCDCTL_PATH}" ]; then
     fi
 fi
 
-# --- etcd TLS / endpoint env vars (set by calling environment or conf) ---
-ENABLE_TLS="${ENABLE_TLS:-false}"
-ETCD_SSL_BASE_PATH="${ETCD_SSL_BASE_PATH:-}"
-ETCD_ENDPOINT="${ETCD_ENDPOINT:-}"
+# --- etcd endpoint bootstrap ---
 # automount 调用本脚本时没有环境变量，endpoint 必须自举。
-# 回退链: conf/env ETCD_ENDPOINT → config.py etcd-nodes 推导（集群全量，多节点容灾）
+# 回退链: WORKSPACE_ETCD_ENDPOINTS → ETCD_ENDPOINT → config.py etcd-nodes
 #         → 本机 etcd client 端口（agentos etcd 常规端口 32379）
-if [ -z "${ETCD_ENDPOINT}" ]; then
+if [ -z "${WORKSPACE_ETCD_ENDPOINTS}" ]; then
+    WORKSPACE_ETCD_ENDPOINTS="${ETCD_ENDPOINT:-}"
+fi
+if [ -z "${WORKSPACE_ETCD_ENDPOINTS}" ]; then
     _conf_config_py="${SCRIPT_DIR}/../scripts/config.py"
     if [ -f "${_conf_config_py}" ]; then
         _py_bin="$(command -v python3 2>/dev/null || echo python3)"
@@ -91,19 +104,19 @@ if [ -z "${ETCD_ENDPOINT}" ]; then
         fi
         if [ -n "${_etcd_nodes}" ]; then
             for _node in ${_etcd_nodes}; do
-                if [ -n "${ETCD_ENDPOINT}" ]; then
-                    ETCD_ENDPOINT="${ETCD_ENDPOINT},"
+                if [ -n "${WORKSPACE_ETCD_ENDPOINTS}" ]; then
+                    WORKSPACE_ETCD_ENDPOINTS="${WORKSPACE_ETCD_ENDPOINTS},"
                 fi
-                ETCD_ENDPOINT="${ETCD_ENDPOINT}${_node}:${YR_ETCD_CLIENT_PORT:-32379}"
+                WORKSPACE_ETCD_ENDPOINTS="${WORKSPACE_ETCD_ENDPOINTS}${_node}:${YR_ETCD_CLIENT_PORT:-32379}"
             done
         fi
     fi
 fi
-if [ -z "${ETCD_ENDPOINT}" ]; then
-    ETCD_ENDPOINT="127.0.0.1:${YR_ETCD_CLIENT_PORT:-32379}"
+if [ -z "${WORKSPACE_ETCD_ENDPOINTS}" ]; then
+    WORKSPACE_ETCD_ENDPOINTS="127.0.0.1:${YR_ETCD_CLIENT_PORT:-32379}"
 fi
 # Timeout for etcdctl queries (seconds)
-ETCD_TIMEOUT="${ETCD_TIMEOUT:-5}"
+WORKSPACE_ETCD_TIMEOUT="${WORKSPACE_ETCD_TIMEOUT:-${ETCD_TIMEOUT:-2}}"
 
 # --- Self IP detection ---
 # 输出本机全部 IPv4 地址（空格分隔，排除回环）。优先 ip -4，
@@ -145,60 +158,6 @@ _is_local_ip() {
     return 1
 }
 
-# --- Query etcd for workspace ownership ---
-# Echoes the owning IP, or empty string on any failure / missing key.
-_query_etcd_owner() {
-    local key="$1"
-    local etcd_key="${WORKSPACE_ETCD_PREFIX}/${key}"
-
-    # If etcdctl is not available, fail silently
-    if [ -z "${ETCDCTL_PATH}" ] || [ ! -x "${ETCDCTL_PATH}" ]; then
-        return 0
-    fi
-    # If no endpoint is configured, fail silently
-    if [ -z "${ETCD_ENDPOINT}" ]; then
-        return 0
-    fi
-
-    local result=""
-    # endpoints 规范化: 支持逗号分隔多节点（etcdctl 自动故障切换），
-    # 未带 scheme 的项按 ENABLE_TLS 补 http(s)://，已带的保持原样
-    local scheme="http"
-    if [ "X${ENABLE_TLS}" = "Xtrue" ]; then
-        scheme="https"
-    fi
-    local endpoints="" ep _ifs_old
-    _ifs_old="${IFS}"
-    IFS=','
-    for ep in ${ETCD_ENDPOINT}; do
-        [ -n "${ep}" ] || continue
-        case "${ep}" in
-            http://*|https://*) ;;
-            *) ep="${scheme}://${ep}" ;;
-        esac
-        if [ -n "${endpoints}" ]; then
-            endpoints="${endpoints},${ep}"
-        else
-            endpoints="${ep}"
-        fi
-    done
-    IFS="${_ifs_old}"
-
-    local tls_params=""
-    if [ "X${ENABLE_TLS}" = "Xtrue" ] && [ -n "${ETCD_SSL_BASE_PATH}" ]; then
-        tls_params="--cacert=${ETCD_SSL_BASE_PATH}/ca.crt --cert=${ETCD_SSL_BASE_PATH}/client.crt --key=${ETCD_SSL_BASE_PATH}/client.key"
-    fi
-    result=$(LD_LIBRARY_PATH="${ETCD_LD_PATH}" ETCDCTL_API=3 \
-        timeout "${ETCD_TIMEOUT}s" "${ETCDCTL_PATH}" \
-        ${tls_params} \
-        --endpoints "${endpoints}" \
-        get "${etcd_key}" --print-value-only 2>/dev/null || true)
-
-    # Strip whitespace; empty means no record
-    result="$(echo "${result}" | tr -d '[:space:]')"
-    echo "${result}"
-}
-
 # --- Validate key (owner name) for path safety ---
 _validate_key() {
     local key="$1"
@@ -226,6 +185,93 @@ _validate_key() {
     return 0
 }
 
+# --- Query etcd for workspace ownership ---
+# Echoes the owning IP and returns:
+#   0 = 命中记录
+#   2 = etcd 可达但无该 key（权威结论，调用方不得回落缓存）
+#   1 = etcdctl 缺失 / 传输层失败 / 超时（调用方回落本地缓存）
+_query_etcd_owner() {
+    local key="$1"
+    local etcd_key="${WORKSPACE_ETCD_PREFIX}/${key}"
+
+    if [ -z "${ETCDCTL_PATH}" ] || [ ! -x "${ETCDCTL_PATH}" ]; then
+        return 1
+    fi
+    if [ -z "${WORKSPACE_ETCD_ENDPOINTS}" ]; then
+        return 1
+    fi
+
+    # endpoints 规范化: 支持逗号分隔多节点（etcdctl 自动故障切换），
+    # 未带 scheme 的项按 TLS 开关补 http(s)://，已带的保持原样
+    local scheme="http" tls_enabled="${WORKSPACE_ETCD_TLS:-false}"
+    if [ "X${tls_enabled}" = "Xtrue" ]; then
+        scheme="https"
+    elif [ "X${ENABLE_TLS:-false}" = "Xtrue" ]; then
+        scheme="https"
+        tls_enabled="true"
+    fi
+    local endpoints="" ep _ifs_old
+    _ifs_old="${IFS}"
+    IFS=','
+    for ep in ${WORKSPACE_ETCD_ENDPOINTS}; do
+        [ -n "${ep}" ] || continue
+        case "${ep}" in
+            http://*|https://*) ;;
+            *) ep="${scheme}://${ep}" ;;
+        esac
+        if [ -n "${endpoints}" ]; then
+            endpoints="${endpoints},${ep}"
+        else
+            endpoints="${ep}"
+        fi
+    done
+    IFS="${_ifs_old}"
+
+    local tls_params=""
+    if [ "X${tls_enabled}" = "Xtrue" ]; then
+        if [ -n "${WORKSPACE_ETCD_TLS_CA}" ] || [ -n "${WORKSPACE_ETCD_TLS_CERT}" ] \
+            || [ -n "${WORKSPACE_ETCD_TLS_KEY}" ]; then
+            [ -n "${WORKSPACE_ETCD_TLS_CA}" ] && tls_params="${tls_params} --cacert=${WORKSPACE_ETCD_TLS_CA}"
+            [ -n "${WORKSPACE_ETCD_TLS_CERT}" ] && tls_params="${tls_params} --cert=${WORKSPACE_ETCD_TLS_CERT}"
+            [ -n "${WORKSPACE_ETCD_TLS_KEY}" ] && tls_params="${tls_params} --key=${WORKSPACE_ETCD_TLS_KEY}"
+        elif [ -n "${ETCD_SSL_BASE_PATH:-}" ]; then
+            tls_params="--cacert=${ETCD_SSL_BASE_PATH}/ca.crt --cert=${ETCD_SSL_BASE_PATH}/client.crt --key=${ETCD_SSL_BASE_PATH}/client.key"
+        fi
+    fi
+
+    local result="" rc=0
+    result=$(LD_LIBRARY_PATH="${ETCD_LD_PATH}" ETCDCTL_API=3 \
+        timeout "${WORKSPACE_ETCD_TIMEOUT}s" "${ETCDCTL_PATH}" \
+        ${tls_params} \
+        --endpoints "${endpoints}" \
+        get "${etcd_key}" --print-value-only 2>/dev/null) || rc=$?
+
+    if [ "${rc}" -ne 0 ]; then
+        return 1
+    fi
+
+    # Strip whitespace; empty means the key does not exist (authoritative)
+    result="$(echo "${result}" | tr -d '[:space:]')"
+    if [ -z "${result}" ]; then
+        return 2
+    fi
+    printf '%s' "${result}"
+    return 0
+}
+
+# --- Fallback: local TSV cache maintained by workspace watchdog ---
+# 格式: owner<TAB>node_ip；仅在 etcd 传输层失败时使用
+_cache_lookup() {
+    local key="$1"
+    if [ -z "${WORKSPACE_CACHE_FILE}" ] || [ ! -r "${WORKSPACE_CACHE_FILE}" ]; then
+        return 1
+    fi
+    awk -F'\t' -v key="${key}" '
+        $1 == key && $2 != "" { print $2; found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "${WORKSPACE_CACHE_FILE}"
+}
+
 # ===== main =====
 main() {
     local key="${1:-}"
@@ -240,23 +286,31 @@ main() {
         return 0
     fi
 
-    # Query etcd for the owning IP
-    local owning_ip
+    local owning_ip="" rc=0
     owning_ip=$(_query_etcd_owner "${key}")
+    rc=$?
 
-    # No etcd record → return empty (no mount)
-    # Ownership+directory must be created via frontend POST /workspace first
+    case "${rc}" in
+        0) : ;;
+        2) return 0 ;;  # etcd 权威判定无记录，不回落缓存
+        *)
+            owning_ip=$(_cache_lookup "${key}") || owning_ip=""
+            ;;
+    esac
+
     if [ -z "${owning_ip}" ]; then
         return 0
     fi
 
     # 本地判定：owning_ip 属于本机地址集合（避免 IPv6/网桥/多网卡误判）
-    if _is_local_ip "${owning_ip}"; then
-        # Local owner: bind mount to local storage directory
-        # (directory created by function_proxy PrepareWorkspace via frontend POST /workspace)
+    case "${LOCAL_OWNER_MOUNT_MODE}" in bind|nfs) ;; *) return 1 ;; esac
+    if [ "${LOCAL_OWNER_MOUNT_MODE}" = bind ] && _is_local_ip "${owning_ip}"; then
         echo "-fstype=bind :${WORKSPACE_STORAGE_ROOT}/${key}"
+    elif [ "${LOCAL_OWNER_MOUNT_MODE}" = nfs ]; then
+        # autofs otherwise optimizes local NFS exports back into bind mounts.
+        # Keep the filesystem type identical on owner and restore nodes.
+        echo "-fstype=nfs,vers=${NFS_VERSION},nobind ${owning_ip}:${WORKSPACE_STORAGE_ROOT}/${key}"
     else
-        # Remote owner: NFS mount from the owning node
         echo "-fstype=nfs,vers=${NFS_VERSION} ${owning_ip}:${WORKSPACE_STORAGE_ROOT}/${key}"
     fi
 }
