@@ -1,5 +1,6 @@
 a2a-sdk==1.1.2
 a2ui-agent-sdk==0.2.1
+a4p==0.1.0
 agentdescent==0.4.6
 aiofiles==25.1.0
 aiohappyeyeballs==2.7.1
@@ -247,6 +248,7 @@ transformers==5.14.1
 tree-sitter==0.25.2
 tree-sitter-bash==0.25.1
 truststore==0.10.4
+tzdata==2026.6
 typer==0.27.0
 typing-inspection==0.4.2
 typing_extensions==4.16.0
