@@ -842,6 +842,7 @@ Commands (Required):
   init        启动 etcd + 外置 redis（委托 etcd.sh / redis.sh up，非对应角色节点自动跳过）
               保留已有数据实现平滑升级；如需彻底清理数据请显式 ./etcd.sh clean / ./redis.sh clean
   up          按顺序部署全部应用组件（前置检查 etcd / redis 可达，不可达则提示先 init）
+              默认按统一配置同步存量用户 trace 字段（运行中 Agent 需重新启动后生效）
   down        逆序停止全部应用组件（不动 etcd / redis）
   deinit      停 etcd + redis + 删 unit（委托 etcd.sh / redis.sh down，保留数据）
   uninstall   在本机卸载全部组件的 whl 包

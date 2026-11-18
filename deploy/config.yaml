@@ -13,7 +13,7 @@
 #   cluster_nodes: 整个集群的全部节点列表（workspace 亲和 HRW 候选集 / 数据迁移节点来源）
 #   ingress_virtual_ip: 统一入口虚拟 IP，抢占到 VIP 的节点部署 gateway/registry/web-server
 #   trace_otlp_endpoints: AgentGateway、AgentRuntime、JiuwenSwarm 统一 tracing 配置
-#     （host:port 形式，不要带 http:// 前缀；支持多项主备）。空列表/缺省 = 关闭 tracing。
+#     （host:port 形式，不要带 http:// 前缀；支持多项主备）。空列表/缺省关闭各组件配置开关。
 #     取第一个地址注入全部组件（部署级主备）；主地址不可达时修改本列表后重新 up 切换。
 
 cluster:
@@ -32,6 +32,7 @@ cluster:
   # 统一入口虚拟 IP（抢占成功后启动 gateway/registry/web-server）
   ingress_virtual_ip: "127.0.0.1"
 
-# 全组件 tracing 总开关：非空时统一使用 OTLP gRPC，空列表关闭采集；修改后执行 up。
+# 非空时统一开启现有 tracing 开关并使用 OTLP gRPC；空列表关闭这些开关，修改后执行 up。
+# JiuwenSwarm 的演进、轨迹 UI 和调试采集继续遵循各自已有规则。
 # 示例：trace_otlp_endpoints: ["10.0.0.1:4317", "10.0.0.2:4317"]
 trace_otlp_endpoints: []

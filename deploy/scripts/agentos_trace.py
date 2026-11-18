@@ -1,10 +1,11 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Apply AgentOS tracing settings to Gateway and new-user config templates."""
+"""Apply AgentOS tracing settings to templates and existing user configs."""
 
 from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 _ENDPOINT_PATTERN = re.compile(r"[A-Za-z0-9._:~-]+")
@@ -45,7 +46,8 @@ def _block_bounds(lines: list[str], header: str) -> tuple[int, int]:
         stripped = lines[index].strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if not lines[index].startswith((" ", "\t")):
+        indent = len(lines[index]) - len(lines[index].lstrip())
+        if indent <= len(header) - len(header.lstrip()):
             end = index
             break
     return start, end
@@ -67,24 +69,26 @@ def _replace_key(line: str, key: str, value: str) -> str:
 def _rewrite_block(lines: list[str], header: str, keys: tuple[str, ...], values: dict[str, str]) -> None:
     """Rewrite the two-space keys of one top-level block."""
     start, end = _block_bounds(lines, header)
+    prefix = " " * (len(header) - len(header.lstrip()))
     found: set[str] = set()
     for index in range(start + 1, end):
         for key in keys:
-            if re.match(rf"^  {re.escape(key)}:", lines[index]):
-                lines[index] = _replace_key(lines[index], key, values[key])
+            if re.match(rf"^{prefix}  {re.escape(key)}:", lines[index]):
+                lines[index] = prefix + _replace_key(lines[index], key, values[key])
                 found.add(key)
                 break
 
     missing = [key for key in keys if key not in found]
     if missing:
         insert_at = start + 1
-        inserts = [_render_key(key, values[key]) for key in missing]
+        inserts = [prefix + _render_key(key, values[key]) for key in missing]
         lines[insert_at:insert_at] = inserts
 
 
-def apply_template(path: Path, *, endpoint: str) -> None:
-    """Rewrite the master switch and OTLP gRPC settings in the template."""
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+def apply_template(path: Path, *, endpoint: str) -> bool:
+    """Rewrite existing tracing switches and OTLP gRPC settings in the template."""
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
     normalized = normalize_endpoint(endpoint) if endpoint else ""
     enabled = "true" if normalized else "false"
     _rewrite_block(lines, "telemetry:", _TELEMETRY_KEYS, {
@@ -95,24 +99,53 @@ def apply_template(path: Path, *, endpoint: str) -> None:
     })
 
     obs_values = {"enabled": enabled, "exporter": "otlp_grpc", "endpoint": normalized}
-    for header in _OBSERVABILITY_BLOCKS:
-        _rewrite_block(lines, header, _OBSERVABILITY_KEYS, obs_values)
-
-    for index, line in enumerate(lines):
-        if line.startswith("trace_enabled:"):
-            lines[index] = f"trace_enabled: {enabled}\n"
-            break
+    if any(line.rstrip() == "observability:" for line in lines):
+        _rewrite_block(lines, "observability:", ("exporter", "endpoint"), obs_values)
+        start, end = _block_bounds(lines, "observability:")
+        block = lines[start:end]
+        for header in ("  team:", "  agent:"):
+            _rewrite_block(block, header, ("enabled",), obs_values)
+        lines[start:end] = block
     else:
-        lines.insert(0, f"trace_enabled: {enabled}\n")
+        for header in _OBSERVABILITY_BLOCKS:
+            _rewrite_block(lines, header, _OBSERVABILITY_KEYS, obs_values)
 
-    path.write_text("".join(lines), encoding="utf-8")
+    rendered = "".join(lines)
+    if rendered == original:
+        return False
+    path.write_text(rendered, encoding="utf-8")
+    return True
+
+
+def sync_users(root: Path, *, endpoint: str) -> tuple[int, int, int]:
+    if not root.is_dir():
+        raise ValueError(f"User root directory not found: {root}")
+    if endpoint:
+        normalize_endpoint(endpoint)
+    updated = unchanged = failed = 0
+    for path in sorted(root.glob("*/.jiuwenswarm/config/config.yaml")):
+        try:
+            if apply_template(path, endpoint=endpoint):
+                updated += 1
+            else:
+                unchanged += 1
+        except (OSError, ValueError) as exc:
+            failed += 1
+            print(f"Failed to sync {path}: {exc}", file=sys.stderr)
+    print(f"User trace sync: updated={updated}, unchanged={unchanged}, failed={failed}")
+    return updated, unchanged, failed
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--template", required=True, type=Path)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--template", type=Path)
+    target.add_argument("--users-root", type=Path)
     parser.add_argument("--endpoint", default="")
     args = parser.parse_args()
+    if args.users_root is not None:
+        _, _, failed = sync_users(args.users_root, endpoint=args.endpoint)
+        sys.exit(1 if failed else 0)
     apply_template(args.template, endpoint=args.endpoint)
 
 

@@ -61,14 +61,12 @@ class AgentOSTraceTests(unittest.TestCase):
 
     def test_empty_endpoint_disables_tracing(self):
         rendered = self._apply("")
-        self.assertIn("trace_enabled: false\n", rendered)
         self.assertIn("  enabled: false  # 总开关", rendered)
         self.assertIn("  endpoint:  # OTLP endpoint", rendered)
         self.assertNotIn("  endpoint: http://collector", rendered)
 
     def test_observability_blocks_follow_unified_switch(self):
         rendered = self._apply("collector:4317")
-        self.assertIn("trace_enabled: true\n", rendered)
         self.assertIn("  exporter: otlp_grpc  # otlp_grpc / otlp_http / file", rendered)
         self.assertEqual(rendered.count("  endpoint: http://collector:4317  # OTLP gRPC endpoint"), 2)
         self.assertIn("  enabled: true  # Team observability 总开关", rendered)
@@ -82,12 +80,10 @@ class AgentOSTraceTests(unittest.TestCase):
             path.write_text(rendered, encoding="utf-8")
             agentos_trace.apply_template(path, endpoint="")
             reverted = path.read_text(encoding="utf-8")
-        self.assertIn("trace_enabled: false\n", reverted)
         self.assertIn("  enabled: false  # Team observability 总开关", reverted)
         self.assertIn("  enabled: false  # 单 agent 可观测性总开关", reverted)
         self.assertEqual(reverted.count("  exporter: otlp_grpc  # otlp_grpc / otlp_http / file"), 2)
         self.assertEqual(reverted.count("  endpoint:  # OTLP gRPC endpoint"), 2)
-        self.assertEqual(reverted.count("trace_enabled:"), 1)
 
     def test_missing_telemetry_block_is_an_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -95,6 +91,31 @@ class AgentOSTraceTests(unittest.TestCase):
             path.write_text("gateway:\n  x: 1\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 agentos_trace.apply_template(path, endpoint="collector:4317")
+
+    def test_sync_existing_users_preserves_config_and_reports_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            good = root / "alice/.jiuwenswarm/config/config.yaml"
+            bad = root / "bob/.jiuwenswarm/config/config.yaml"
+            for path in (good, bad):
+                path.parent.mkdir(parents=True)
+            good.write_text(TEMPLATE, encoding="utf-8")
+            bad.write_text("models: {}\n", encoding="utf-8")
+            self.assertEqual(agentos_trace.sync_users(root, endpoint="collector:4317"), (1, 0, 1))
+            self.assertIn("session_map_scope: per_chat_bot_user", good.read_text())
+            self.assertEqual(bad.read_text(), "models: {}\n")
+            self.assertEqual(agentos_trace.sync_users(root, endpoint="collector:4317"), (0, 1, 1))
+
+    def test_current_observability_structure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("telemetry:\n  enabled: false\nobservability:\n  team:\n    enabled: false\n  agent:\n    enabled: false\n  exporter: file\n  endpoint: old:4317\n  redact_prompts: true\n", encoding="utf-8")
+            for endpoint, enabled in (("collector:4317", "true"), ("", "false")):
+                agentos_trace.apply_template(path, endpoint=endpoint)
+                rendered = path.read_text()
+                self.assertEqual(rendered.count(f"    enabled: {enabled}"), 2)
+                self.assertIn("  exporter: otlp_grpc", rendered)
+                self.assertIn("  redact_prompts: true", rendered)
 
     def test_prepared_gateway_and_user_seed_keep_the_cluster_trace_switch(self):
         spec = importlib.util.spec_from_file_location("trace_runtime", ROOT / "deploy/agent-runtime/configure.py")
@@ -106,12 +127,17 @@ class AgentOSTraceTests(unittest.TestCase):
                 template.write_text(TEMPLATE)
                 cluster = Path(directory) / "cluster.yaml"
                 cluster.write_text(json.dumps({"trace_otlp_endpoints": endpoints}))
-                runtime.apply_deployment_tracing(template, cluster)
+                users = Path(directory) / "users"
+                user = users / "alice/.jiuwenswarm/config/config.yaml"
+                user.parent.mkdir(parents=True)
+                user.write_text(TEMPLATE)
+                runtime.apply_deployment_tracing(template, cluster, users_root=users)
                 value = template.read_text()
+                self.assertEqual(user.read_text(), value)
                 if enabled is None:
                     self.assertEqual(value, TEMPLATE)
                 else:
-                    self.assertIn("trace_enabled: " + str(enabled).lower(), value)
+                    self.assertIn("  enabled: " + str(enabled).lower(), value)
                     self.assertIn("  protocol: grpc", value)
                     self.assertIn("gateway:\n  session_map_scope: per_chat_bot_user", value)
                     if enabled:

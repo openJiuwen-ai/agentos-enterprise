@@ -533,8 +533,8 @@ def preflight(settings):
         migrate_tool_environment(gateway_config(read_yaml(config), settings, config.with_name(".env")), config.with_name(".env"))
 
 
-def apply_deployment_tracing(config, deployment_config):
-    """Keep main's Gateway/new-user tracing switch in the prepared configuration."""
+def apply_deployment_tracing(config, deployment_config, *, users_root=None):
+    """Apply deployment tracing settings to Gateway and existing users."""
     if not deployment_config.is_file():
         return
     helpers = Path(__file__).resolve().parents[1] / "scripts"
@@ -545,6 +545,11 @@ def apply_deployment_tracing(config, deployment_config):
         trace["apply_template"](config, endpoint=endpoints[0] if endpoints else "")
     except (ValueError, TypeError) as exc:
         logging.warning("Gateway tracing configuration unchanged: %s", exc)
+        return
+    if users_root is not None and users_root.is_dir():
+        _, _, failed = trace["sync_users"](users_root, endpoint=endpoints[0] if endpoints else "")
+        if failed:
+            raise ValueError("Existing-user trace sync failed; fix the reported configs and retry up")
 
 
 def configure(settings):
@@ -585,7 +590,8 @@ def configure(settings):
     value["gateway"]["adx"].pop("workspace_config_template", None)
     write_yaml(config, value)
     if settings.get("profile", "standalone") == "agentos":
-        apply_deployment_tracing(config, Path(__file__).resolve().parents[1] / "config.yaml")
+        apply_deployment_tracing(config, Path(__file__).resolve().parents[1] / "config.yaml",
+                                 users_root=Path(os.environ.get("WORKSPACE_STORAGE_ROOT", "/home/agentos/.users")))
         value = read_yaml(config)
     template = write_user_template(value, settings)
     settings.setdefault("gateway", {})["agentos"] = value["gateway"]["agentos"]
