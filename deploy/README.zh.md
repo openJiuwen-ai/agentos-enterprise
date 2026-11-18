@@ -13,6 +13,8 @@ Python Gateway + Supervisor AgentServer + gVisor（runsc）工具沙箱接线、
 | `moosefs` | 分布式共享存储 | MooseFS 集群（master + chunkserver + client），单机自动跳过 |
 | `jiuwenbox` | 沙箱服务 | 每台机器同构启动 jiuwenbox-server（随 jiuwenswarm whl 安装） |
 | `etcd` | etcd 独立二进制安装 | 从发布包内置压缩包安装 etcd 3.5.24，校验 SHA256、ELF 架构及版本；无需安装元戎 wheel |
+| `workspace-storage` | workspace 存储（autofs-nfs 后端） | NFS + autofs 共享挂载 + 每节点 agentos-workspace 服务（HTTP API / watchdog / autofs 缓存） |
+| `afs` | workspace 存储（AFS 后端，`AGENTOS_STORAGE_BACKEND=afs` 时顶替 workspace-storage） | Agent DX AFS 集群（afs-meta + afs-node，systemd 托管；二进制随 `--with-afs` ADX release 分发） |
 | `agent-runtime` | Agent 分布式运行时（具体选型: Agent DX 集群） | adxctl 安装/启停（systemd 托管；install 支持 adx-release 本地目录兜底） |
 | `agent-gateway` | A2X 注册中心 | a2x-registry 后端（sqlite 存储），优先 systemd 托管，抢占 ingress VIP 的节点启动 |
 | `jiuwenswarm` | jiuwenswarm gateway + web | gateway 进程 + web 前端（whl 包已包含 gateway） |
@@ -45,6 +47,16 @@ deploy/
 │   ├── module.sh             # agent-runtime 钩子函数
 │   ├── agent_runtime_deploy.sh         # agent-runtime 部署脚本（Agent DX 安装/启停）
 │   └── adx-release/          # （可选）ADX 发布包目录，install 兜底安装源
+├── afs/
+│   ├── module.sh             # afs 钩子（up/down/install/uninstall/status；install 校验 release 包 with_afs 并补装二进制；migrate 为 no-op）
+│   ├── afs_deploy.sh         # AFS 部署脚本（install/up/down/restart/uninstall/status/clean/user-init/user-delete）
+│   └── afs.conf              # AFS 配置文件（端口/outlet 路径/迁移模式等）
+│   # 无 units/、无 templates/、无 TLS 脚本副本：unit 由 afs_deploy.sh 内联生成，
+│   # meta.toml/node.toml 与 prepare-local-tls.sh 单一来源是 ADX 包 etc/examples/afs/
+├── workspace-storage/
+│   ├── module.sh             # workspace-storage 钩子（autofs-nfs 后端）
+│   ├── deploy.sh             # agentos-workspace 服务部署（install/up/down/migrate）
+│   └── workspace_storage.conf # workspace-storage 配置文件
 ├── redis/
 │   └── module.sh             # redis 安装校验钩子（仅 install/uninstall；服务生命周期在 ../redis.sh）
 ├── agent-gateway/
@@ -60,8 +72,9 @@ deploy/
 
 核心机制：**模块注册 + 钩子函数 + 调度引擎**。
 
-1. **模块注册**：`agentos.sh` 顶部的 `MODULES` 数组声明所有模块及其部署顺序：
-   `MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")`
+1. **模块注册**：`agentos.sh` 按存储后端（`AGENTOS_STORAGE_BACKEND`，默认 `autofs-nfs`）动态选择模块数组及其部署顺序（两后端默认均不含可选的 `conch`，需要时经 `AGENTOS_MODULES` 显式加入）：
+   - `autofs-nfs`（默认）：`MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")`
+   - `afs`（须显式指定）：`MODULES=("etcd" "afs" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")`（`afs` 顶替 `workspace-storage`；两后端互斥，切换流程见下文「afs」）
    其中 `etcd`、`redis` 为**仅安装型模块**（`INSTALL_ONLY_MODULES`）：只参与 `install`/`uninstall`，`up`/`down`/`restart`/`status` 不调度（服务生命周期由 `etcd.sh` / `redis.sh` 的 `init`/`deinit` 管理）。
 2. **钩子约定**：每个模块在 `deploy/<module>/module.sh` 中实现 5 个钩子函数：
    - `<module>_up` — 启动/部署
@@ -366,6 +379,10 @@ workspace 目录通过 NFS + autofs 共享，归属记录存放在 etcd 单键�
 - `.trash` 目录与存储根同一文件系统、权限 `root 0700`，不参与 NFS 导出与孤儿目录巡检；watchdog 按 `WORKSPACE_TRASH_RETENTION` 回收过期项
 - 安装产物：`/opt/agentos/workspace-storage/`（代码）、`/etc/agentos/workspace-storage/service.env`（0600）、`/var/lib/agentos-workspace/owners.cache`（autofs 故障回落缓存）
 - 升级/回滚：升级仍走 `migrate` → `down` → `uninstall` → `install` → `init` → `up`（`migrate` 负责搬迁旧存储数据并写 etcd 归属，幂等可重跑）；`down`/`uninstall` 均保留本地数据与 etcd 归属，回滚用旧版本包重复标准流程即可
+
+#### afs
+
+AFS（OwnerFs）workspace 存储模块：`AGENTOS_STORAGE_BACKEND=afs` 时启用，顶替 `workspace-storage`（autofs + NFS）成为 workspace 后端。`install` 校验 ADX release 包 `manifest.json` 的 `with_afs` 标记（`true` 才放行），并把包内 `bin/{afs-meta,afs-node}` 装到 `${AFS_ROOT}/bin`（默认 `/opt/agentos/afs`）——逐字节比对后**内容不同才覆盖**，换新 release 包重装即完成二进制升级；包内无 AFS 载荷（离线重跑、未打 AFS 的包）时保留现有二进制并告警，首次安装则会硬失败。TLS 证书脚本不在 deploy 侧留存，直接取包内 `etc/examples/afs/prepare-local-tls.sh`。`up` 幂等重渲染 unit 与 `afs-wait-ready.sh` 后启动 `agentos-afs-meta` / `agentos-afs-node`（systemd 托管，ExecStartPre 幂等准备 outlet 目录与 egress tmpfs）；unit 内容有变化且服务已在跑时会 restart 使之生效。
 
 #### jiuwenbox
 

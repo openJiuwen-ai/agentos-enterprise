@@ -36,21 +36,41 @@ REDIS_SH="${SCRIPT_DIR}/redis.sh"
 EROFS_SH="${SCRIPT_DIR}/erofs.sh"
 
 # ===== 模块注册（按部署/安装顺序声明，down/uninstall 自动逆序） =====
-# workspace-storage（NFS + autofs）替代旧版 moosefs。
-# 注意: deploy/moosefs/ 目录保留，仅供 down/uninstall 拆旧集群时动态加载（见 _teardown_legacy_moosefs），
-# 不在 MODULES 中 —— 新部署不再安装/启动 MooseFS。
+# 存储后端二选一（AGENTOS_STORAGE_BACKEND，默认 autofs-nfs）:
+#   autofs-nfs — workspace-storage（NFS + autofs，交付基线；配置 workspace_storage.conf）
+#   afs        — AFS(OwnerFs)（deploy/afs/，配置 deploy/afs/afs.conf；显式指定才启用）
+# 注意: deploy/moosefs/ 与 deploy/workspace-storage/ 目录均保留，仅供拆旧时动态加载:
+#       moosefs   → _teardown_legacy_moosefs（历史遗留）
 # etcd 仅安装独立二进制；服务生命周期仍由 etcd.sh 的 init/deinit 管理。
-# 先安装 etcd，便于 workspace-storage 为 autofs 固化 etcdctl 路径。
+# 先安装 etcd，便于存储模块为挂载固化 etcdctl 路径。
 # redis 排在 agent-runtime 之后：redis-server 二进制由 ADX 发布包交付，
 # redis install 钩子校验其可用性（早失败）；服务生命周期由 redis.sh 的 init/deinit 管理。
-# Conch 是可选工具沙箱后端：代码、配置与发布件均保留，但默认 MODULES 不调度它，
+# Conch 是可选工具沙箱后端（两后端同样适用）：代码、配置与发布件均保留，但默认 MODULES 不调度它，
 # 因此 install/up/down/restart/status 不会安装/启动/停止 conchd。
 # 需要部署 Conch 时，用 AGENTOS_MODULES 显式加入 conch（需包内带 conch RPM/wheel）：
 #   AGENTOS_MODULES="etcd workspace-storage conch jiuwenbox agent-runtime redis agent-gateway jiuwenswarm" ./agentos.sh install
 # 下面根据最终 MODULES 自动派生 AGENTOS_CONCH_MODULE（内部变量，不是用户开关）：
 #   - 不含 conch：ADX 生成配置时裁掉 conch class/socket，启动不连接 conchd；
 #   - 含 conch：恢复原有 Conch 接线与部署。
-MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")
+case "${AGENTOS_STORAGE_BACKEND:-autofs-nfs}" in
+    afs)        MODULES=("etcd" "afs" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm") ;;
+    autofs-nfs) MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm") ;;
+    *)
+        echo "❌ Invalid AGENTOS_STORAGE_BACKEND: ${AGENTOS_STORAGE_BACKEND} (afs/autofs-nfs)" >&2
+        exit 1
+        ;;
+esac
+
+# ===== install 阶段顺序（与 up 不同，仅在 afs 后端分离）=====
+# up 要求存储先于消费方：/home/agentos/users 的名字层没就绪，agent-runtime 枚举用户为空。
+# install 相反——AFS 的 TOML 模板与二进制随 adx-release 交付，必须先由 agent-runtime
+# 解包到 ${ADX_PACKAGE_DIR}/etc/examples/afs，afs 的 install 才取得到模板；
+# 顺序反了会在渲染阶段直接失败（模板缺失）。
+# redis 同样依赖 agent-runtime 解包（redis-server 由 ADX 发布包交付），位置不变。
+INSTALL_MODULES=("${MODULES[@]}")
+if [ "${AGENTOS_STORAGE_BACKEND:-autofs-nfs}" = "afs" ]; then
+    INSTALL_MODULES=("etcd" "jiuwenbox" "agent-runtime" "afs" "redis" "agent-gateway" "jiuwenswarm")
+fi
 
 # ===== 仅安装型模块（无服务生命周期，up/down/restart/status 不调度） =====
 INSTALL_ONLY_MODULES=("etcd" "redis")
@@ -61,6 +81,8 @@ INSTALL_ONLY_MODULES=("etcd" "redis")
 # 未设置时使用上面的默认全集；显式加入 conch 即可恢复 Conch 部署。
 if [ -n "${AGENTOS_MODULES:-}" ]; then
     read -r -a MODULES <<< "${AGENTOS_MODULES}"
+    # 显式裁剪时不再区分阶段：用户给的顺序同时用于 install 与 up
+    INSTALL_MODULES=("${MODULES[@]}")
 fi
 
 # 内部派生：Conch 接线是否参与本次部署。由最终模块列表决定，不新增用户开关。
@@ -149,10 +171,11 @@ load_modules() {
 
 # ===== 反转数组（用于 down/uninstall 逆序） =====
 reverse_modules() {
+    local -n _src="${1:-MODULES}"
     local reversed=()
     local i
-    for ((i=${#MODULES[@]}-1; i>=0; i--)); do
-        reversed+=("${MODULES[$i]}")
+    for ((i=${#_src[@]}-1; i>=0; i--)); do
+        reversed+=("${_src[$i]}")
     done
     echo "${reversed[@]}"
 }
@@ -178,8 +201,13 @@ _module_has_phase() {
 modules_for_hook() {
     local hook="$1"
     local module_list
-    if [ "${hook}" = "down" ] || [ "${hook}" = "uninstall" ]; then
-        module_list="$(reverse_modules)"
+    if [ "${hook}" = "install" ]; then
+        module_list="${INSTALL_MODULES[*]}"
+    elif [ "${hook}" = "uninstall" ]; then
+        # 逆序拆：install 用哪个顺序建立依赖，就按它的逆序清理
+        module_list="$(reverse_modules INSTALL_MODULES)"
+    elif [ "${hook}" = "down" ]; then
+        module_list="$(reverse_modules MODULES)"
     else
         module_list="${MODULES[*]}"
     fi
@@ -485,7 +513,7 @@ deploy_init() {
 }
 
 # ===== deinit: 停 etcd + redis + 删 unit（保留数据；与 init 互逆，顺序逆序） =====
-# 仅停服务、删 unit，保留 /var/lib/agentos/etcd 与 /var/lib/agentos/redis 数据，便于 restart。
+# 仅停服务、删deploy_create_user unit，保留 /var/lib/agentos/etcd 与 /var/lib/agentos/redis 数据，便于 restart。
 # 彻底清数据仅由显式 ./etcd.sh clean / ./redis.sh clean 完成。
 deploy_deinit() {
     echo ""
@@ -823,8 +851,10 @@ Commands (Required):
   status      查询全部组件运行状态（只读探测，不启停服务；含 etcd + redis + MODULES）
   restart     重启全部应用组件（先 down 再 up；不含 init/deinit）
   migrate     数据迁移（须先于 down 执行，且必须在新安装包目录中执行）
-              从 config.yaml 的 cluster_nodes 取节点 → HRW 归属 → rsync 本节点归属用户
-              → 写 etcd 归属记录（一次完成，幂等可重跑）
+              从 config.yaml 的 cluster_nodes 取节点 → HRW 归属
+              → rsync 本节点归属用户 → 写 etcd 归属记录（一次完成，幂等可重跑）
+              AFS 后端不参与数据搬迁：已有目录由 afs-node 启动扫描原地认领
+              （[ownerfs] adopt_on_startup，零拷贝），本命令只跑 agent-runtime 配置迁移
   create-user <username> [--force]
               在 /home/agentos/users/<username> 下创建用户家目录并初始化 .jiuwenswarm
               - 创建家目录（0700）和 workspace（0700）
@@ -847,14 +877,22 @@ etcd / redis 数据清理（独立操作，需交互确认；-y 跳过确认）:
   适用场景: 拓扑变更（增减节点）、数据损坏修复、全新 re-bootstrap
 
 Config:
-  moosefs     配置文件: deploy/moosefs/moosefs.conf (端口/目录/副本数/systemd 开关等)
-              默认部署分布式文件系统，通过 MOOSEFS_ENABLED=no 关闭
-              master IP 从 deploy/config.yaml 的 master_nodes 第一个 IP 获取
-              支持 openEuler (RPM) 和 Ubuntu (DEB)，自动检测包管理器
-              systemd 可选: MOOSEFS_USE_SYSTEMD=auto/yes/no (默认 auto 自动检测)
-              角色判断: 本机 IP 匹配 MOOSEFS_MASTER_HOST 为 master，否则为 agent
-              生命周期: install(配置+unit生成) → up(enable --now) → down(stop) → uninstall(停止+清理)
-              数据保留: MOOSEFS_PURGE_DATA=no(默认保留数据,重新install+up可恢复) / yes(彻底清理)
+  storage      存储后端二选一: AGENTOS_STORAGE_BACKEND=autofs-nfs / afs
+              （默认 autofs-nfs=交付基线；切到 AFS 需显式 AGENTOS_STORAGE_BACKEND=afs）
+              autofs-nfs — workspace-storage（NFS + autofs；deploy/workspace-storage/workspace_storage.conf:
+                           存储根 /home/agentos/.users、访问根 /home/agentos/users、
+                           etcd 归属前缀 /agent-runtime/workspace）
+                           生命周期: install → up → down → uninstall（保留数据与 etcd 归属）
+              afs        — AFS(OwnerFs) workspace 存储（deploy/afs/afs.conf:
+                           端口 meta 7400/7401 node 7500/7501 workspace-api 127.0.0.1:18889、
+                           egress 根锁定 /home/agentos/users、NFS pool 导出）
+                           生命周期: install(配置+TLS+unit) → up(meta+node+readiness 门禁)
+                           → down → uninstall(保留 data/tls/bin)
+              AFS 不再提供 migrate/rollback：已有目录由 afs-node 启动扫描原地认领
+              （[ownerfs] adopt_on_startup，零拷贝），部署面不搬运数据。
+              切换后端统一走: down → uninstall → 改 AGENTOS_STORAGE_BACKEND → install → up
+              （两个后端各自闭环：AFS 的 up 会卸载 egress 残留层后重挂 tmpfs，
+                互不依赖对方的探测；切换前按上述流程先停旧后端即可）
   jiuwenbox   配置文件: deploy/jiuwenbox/default-policy.yaml (含 extensions 目录占位符)
               jiuwenbox-server 随 jiuwenswarm whl 包安装，无需单独 install
   etcd        install 按本机 x86_64/aarch64 从 OBS 下载 etcd 3.5.24，校验 SHA256 和架构
