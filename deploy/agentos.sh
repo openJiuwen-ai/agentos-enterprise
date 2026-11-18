@@ -30,9 +30,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENTOS_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# ===== etcd / redis 独立脚本（init/deinit 委托给它们，agentos.sh 不重复实现） =====
+# ===== etcd / redis / erofs 独立脚本（生命周期委托给它们，agentos.sh 不重复实现） =====
 ETCD_SH="${SCRIPT_DIR}/etcd.sh"
 REDIS_SH="${SCRIPT_DIR}/redis.sh"
+EROFS_SH="${SCRIPT_DIR}/erofs.sh"
 
 # ===== 模块注册（按部署/安装顺序声明，down/uninstall 自动逆序） =====
 # workspace-storage（NFS + autofs）替代旧版 moosefs。
@@ -42,7 +43,14 @@ REDIS_SH="${SCRIPT_DIR}/redis.sh"
 # 先安装 etcd，便于 workspace-storage 为 autofs 固化 etcdctl 路径。
 # redis 排在 agent-runtime 之后：redis-server 二进制由 ADX 发布包交付，
 # redis install 钩子校验其可用性（早失败）；服务生命周期由 redis.sh 的 init/deinit 管理。
-MODULES=("etcd" "workspace-storage" "conch" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")
+# Conch 是可选工具沙箱后端：代码、配置与发布件均保留，但默认 MODULES 不调度它，
+# 因此 install/up/down/restart/status 不会安装/启动/停止 conchd。
+# 需要部署 Conch 时，用 AGENTOS_MODULES 显式加入 conch（需包内带 conch RPM/wheel）：
+#   AGENTOS_MODULES="etcd workspace-storage conch jiuwenbox agent-runtime redis agent-gateway jiuwenswarm" ./agentos.sh install
+# 下面根据最终 MODULES 自动派生 AGENTOS_CONCH_MODULE（内部变量，不是用户开关）：
+#   - 不含 conch：ADX 生成配置时裁掉 conch class/socket，启动不连接 conchd；
+#   - 含 conch：恢复原有 Conch 接线与部署。
+MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")
 
 # ===== 仅安装型模块（无服务生命周期，up/down/restart/status 不调度） =====
 INSTALL_ONLY_MODULES=("etcd" "redis")
@@ -50,10 +58,18 @@ INSTALL_ONLY_MODULES=("etcd" "redis")
 # ===== 模块集覆盖（可选） =====
 # AGENTOS_MODULES 以空格分隔覆盖默认 MODULES（裁剪部署/容器化模拟等场景），如：
 #   AGENTOS_MODULES="agent-runtime" ./agentos.sh up
-# 未设置时使用上面的默认全集。
+# 未设置时使用上面的默认全集；显式加入 conch 即可恢复 Conch 部署。
 if [ -n "${AGENTOS_MODULES:-}" ]; then
     read -r -a MODULES <<< "${AGENTOS_MODULES}"
 fi
+
+# 内部派生：Conch 接线是否参与本次部署。由最终模块列表决定，不新增用户开关。
+AGENTOS_CONCH_MODULE=0
+for _agentos_module in "${MODULES[@]}"; do
+    [ "${_agentos_module}" = "conch" ] && AGENTOS_CONCH_MODULE=1
+done
+export AGENTOS_CONCH_MODULE
+unset _agentos_module
 
 # ===== 全局环境变量 =====
 export PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
@@ -445,6 +461,8 @@ deploy_up() {
     ensure_agentos_user
     ensure_etcd_ready
     ensure_redis_ready
+    [ -r "${EROFS_SH}" ] || error "erofs script not found or not readable: ${EROFS_SH}"
+    bash "${EROFS_SH}" up || error "EROFS module is not available; run './agentos.sh install' first"
     info "Modules: $(modules_for_hook up)"
     run_hooks up
     _print_summary up
@@ -500,6 +518,8 @@ deploy_install() {
     info "Starting full install (local only)"
     info "Modules: ${MODULES[*]}"
     info "Python version: ${PYTHON_VERSION}"
+    [ -r "${EROFS_SH}" ] || error "erofs script not found or not readable: ${EROFS_SH}"
+    bash "${EROFS_SH}" install || error "EROFS artifact installation failed"
     # 先把 deploy 目录持久化到 ~/.agentos/deploy，避免安装包/解压目录被删除后无法 up/down
     _persist_deploy_dir
     run_hooks install
@@ -513,6 +533,9 @@ deploy_uninstall() {
     info "Python version: ${PYTHON_VERSION}"
     run_hooks uninstall
     _teardown_legacy_moosefs uninstall
+    if [ -r "${EROFS_SH}" ]; then
+        bash "${EROFS_SH}" uninstall || warning "EROFS cleanup reported errors; continuing"
+    fi
     # etcd / redis 是持久基础设施：uninstall 不停服务（用 deinit）；仍运行时给出提醒
     if command -v systemctl >/dev/null 2>&1; then
         if systemctl is-active --quiet agentos-etcd 2>/dev/null; then
@@ -842,7 +865,13 @@ Config:
               排在其后安装）；自备 redis 设 REDIS_BIN_PATH
               uninstall 保留 redis 数据/口令/服务；停服务使用 deinit
   agent-runtime  固定配置: deploy/agent-runtime/defaults/*.yaml
-               Agent DX + Jiuwenbox Supervisor/Conch；动态绑定由发布包自动准备
+               Agent DX + Jiuwenbox Supervisor / gVisor（runsc）；
+               Conch 代码/配置保留，但默认不由 MODULES 调度；动态绑定由发布包自动准备
+  conch       可选工具沙箱后端：代码、配置与发布件保留，默认不在 MODULES 中。
+              需要时用 AGENTOS_MODULES 显式加入 conch（需包内带 conch RPM/wheel）。
+              ADX 配置按 MODULES 是否包含 conch 自动裁剪/保留 conch class/socket；
+              不含 conch 时启动不连接 conchd。默认 down/uninstall 也不处理已存在的
+              conch；需停止/卸载时用 AGENTOS_MODULES 显式包含 conch，或使用旧包。
   jiuwenswarm 配置文件: deploy/jiuwenswarm/.env.custom (基于 .env.example)
   whl 包来源  install 时从 agentos 根目录（deploy 的同级目录）读取
 

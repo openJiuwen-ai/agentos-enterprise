@@ -2,7 +2,7 @@
 
 ## 简介
 
-Python Gateway + Supervisor AgentServer + Conch 工具沙箱接线、发布包 SDK 安装及配置步骤，见 [ADX 部署接线](agent-runtime/README.adx.zh.md)。
+Python Gateway + Supervisor AgentServer + gVisor（runsc）工具沙箱接线、发布包 SDK 安装及配置步骤，见 [ADX 部署接线](agent-runtime/README.adx.zh.md)。
 
 本目录是 agentos 的统一部署入口，采用**可插拔架构**编排各组件的安装与部署。
 
@@ -14,7 +14,6 @@ Python Gateway + Supervisor AgentServer + Conch 工具沙箱接线、发布包 S
 | `jiuwenbox` | 沙箱服务 | 每台机器同构启动 jiuwenbox-server（随 jiuwenswarm whl 安装） |
 | `etcd` | etcd 独立二进制安装 | 从发布包内置压缩包安装 etcd 3.5.24，校验 SHA256、ELF 架构及版本；无需安装元戎 wheel |
 | `agent-runtime` | Agent 分布式运行时（具体选型: Agent DX 集群） | adxctl 安装/启停（systemd 托管；install 支持 adx-release 本地目录兜底） |
-| `conch` | Conch 沙箱引擎 | RPM 安装 erofs-utils、StratoVirt、Conch |
 | `agent-gateway` | A2X 注册中心 | a2x-registry 后端（sqlite 存储），优先 systemd 托管，抢占 ingress VIP 的节点启动 |
 | `jiuwenswarm` | jiuwenswarm gateway + web | gateway 进程 + web 前端（whl 包已包含 gateway） |
 
@@ -23,6 +22,7 @@ Python Gateway + Supervisor AgentServer + Conch 工具沙箱接线、发布包 S
 ```
 deploy/
 ├── agentos.sh                # agentos 部署总脚本（不含模块特有逻辑）
+├── erofs.sh                  # EROFS 独立脚本（OBS/包内产物、加载）
 ├── etcd.sh                   # etcd 独立启停脚本（init/deinit 委托给它）
 ├── redis.sh                  # 外置 redis 独立启停脚本（init/deinit 委托给它）
 ├── check-ingress-master.sh   # ingress VIP 持有检查（agent-gateway systemd ExecStartPre）
@@ -47,9 +47,6 @@ deploy/
 │   └── adx-release/          # （可选）ADX 发布包目录，install 兜底安装源
 ├── redis/
 │   └── module.sh             # redis 安装校验钩子（仅 install/uninstall；服务生命周期在 ../redis.sh）
-├── conch/
-│   ├── module.sh             # conch 钩子函数
-│   └── conch_deploy.sh       # Conch 部署脚本
 ├── agent-gateway/
 │   └── module.sh             # agent-gateway 钩子（A2X 注册中心，systemd/nohup 双模式）
 ├── jiuwenswarm/
@@ -64,7 +61,7 @@ deploy/
 核心机制：**模块注册 + 钩子函数 + 调度引擎**。
 
 1. **模块注册**：`agentos.sh` 顶部的 `MODULES` 数组声明所有模块及其部署顺序：
-   `MODULES=("etcd" "workspace-storage" "conch" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")`
+   `MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")`
    其中 `etcd`、`redis` 为**仅安装型模块**（`INSTALL_ONLY_MODULES`）：只参与 `install`/`uninstall`，`up`/`down`/`restart`/`status` 不调度（服务生命周期由 `etcd.sh` / `redis.sh` 的 `init`/`deinit` 管理）。
 2. **钩子约定**：每个模块在 `deploy/<module>/module.sh` 中实现 5 个钩子函数：
    - `<module>_up` — 启动/部署
@@ -495,12 +492,16 @@ whl 包来源：`install` 时从 agentos 根目录匹配 `a2x_registry-*-py3-non
 #### jiuwenswarm
 
 通过 `module.sh → deploy.sh → agentos_handler.sh` 部署 Python Gateway/Web；最后一层由 OS 提供，Swarm 原有 Gateway/Web handler 保持原版。部署脚本来自 Swarm archive 的 `deploy/yuanrong`；本仓库负责本机 wheel 安装、状态查询、卸载及 ADX 配置准备。Gateway 通过本节点 ADX HTTPS Ingress，AgentServer 使用 Supervisor，
-工具使用 Conch；配置和凭据由发布包脚本闭环准备。
+工具使用 gVisor（runsc）；配置和凭据由发布包脚本闭环准备。
 
 `deploy/jiuwenswarm/.env.custom` 仅保留可选的模型业务参数：
 `MODEL_PROVIDER`、`MODEL_NAME`、`API_BASE`、`API_KEY`，以及 `EMBED_MODEL`、
 `EMBED_API_BASE`、`EMBED_API_KEY`。已有模型、IAM、会话与 workspace 数据保留。
-Conch 模板沿用 Conch 模块的在线/离线安装流程。
+Conch 代码、配置与发布件保留，但默认 `MODULES` 不调度 conch；需要时用 `AGENTOS_MODULES`
+显式加入 `conch`。`agentos.sh` 会由最终模块列表派生 `AGENTOS_CONCH_MODULE`（内部变量，
+不是用户开关），ADX 配置据此自动裁剪/保留 conch class/socket；不含 conch 时启动不连接 conchd。
+默认 `down/uninstall` 也不会停止/卸载已存在的 conch；如需处理，用
+`AGENTOS_MODULES="... conch ..."` 显式调度，或使用旧包。
 
 #### whl 包来源
 
@@ -567,7 +568,7 @@ mymodule_status() {
 编辑 `agentos.sh` 顶部的 `MODULES` 数组，按部署顺序添加模块名：
 
 ```bash
-MODULES=("moosefs" "jiuwenbox" "agent-runtime" "conch" "agent-gateway" "jiuwenswarm" "mymodule")
+MODULES=("moosefs" "jiuwenbox" "agent-runtime" "agent-gateway" "jiuwenswarm" "mymodule")
 ```
 
 ### 完成
@@ -612,7 +613,7 @@ MODULES=("moosefs" "jiuwenbox" "agent-runtime" "conch" "agent-gateway" "jiuwensw
 
 ## Python Gateway + ADX 发布包部署
 
-统一入口默认采用 ADX Gateway，参数、包内 Core/Swarm/SDK 安装、Supervisor/Conch
+统一入口默认采用 ADX Gateway，参数、包内 Core/Swarm/SDK 安装、Supervisor/gVisor（runsc）
 接线与服务生命周期见 [ADX 部署接线](agent-runtime/README.adx.zh.md#发布包统一部署入口)。
 启动等待实际 ADX API 就绪；不再等待 YuanRong frontend 的默认 8888 端口。
 

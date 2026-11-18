@@ -45,19 +45,30 @@ cluster:
 | `GATEWAY_HOST` / `GATEWAY_PORT` | gateway listen address / port (default port 19001; binds to the ingress VIP automatically when host is empty) |
 | `WEB_PORT` / `WEB_ENABLED` | web frontend port (default 19000) / whether it starts with `up` |
 | `ETCD_ENDPOINTS` | Cron etcd endpoints; left empty it is derived from `config.yaml` |
-| `SANDBOX_TYPE` / `TOOL_SANDBOX_*` | sandbox type and tool sandbox configuration |
 
-### Tool sandbox images must be pulled beforehand
+> `SANDBOX_TYPE` / `TOOL_SANDBOX_*` are no longer read from `.env.custom`; ADX owns
+> tool configuration through `deploy/agent-runtime/defaults/settings.yaml` and the
+> `agent-runtime` prepare-env step.
 
-Neither `install` nor `up` pulls the image named by `TOOL_SANDBOX_IMAGE` (the image address is whatever is configured in `deploy/jiuwenswarm/.env.custom`). With `TOOL_SANDBOX_ENABLE=true`, `install` checks local docker availability and image presence, and aborts the installation if either fails:
+### Tool sandbox images are prepared by the deployment
+
+The default tool image is fixed at
+`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`. During `agentos.sh up`,
+prepare-env:
+
+1. loads the fixed offline tar `/root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar` when present;
+2. inspects the local Docker image;
+3. always runs `docker pull` when absent;
+4. exports a Local rootfs and registers it for sandboxd/runsc.
+
+The reference is owned by the deployment and is not overridable by environment variables.
+Agent/user images still never pull and must already exist locally.
 
 ```bash
-# replace <TOOL_SANDBOX_IMAGE> with the image address configured in .env.custom
-docker pull <TOOL_SANDBOX_IMAGE>
-
 # offline: export on a connected machine -> transfer -> import on the target host
-docker save -o sandbox-image.tar <TOOL_SANDBOX_IMAGE>
-docker load -i sandbox-image.tar
+docker save -o tool-sandbox_latest.tar \
+  swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest
+docker load -i tool-sandbox_latest.tar
 ```
 
 ## agent SSH key pair

@@ -8,15 +8,16 @@ set -euo pipefail
 # 支持 openEuler 22.03/24.03 和 Ubuntu 22.04/24.04（x86_64 / aarch64）
 # 安装内容:
 #   1. 系统包: python3.11、iproute/iproute2 (ip)、iptables、curl、fuse3、bwrap、jq、
-#              NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server)、autofs、
-#              Conch 沙箱依赖（virtiofsd/qemu/erofs-utils 等，随 OS 版本不同）
-#   2. MooseFS: moosefs-master、moosefs-chunkserver、moosefs-client
-#   3. Python 依赖: deploy/requirements.txt
+#              kmod、containernetworking-plugins、procps、
+#              NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server)、autofs
+#   2. Conch 依赖（默认保留安装；可用 --skip-conch-deps 跳过）
+#   3. MooseFS: moosefs-master、moosefs-chunkserver、moosefs-client
+#   4. Python 依赖: deploy/requirements.txt
 #
 # 用法:
-#   ./install_deps.sh                  # 安装全部依赖
+#   ./install_deps.sh                  # 安装全部依赖（Conch 默认关闭）
 #   ./install_deps.sh --skip-system    # 跳过系统包
-#   ./install_deps.sh --skip-conch-deps # 跳过 Conch 沙箱依赖
+#   ./install_deps.sh --skip-conch-deps # 跳过 Conch 可选依赖
 #   ./install_deps.sh --skip-moosefs  # 跳过 MooseFS
 #   ./install_deps.sh --skip-python   # 跳过 Python 依赖
 #
@@ -33,9 +34,11 @@ REQUIREMENTS_FILE="${SCRIPT_DIR}/requirements.txt"
 
 # ===== 开关 =====
 SKIP_SYSTEM=0
-SKIP_CONCH_DEPS=0
 SKIP_MOOSEFS=0
 SKIP_PYTHON=0
+# Conch 是可选的工具沙箱后端；默认部署不调度 conch 模块，但 Conch 原有
+# 系统依赖安装逻辑保留，可用 --skip-conch-deps 显式跳过。
+SKIP_CONCH_DEPS=0
 
 # ===== 日志函数 =====
 info()    { echo -e "\033[36m=== $@ ===\033[0m"; }
@@ -169,6 +172,8 @@ install_system_openeuler() {
         "iproute"
         "bubblewrap"
         "jq"
+        "kmod"
+        "containernetworking-plugins"
         "nfs-utils"
         "rpcbind"
         "autofs"
@@ -185,7 +190,7 @@ install_system_openeuler() {
     dnf install -y --disablerepo=moosefs "${pkgs[@]}" || {
         # bubblewrap 可能在某些 openEuler 版本中叫 bwrap
         warning "dnf install failed, trying with bwrap instead of bubblewrap"
-        pkgs=("iptables" "ipset" "curl" "fuse3" "iproute" "bwrap" "jq" "nfs-utils" "rpcbind" "autofs")
+        pkgs=("iptables" "ipset" "curl" "fuse3" "iproute" "bwrap" "jq" "kmod" "containernetworking-plugins" "nfs-utils" "rpcbind" "autofs")
         dnf install -y --disablerepo=moosefs "${pkgs[@]}" || error "Failed to install system packages via dnf"
     }
 
@@ -268,6 +273,9 @@ install_system_ubuntu() {
         "bubblewrap"
         "jq"
         "gpg"
+        "kmod"
+        "containernetworking-plugins"
+        "procps"
         "nfs-kernel-server"
         "nfs-common"
         "rpcbind"
@@ -281,7 +289,7 @@ install_system_ubuntu() {
     apt-get install -y "${pkgs[@]}" || {
         # bubblewrap 可能在某些 Ubuntu 版本中叫 bwrap
         warning "apt install failed, trying with bwrap instead of bubblewrap"
-        pkgs=("iptables" "ipset" "curl" "fuse3" "iproute2" "bwrap" "jq" "gpg" "nfs-kernel-server" "nfs-common" "rpcbind" "autofs")
+        pkgs=("iptables" "ipset" "curl" "fuse3" "iproute2" "bwrap" "jq" "gpg" "kmod" "containernetworking-plugins" "procps" "nfs-kernel-server" "nfs-common" "rpcbind" "autofs")
         apt-get install -y "${pkgs[@]}" || error "Failed to install system packages via apt"
     }
 
@@ -521,20 +529,20 @@ Usage: ./$(basename "$0") [OPTIONS]
 
 安装内容:
   1. 系统包:   python${PYTHON_VERSION}、ip (iproute/iproute2)、iptables、curl、fuse3、bwrap、jq、
-               NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server + nfs-common)、autofs、
-               Conch 沙箱依赖（virtiofsd/qemu/erofs-utils 等，随 OS 版本不同）
+               kmod、containernetworking-plugins、procps、
+               NFS (openEuler: nfs-utils / Ubuntu: nfs-kernel-server + nfs-common)、autofs
   2. MooseFS:  moosefs-master、moosefs-chunkserver、moosefs-client
   3. Python:   deploy/requirements.txt 中的全部依赖
 
 Options:
   --skip-system      跳过系统包安装
-  --skip-conch-deps  跳过 Conch 沙箱依赖安装
+  --skip-conch-deps  跳过 Conch 可选依赖安装
   --skip-moosefs    跳过 MooseFS 安装
   --skip-python      跳过 Python 依赖安装
   -h, --help         显示帮助信息
 
 Environment Variables:
-  PYTHON_VERSION  Python 版本号（默认: 3.11）
+  PYTHON_VERSION           Python 版本号（默认: 3.11）
 
 Examples:
   # 安装全部依赖
@@ -620,9 +628,6 @@ main() {
     echo "  Python:     ${PYTHON_VERSION}"
     if [ "${SKIP_SYSTEM}" -eq 0 ]; then
         echo "  System pkgs: installed"
-    fi
-    if [ "${SKIP_SYSTEM}" -eq 0 ] && [ "${SKIP_CONCH_DEPS}" -eq 0 ]; then
-        echo "  Conch deps:  installed"
     fi
     if [ "${SKIP_MOOSEFS}" -eq 0 ]; then
         echo "  MooseFS:    installed"

@@ -3,7 +3,9 @@
 set -e
 
 # AgentOS b050 交付产物打包脚本。详细说明（产物清单/archive 结构/路径规则/重构要点/依赖）见 README-v2.zh.md。
-# daily/release 共用 OBS archive.tar.gz 获取 jiuwenswarm/agent-dx/agent-protocol/conch，client 包不区分架构（含全平台 jiuwenswarm_tui），server 包按 ${ARCH} 打。
+# daily/release 共用 OBS archive.tar.gz 获取 jiuwenswarm/agent-dx/agent-protocol，client 包不区分架构（含全平台 jiuwenswarm_tui），server 包按 ${ARCH} 打。
+# Conch 代码/脚本与 RPM 随 server 包保留；默认 MODULES 不调度 conch，需要时用 AGENTOS_MODULES 显式启用。
+# EROFS 作为独立产物打入 server 包的 erofs/<variant>/erofs.ko；默认从 Agent-DX OBS erofs.tar.gz 获取。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -319,6 +321,7 @@ build_conch() {
 
   # 下载 archive.tar.gz 到带时间戳的临时目录解压（与 build_agent_dx/build_jiuwenswarm 同模式）
   # conch 为沙箱相关模块，产物为 rpm：archive/<arch>/*.rpm（平台相关）+ archive/*.rpm（平台无关 none）
+  # 同时可作为 EROFS 离线/联调来源；EROFS 独立产物由 build_erofs 生成。
   local timestamp tmp_dir archive_url
   timestamp="$(date +%Y%m%d%H%M%S)"
   tmp_dir="${BUILD_DIR}/tmp_conch_${timestamp}"
@@ -341,6 +344,30 @@ build_conch() {
     echo "error: ${ARCH} directory not found in ${CONCH_ARCHIVE_ROOT}" >&2
     return 1
   fi
+}
+
+build_erofs() {
+  echo "==> build_erofs (${ARCH})"
+
+  local dest="${BUILD_DIR}/erofs"
+  local -a args=(--dest "${dest}")
+  rm -rf "${dest}"
+  mkdir -p "${dest}"
+
+  # 默认使用 erofs.sh 的 OBS 地址；显式提供 conch archive 时优先用于离线/测试。
+  if [[ -n "${CONCH_ARCHIVE_ROOT}" && -d "${CONCH_ARCHIVE_ROOT}/${ARCH}" ]]; then
+    args+=(--from-dir "${CONCH_ARCHIVE_ROOT}/${ARCH}")
+  fi
+
+  if ! bash "${DEPLOY_DIR}/erofs.sh" fetch "${args[@]}"; then
+    if [[ -n "${CONCH_ARCHIVE_ROOT}" && -d "${CONCH_ARCHIVE_ROOT}/${ARCH}" ]]; then
+      echo "warning: EROFS OBS/archive unavailable; falling back to conch archive for validation" >&2
+      bash "${DEPLOY_DIR}/erofs.sh" fetch --dest "${dest}" --from-dir "${CONCH_ARCHIVE_ROOT}/${ARCH}" || return 1
+    else
+      return 1
+    fi
+  fi
+  echo "  erofs artifact staged: ${dest}"
 }
 
 build_credential_router() {
@@ -500,6 +527,14 @@ pack() {
     cp -a "${erofs_ko_dir}" "${server_staging}/"
   done
 
+  # EROFS：独立目录，供 ADX bootstrap 使用；与 Conch 根目录 erofs.ko 并存。
+  if [[ ! -d "${BUILD_DIR}/erofs" ]]; then
+    echo "error: EROFS staging directory not found: ${BUILD_DIR}/erofs" >&2
+    return 1
+  fi
+  mkdir -p "${server_staging}/erofs"
+  cp -a "${BUILD_DIR}/erofs/." "${server_staging}/erofs/"
+
   # credential_router：平台相关 credential-router 开头的 .tar.gz 从 credential_router archive ${ARCH} 目录取（build_credential_router 已校验目录），打入 server 包根目录与各 whl/rpm 同级
   cp -p "${CREDENTIAL_ROUTER_ARCHIVE_ROOT}/${ARCH}"/credential-router*.tar.gz "${server_staging}/"
   # 平台无关（none）credential-router*.tar.gz 在 archive 根目录，如有则一并打入（当前 credential_router archive 无 none tar.gz，跳过）
@@ -619,6 +654,7 @@ main() {
   build_agent_gateway                  # 下载并解压 OBS archive.tar.gz（a2x_registry wheel）
   build_a4p_wheels                      # 构建 A4P 并下载目标架构的离线依赖
   build_conch                          # 下载并解压 OBS archive.tar.gz（conch 沙箱模块 rpm）
+  build_erofs                          # 生成独立的 server 包 erofs/<variant>/erofs.ko
   build_credential_router             # 下载并解压 OBS archive.tar.gz（credential-router 平台相关 tar.gz）
   pack                                 # 组装 client/server 两个 tgz 产物
   collect_buildinfo                    # 收集各子模块 buildinfo + agent-os 主仓 buildinfo(CI 生成) 一起打包到 AgentOS-Buildinfo.tgz

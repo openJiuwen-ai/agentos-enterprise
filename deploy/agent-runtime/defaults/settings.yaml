@@ -35,9 +35,19 @@ runtime:
   # Existing gateway/workspace restart_policy overrides remain effective.
   # agent_restart_policy: {maxAttempts: 3, initialBackoffSeconds: 1, maxBackoffSeconds: 30}
   # tool_restart_policy: {maxAttempts: 3, initialBackoffSeconds: 1, maxBackoffSeconds: 30}
-  # Default above; both backends remain available for historical workspaces.
+  # Conch code/config/artifacts are retained. agentos.sh derives
+  # AGENTOS_CONCH_MODULE from the final MODULES list; when conch is not in
+  # MODULES, configure/runsc-node-config strip conch class/socket and backend
+  # defaults so ADX startup never probes conchd.
   tool_runtimes: [runsc, conch]
   conch_image: agentos-tools:v1
+  # Tool sandbox Docker image. Fixed deployment-owned reference; when it is
+  # missing locally, the deployment always allows a registry pull.
+  tool_image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest
+  # Fixed offline archive: /root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar
+  # Optional overrides for the fixed offline archive (absolute directory).
+  # tool_image_dir: /root/resources/MindAgent-image
+  # tool_image_tar: tool-sandbox_latest.tar
   local_image_bindings_file: ${ADX_LOCAL_IMAGE_BINDINGS_FILE}
   # Optional offline Docker archive paths, keyed by their original image reference.
   # local_images:

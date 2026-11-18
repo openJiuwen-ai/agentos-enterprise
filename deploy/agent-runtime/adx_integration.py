@@ -61,6 +61,18 @@ def deployment_config_path(deploy):
 DEFAULTS = Path(__file__).with_name("defaults")
 
 
+def conch_module_enabled(environment=None):
+    """Internal deployment signal derived from MODULES; not a user switch.
+
+    Absent means a standalone/legacy invocation; keep the original Conch wiring.
+    agentos.sh always exports 0 or 1 from the final MODULES list.
+    """
+    values = environment if environment is not None else os.environ
+    if "AGENTOS_CONCH_MODULE" not in values:
+        return True
+    return str(values["AGENTOS_CONCH_MODULE"]).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _network_module():
     spec = importlib.util.spec_from_file_location('agentos_deployment_network', Path(__file__).with_name('network.py'))
     module = importlib.util.module_from_spec(spec)
@@ -171,6 +183,30 @@ def literal_deployment_value(value):
     return value
 
 
+def strip_conch_backend(config):
+    """Remove Conch runtime wiring when the conch module is not in MODULES."""
+    adxlet = config.get("service_overrides", {}).get("adxlet", {}).get("config", {})
+    if not isinstance(adxlet, dict):
+        return config
+    jiuwenbox = adxlet.get("jiuwenbox")
+    if isinstance(jiuwenbox, dict):
+        jiuwenbox.pop("conch_socket", None)
+        classes = jiuwenbox.get("classes")
+        if isinstance(classes, dict):
+            classes.pop("conch", None)
+    return config
+
+
+def write_default_config(output, profile):
+    """Render a fixed profile, stripping Conch when the module is not deployed."""
+    if profile not in ("node", "ingress", "coordinator"):
+        raise ValueError("unsupported ADX profile: " + str(profile))
+    config = read_yaml(DEFAULTS / f"{profile}.yaml")
+    if profile == "node" and not conch_module_enabled():
+        strip_conch_backend(config)
+    write_yaml(output, config)
+
+
 def write_runsc_node_config(output, socket):
     if not socket.is_absolute():
         raise ValueError("runsc requires an absolute Unix socket path")
@@ -193,6 +229,8 @@ def write_runsc_node_config(output, socket):
             for name in tuple(classes):
                 if name not in selected:
                     classes.pop(name)
+            if "conch" not in selected:
+                adxlet["jiuwenbox"].pop("conch_socket", None)
         storage = runtime.get("checkpoint_storage")
         if storage is not None:
             if not isinstance(storage, dict):
@@ -561,7 +599,7 @@ def prepare_environment(config_path, output, node_ip, python, config_dir, *, red
     spec = importlib.util.spec_from_file_location("agentos_local_images", Path(__file__).with_name("local_images.py"))
     images = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(images)
-    bindings = images.prepare_registry(settings)
+    bindings = images.prepare_registry(settings, export_rootfs=worker)
     catalog = Path(values["ADX_LOCAL_IMAGE_BINDINGS_FILE"])
     catalog.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".local-images-", dir=catalog.parent)
@@ -737,7 +775,11 @@ def selected_runtimes(settings):
     extra = runtime.get("tool_runtimes", [])
     if not isinstance(extra, list) or any(value not in ("runsc", "conch") for value in extra):
         raise ValueError("runtime.tool_runtimes must list runsc/conch backends")
-    return selected | set(extra)
+    selected = selected | set(extra)
+    # The Conch backend is only deployed when the conch module is in MODULES.
+    if not conch_module_enabled():
+        selected.discard("conch")
+    return selected
 
 
 def backend_enabled(settings, backend):
@@ -753,8 +795,9 @@ def backend_enabled(settings, backend):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("sdk", "check", "prepare-env", "export-env", "components", "gateway-ready", "release-label", "runsc-node-config", "install-sandboxd", "ingress-cert", "ingress-cert-loaded", "ingress-ready", "backend-enabled", "node-ready", "coordinator-config", "ingress-config"))
+    parser.add_argument("action", choices=("sdk", "check", "prepare-env", "export-env", "components", "gateway-ready", "release-label", "runsc-node-config", "install-sandboxd", "ingress-cert", "ingress-cert-loaded", "ingress-ready", "backend-enabled", "node-ready", "coordinator-config", "ingress-config", "default-config"))
     parser.add_argument("--backend", choices=("conch", "jiuwenbox", "runsc"))
+    parser.add_argument("--profile", choices=("node", "ingress", "coordinator"))
     parser.add_argument("--release", type=Path, default=Path("/opt/adx/current"))
     parser.add_argument("--python", default=os.environ.get("ADX_BUSINESS_PYTHON", "python3.11"))
     parser.add_argument("--wheelhouse", type=Path, action="append", default=[])
@@ -765,6 +808,13 @@ def main():
     parser.add_argument("--redis-host")
     parser.add_argument("--config-dir", type=Path, default=Path(os.environ.get("ADX_CONFIG_DIR", "/opt/adx/config")))
     args = parser.parse_args()
+    if args.action == "default-config":
+        if args.config is None:
+            parser.error("default-config requires --config")
+        if args.profile is None:
+            parser.error("default-config requires --profile")
+        write_default_config(args.config, args.profile)
+        return
     if args.action == "coordinator-config":
         if args.config is None:
             parser.error("coordinator-config requires --config")

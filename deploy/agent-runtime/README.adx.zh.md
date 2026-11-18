@@ -25,10 +25,11 @@ A4P 及其依赖由服务端包 `wheels/a4p/` 交付，其他依赖按发布包�
 版本目录。宿主 `agentos` UID/GID 写入 OCI 配置，需与 workspace 属主相符。
 默认 Supervisor AgentServer 使用节点上登记的 `agentos-supervisor:v1` 启动绑定，
 由目标节点提供启动器和本节点工具入口；该名称不触发 OCI 镜像拉取。
-默认 runsc 工具不设置 `runtime.tool_image`，使用发布包内的本地
-`runtime/adx-runtime-rootfs.img`。显式选择 `runtime.agent_runtime: runsc` 时，
-仍生成内置 AgentServer 的 Python 挂载和显式启动命令。
-显式设置 OCI 镜像时才需要准备 sandboxd 可用的镜像与 registry 配置；
+默认工具沙箱镜像固定为
+`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`。
+`up` 先加载固定离线 tar，再检查本地镜像，缺失时始终执行 `docker pull`，
+最后导出为 sandboxd 可用的 Local rootfs；因此默认部署需要 Docker。
+显式选择 `runtime.agent_runtime: runsc` 时，仍生成内置 AgentServer 的 Python 挂载和显式启动命令。
 Docker/Conch 缓存不等于 sandboxd 镜像缓存。
 
 各节点使用安装后的 `~/.agentos/deploy/config.yaml`，填写现有集群节点/VIP 字段。
@@ -46,6 +47,11 @@ bash deploy/agentos.sh up
 etcd quorum 就绪后再执行 up。统一使用 `down/up/restart/status` 管理；应用服务
 已运行时 up 保留进程，更新 wheel 或启动配置后使用 restart 应用变化。
 默认安装/启动按选择的运行时准备后端；down/uninstall 保留旧后端的清理路径。
+
+ADX 的 runtime bootstrap 使用 EROFS。`agentos.sh install` 通过 `deploy/erofs.sh`
+把 server 包内置的 `erofs/<variant>/erofs.ko` 持久化到 `/var/lib/agentos/erofs/`，
+`agentos.sh up` 在启动 ADX 前加载 EROFS 模块。Ubuntu 等内核已自带 EROFS 时，
+preflight 通过即可，不需要额外 ko。
 
 ## 沙箱管理命令
 
@@ -130,10 +136,16 @@ runsc 路径，不将 Supervisor 原生策略标记为等价 N2。Supervisor 的
 
 ### 工具运行时与历史镜像
 
-`runtime.tool_runtime` 选择新用户默认运行时，默认 runsc；`runtime.tool_runtimes: [runsc, conch]`
-保持两个后端同时可用。`runtime.conch_image` 默认 `agentos-tools:v1`，对应节点配置中的 Conch 绑定。
-历史 `yuanrong + executor: conch`、`jiuwenbox-conch` 和显式 ADX Conch 配置保留 Conch，
-原模板引用会登记到节点的 Conch image bindings，不经过 Docker 转换。
+`runtime.tool_runtime` 选择新用户默认运行时，默认 runsc；`runtime.tool_runtimes: [runsc, conch]`。
+Conch 代码、配置与发布件保留，但默认 `MODULES` 不调度 conch，因此默认部署不安装/启动 conchd。
+需要部署 Conch 时，用 `AGENTOS_MODULES` 显式加入 `conch`。`agentos.sh` 由最终模块列表派生
+`AGENTOS_CONCH_MODULE`（内部变量，不是用户开关），ADX 配置据此自动裁剪/保留 conch class/socket；
+不含 conch 时启动路径不会连接 conchd。
+
+默认工具镜像固定为 `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`。
+离线 tar 固定为 `/root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar`。
+`up` 时如果 tar 存在会先 `docker load`（失败仅告警并继续），随后检查本地镜像；
+本地没有时执行 `docker pull`，pull 失败则中止部署。
 
 Docker executor 使用 runsc。发布包安装时可在 `runtime.local_images` 按镜像引用配置
 `archive: /absolute/path/image.tar`；准备过程先检查本地 Docker store，缺失时执行 `docker image load`，
@@ -204,11 +216,13 @@ runsc 对 NFS/FUSE 自动追加后与本地选项不一致；未声明选项的�
 
 ## 离线 Docker 镜像与 Local rootfs
 
-默认不设置 `runtime.agent_image/tool_image`，新用户使用 ADX 发布包内置的 Local rootfs。
+`runtime.agent_image` 默认为空；`runtime.tool_image` 默认按架构指向部署自有工具镜像，并会在
+`up` 时执行 load → inspect → pull → export。Agent/用户镜像仍只使用本地已有内容，绝不 pull。
 历史用户的 `sandbox.image` 保留。`agentos.sh up` 会读取 Gateway 和用户 YAML 中的镜像引用，
 并在部署节点将本地 Docker 镜像转换成独立的 Local rootfs 制品；转换时只创建未启动的临时
 容器（`docker create --pull=never`），导出后回收临时容器及其匿名卷，不启动镜像中的程序。
-没有镜像的默认部署不需要执行 Docker 镜像准备。
+默认部署需要 Docker 来完成工具镜像准备；仅当显式清空 `runtime.tool_image` 且不配置
+`local_images` 时才不需要 Docker。
 
 如镜像尚未 `docker load`，在 `deploy/agent-runtime/defaults/settings.yaml` 的 runtime 下指定离线包：
 
@@ -221,7 +235,8 @@ runtime:
       archive: /root/resources/images/ubuntu-24.04.tar
 ```
 
-未指定 archive 时，使用本节点 Docker 镜像库中的对应引用；缺失时明确报错，不执行 pull。
+未指定 archive 时，优先使用本节点 Docker 镜像库中的对应引用；Agent/用户镜像缺失时明确报错、
+不执行 pull，部署自有的工具镜像缺失时始终允许 `docker pull`。
 请在各部署节点准备同一架构、同一内容的镜像或离线包，Master 的 API 配置也需要相同的
 映射元数据。镜像通过不可变 image ID 存放于 `/var/lib/agentos/local-images/objects/local-<digest>`，
 保存文件系统及 Env、Entrypoint、Cmd、WorkingDir、User。每份制品内容固定；

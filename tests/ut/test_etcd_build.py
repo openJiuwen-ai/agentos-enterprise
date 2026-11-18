@@ -28,6 +28,7 @@ class EtcdBuildTests(unittest.TestCase):
         shutil.copytree(ROOT / "deploy/etcd", self.deploy / "etcd")
         for name in ("jiuwenswarm", "agent-runtime"):
             shutil.copytree(ROOT / "deploy" / name, self.deploy / name)
+        shutil.copy2(ROOT / "deploy/erofs.sh", self.deploy / "erofs.sh")
         # Other components are prebuilt package fixtures, not fetched from CI.
         self.components = self.base / "components"
         self.a4p = self.base / "a4p"
@@ -37,7 +38,7 @@ class EtcdBuildTests(unittest.TestCase):
         for path in ["x86_64/jiuwenswarm_tui-fixture.whl", "aarch64/jiuwenswarm_tui-fixture.whl",
                      "jiuwenswarm-fixture-py3-none-any.whl", "registry-fixture.whl",
                      "x86_64/adx-release.tar.gz", "aarch64/adx-release.tar.gz",
-                     "x86_64/conch.rpm", "aarch64/conch.rpm",
+                     "x86_64/oe2203sp4/erofs.ko", "aarch64/oe2203sp4/erofs.ko",
                      "x86_64/credential-router-fixture.tar.gz", "aarch64/credential-router-fixture.tar.gz",
                      "yuanrong/config.yaml"]:
             target = self.components / path
@@ -76,7 +77,7 @@ class EtcdBuildTests(unittest.TestCase):
                   "A4P_WHEELHOUSE": str(self.a4p), "AGENT_CORE_BASE_URL": str(self.base)}
         script = 'set -e\nsource ' + shlex.quote(str(ROOT / "build/build-v2.sh")) + "\n"
         script += "\n".join(k + "=" + shlex.quote(v) for k, v in values.items())
-        script += '\ndownload_file() { cp "$1" "$2"; }\nbuild_etcd\n' + extra
+        script += '\ndownload_file() { cp "$1" "$2"; }\nbuild_etcd\nbuild_erofs\n' + extra
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
 
     def test_both_architectures_are_verified_and_bundled_only_in_server(self):
@@ -95,6 +96,8 @@ class EtcdBuildTests(unittest.TestCase):
                     self.assertNotIn("./deploy/jiuwenswarm/deploy.py", tar.getnames())
                     self.assertIn("./deploy/jiuwenswarm/.env.custom", tar.getnames())
                     self.assertIn("./deploy/agent-runtime/defaults/node.yaml", tar.getnames())
+                    self.assertIn("./erofs/oe2203sp4/erofs.ko", tar.getnames())
+                    self.assertNotIn("./deploy/conch/module.sh", tar.getnames())
                     self.assertNotIn("./deploy/jiuwenswarm/adx_deploy.py", tar.getnames())
                     self.assertEqual(tar.extractfile("./" + name).read(), (self.base / (arch + ".tar.gz")).read_bytes())
                     self.assertFalse(any("etcd-linux-" in p and name not in p for p in tar.getnames()))
@@ -149,6 +152,7 @@ class EtcdBuildTests(unittest.TestCase):
                     "BUILD_DIR=" + shlex.quote(str(output)) + "\n"
                     "JIUWENSWARM_BASE=" + shlex.quote(str(source)) + "\n"
                     "build_jiuwenswarm\n"
+                    "build_erofs\n"
                     'printf "%s" "$JIUWENSWARM_DEPLOY_DIR" > ' + shlex.quote(str(selected)) + "\n"
                     "pack\n"
                 ))

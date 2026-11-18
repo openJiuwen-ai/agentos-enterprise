@@ -283,7 +283,15 @@ _adx_version() {
 }
 # Fixed YAML is shipped in the release; adxctl expands environment bindings.
 _adx_install_default() {
-    install -m 600 "${SCRIPT_DIR}/defaults/$1.yaml" "$2"
+    local profile="$1" target="$2"
+    # MODULES 不含 conch 时，默认节点模板也要裁掉 conch class/socket，
+    # 避免 ADX 启动阶段探测不存在的 conchd。
+    if [ "${profile}" = "node" ] && [ "${AGENTOS_CONCH_MODULE:-1}" != "1" ]; then
+        "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/adx_integration.py" default-config \
+            --profile node --config "${target}" && return 0
+        return 1
+    fi
+    install -m 600 "${SCRIPT_DIR}/defaults/${profile}.yaml" "${target}"
 }
 
 # ===== 角色推导 =====
@@ -429,13 +437,21 @@ _adx_generate_unit() {
     if [ "$svc" = "$ADX_NODE_SVC" ]; then
         runtime_dependencies=""
         case "${ADX_AGENT_RUNTIME:-supervisor} ${ADX_TOOL_RUNTIME:-runsc}" in
-            *supervisor*|*conch*)
+            *supervisor*)
                 runtime_dependencies=$'After=jiuwenbox.service\nRequires=jiuwenbox.service' ;;
         esac
-        case "${ADX_AGENT_RUNTIME:-supervisor} ${ADX_TOOL_RUNTIME:-runsc}" in
-            *conch*)
-                runtime_dependencies+=$'\nAfter=conchd.service\nRequires=conchd.service' ;;
-        esac
+        # Conch 接线由 MODULES 是否包含 conch 决定（AGENTOS_CONCH_MODULE）。
+        # 默认不含 conch 时，即使旧配置里残留 tool_runtime=conch，也不能依赖 conchd。
+        if [ "${AGENTOS_CONCH_MODULE:-1}" = "1" ]; then
+            case "${ADX_AGENT_RUNTIME:-supervisor} ${ADX_TOOL_RUNTIME:-runsc}" in
+                *conch*)
+                    runtime_dependencies=$'After=jiuwenbox.service\nRequires=jiuwenbox.service' ;;
+            esac
+            case "${ADX_AGENT_RUNTIME:-supervisor} ${ADX_TOOL_RUNTIME:-runsc}" in
+                *conch*)
+                    runtime_dependencies+=$'\nAfter=conchd.service\nRequires=conchd.service' ;;
+            esac
+        fi
         if _adx_use_bundled_sandboxd; then
             runtime_dependencies+=$'\n'"After=${ADX_SANDBOXD_SVC}.service"
             runtime_dependencies+=$'\n'"Requires=${ADX_SANDBOXD_SVC}.service"

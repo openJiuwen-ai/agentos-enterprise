@@ -10,7 +10,7 @@
 |------|------|
 | `AgentOS-Client.tgz` | 客户端 TUI（含全平台 jiuwenswarm_tui，不区分架构；daily/release 同逻辑） |
 | `AgentOS-Server-${ARCH}.tgz` | 服务端（`deploy/` + jiuwenswarm + agent-dx + a2x_registry wheels + 沙箱/凭证路由产物 + 对应架构 etcd/etcdctl） |
-| `AgentOS-Buildinfo.tgz` | 各部件构建信息汇总（收集 jiuwenswarm/agent-dx/agent-protocol/conch/credential_router 各 archive 内名字含 buildinfo 关键字的文件，归入 `AgentOS-Buildinfo/` 目录后压缩；保留源文件时间戳，与 AgentOS-Server/Client 同级目录） |
+| `AgentOS-Buildinfo.tgz` | 各部件构建信息汇总（收集 jiuwenswarm/agent-dx/agent-protocol/credential_router 各 archive 内名字含 buildinfo 关键字的文件，归入 `AgentOS-Buildinfo/` 目录后压缩；保留源文件时间戳，与 AgentOS-Server/Client 同级目录） |
 
 脚本只在 linux 上运行（无交叉编译）。client 包内含 OBS 预编译的全平台 wheel（macosx/win/linux_aarch64/linux_x86_64），server 包仅 linux 平台。
 
@@ -38,7 +38,6 @@
 jiuwenswarm:     https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/jiuwenswarm/package/<build_type>/<build_target>/last_successful_build/archive.tar.gz
 agent-dx:        https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-dx/artifacts/<build_type>/<build_target>/last_successful_build/archive.tar.gz
 agent-protocol:  https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-protocol/package/<build_type>/<build_target>/last_successful_build/archive.tar.gz
-conch:           https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/conch/package/<build_type>/<build_target>/last_successful_build/archive.tar.gz
 ```
 
 - `<build_type>`/`<daily|release>` = `daily` 或 `release`
@@ -70,19 +69,16 @@ archive/agent-dx_buildinfo                    -> AgentOS-Buildinfo 包（collect
 archive/a2x_registry-*-py3-none-any.whl   -> server 包（平台无关 wheel，在 archive 根目录）
 ```
 
-**conch archive**：
-```
-archive/<x86_64|aarch64>/*.rpm   -> server 包（平台相关 rpm，按 ${ARCH} 取对应架构；必有）
-archive/<x86_64|aarch64>/oe2203{,sp1~sp4}/erofs.ko -> server 包（openEuler 22.03 各版本 EROFS 内核模块，按 ${ARCH} 取对应架构；如有则一并打入）
-archive/*.rpm                    -> server 包（平台无关 none rpm，在 archive 根目录；如有则一并打入）
-```
+**Conch 代码与发布件保留**：构建仍下载 Conch archive，server 包包含 conch RPM/wheel 与
+`deploy/conch`；但默认 `MODULES` 不调度 conch，需要时用 `AGENTOS_MODULES` 显式启用。
+EROFS 产物由独立的 `build_erofs` 从 Agent-DX OBS 获取，放入 `erofs/<variant>/erofs.ko`。
 
 **注意**：OBS 按 CPU 架构族归类，jiuwenswarm archive 的 `x86_64/` 目录还含 `win_amd64`、`aarch64/` 还含 `macosx_arm64`。client 包按用户要求不区分架构，两个目录下所有 `jiuwenswarm_tui-*.whl` 一并打入 `AgentOS-Client.tgz`（与 build.sh 一致，含 macosx/win/linux_aarch64/linux_x86_64 四平台）。
 
 ## daily 与 release 的唯一差异
 
 - `BUILD_TYPE` 拼 OBS archive 路径（`daily` vs `release` 段）
-- 四个 archive（jiuwenswarm/agent-dx/agent-protocol/conch）路径里该段分别为 `daily`/`release`
+- 三个 archive（jiuwenswarm/agent-dx/agent-protocol）路径里该段分别为 `daily`/`release`
 
 ## 命令行参数
 
@@ -128,7 +124,7 @@ archive/*.rpm                    -> server 包（平台无关 none rpm，在 arc
 - archive 解压后删 `archive.tar.gz` 省磁盘空间
 - tar 加 `--atime-preserve`、wheel cp 加 `-p` 保留原始 mtime 可回溯
 - 随远端 client 迁移删除 `tui-launcher` 本地构建逻辑（`TUI_LAUNCHER_VERSION`/`TUI_LAUNCHER_PACKAGES`/`build_tui_launcher`），client 包不再包含 `agentos_tui_launcher`
-- 新增 conch 沙箱模块：daily/release 都从 OBS archive 获取 rpm（平台相关按 `${ARCH}` 取 + 平台无关 none）与 erofs.ko 版本目录（openEuler 22.03 各版本，如有则一并打入），打入 server 包根目录与各 whl 同级
+- Conch 代码/发布件保留：server 包仍包含 deploy/conch 与 conch RPM；默认 MODULES 不调度 conch。EROFS 另生成独立产物 `erofs/<variant>/erofs.ko`，加载逻辑由 `deploy/erofs.sh` 负责
 - 新增 credential_router：daily/release 都从 OBS archive 获取平台相关 `credential-router*.tar.gz`（按 `${ARCH}` 取 + 平台无关 none），打入 server 包根目录与各 whl/rpm 同级
 
 ## 依赖
@@ -144,10 +140,10 @@ archive/*.rpm                    -> server 包（平台无关 none rpm，在 arc
 3. `build_agent_dx` — 下载并解压 OBS `archive.tar.gz`（agent-dx 平台相关 `adx-release.tar.gz`）
 4. `build_jiuwenswarm` — 下载并解压 OBS `archive.tar.gz`（jiuwenswarm wheels + deploy）
 5. `build_agent_gateway` — 下载并解压 OBS `archive.tar.gz`（a2x_registry wheel）
-6. `build_conch` — 下载并解压 OBS `archive.tar.gz`（conch 沙箱模块 rpm：平台相关按 `${ARCH}` 取 + 平台无关 none，打入 server 包根目录与各 whl 同级）
-7. `build_credential_router` — 下载并解压 OBS `archive.tar.gz`（credential-router 平台相关 tar.gz）
-8. `pack` — 组装 client/server 两个 tgz 产物
-9. `collect_buildinfo` — 收集各部件 archive 内名字含 buildinfo 关键字的构建信息文件，以及 `build/` 目录顶层名字含 buildinfo 关键字的文件（agent-os 主仓 buildinfo 由 CI 流水线生成于此），到 `AgentOS-Buildinfo/` 目录，`cp -p` + `tar --atime-preserve` 保留源文件时间戳，压缩为 `AgentOS-Buildinfo.tgz`（与 AgentOS-Server/Client 同级；须在 pack 之后，pack 会清空 staging）
+6. `build_erofs` — 从 Agent-DX OBS 获取独立 `erofs/<variant>/erofs.ko`（也支持 EROFS_ARCHIVE 本地包）
+8. `build_credential_router` — 下载并解压 OBS `archive.tar.gz`（credential-router 平台相关 tar.gz）
+9. `pack` — 组装 client/server 两个 tgz 产物
+10. `collect_buildinfo` — 收集各部件 archive 内名字含 buildinfo 关键字的构建信息文件，以及 `build/` 目录顶层名字含 buildinfo 关键字的文件（agent-os 主仓 buildinfo 由 CI 流水线生成于此），到 `AgentOS-Buildinfo/` 目录，`cp -p` + `tar --atime-preserve` 保留源文件时间戳，压缩为 `AgentOS-Buildinfo.tgz`（与 AgentOS-Server/Client 同级；须在 pack 之后，pack 会清空 staging）
 
 > agent-os 主仓 buildinfo 文件由 CI 流水线单独生成，放 `build/` 目录顶层（不受脚本 `clean` 影响，`clean` 只删 `build/dist/`）。`build-v2.sh` 不生成该文件，仅在 `collect_buildinfo` 阶段模糊匹配 `build/` 下所有含 `buildinfo` 关键字的文件纳入打包。
 
@@ -317,42 +313,11 @@ tar -czf archive.tar.gz archive/ --atime-preserve
 ```
 
 
-## 6.4、conch沙箱归档目录
-1、obs://openjiuwen-ci/conch/package/daily/agentos_b050/last_successful_build/archive.tar.gz
-2、obs://openjiuwen-ci/conch/package/release/agentos_b050/last_successful_build/archive.tar.gz
-
-共享下载：
-https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/conch/package/daily/agentos_b050/last_successful_build/archive.tar.gz
-https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/conch/package/release/agentos_b050/last_successful_build/archive.tar.gz
-
-```
-daily和release编译的产品分支过程产物归档
-/agentos_b050/
-  |-202608281153
-    |-archive
-      |-x86_64
-      | |-xxx_x86_64.rpm
-      | |-oe2203、oe2203sp1~sp4（各含 erofs.ko）
-      |-aarch64
-      | |-xxx_aarch64.rpm
-      | |-oe2203、oe2203sp1~sp4（各含 erofs.ko）
-      |-XXX_.noarch.rpm
-  |-last_successful_build
-    |-archive.tar.gz
-    
-    
-下载共享last_successful_build归档archive.tar.gz 
-archive.tar.gz
-  |-archive
-    |-x86_64
-    | |-xxx_x86_64.rpm
-    | |-oe2203、oe2203sp1~sp4（各含 erofs.ko）
-    |-aarch64
-    | |-xxx_aarch64.rpm
-    | |-oe2203、oe2203sp1~sp4（各含 erofs.ko）
-    |-XXX_.noarch.rpm
-```
-
+## 6.4、Conch 归档目录
+Conch 代码与发布件保留：构建仍下载 conch archive，server 包包含 conch RPM/wheel 与
+`deploy/conch`。默认 `MODULES` 不调度 conch；需要部署时用 `AGENTOS_MODULES` 显式加入。
+EROFS 另有独立产物 `erofs/<variant>/erofs.ko`，与 Conch 根目录的 `oe2203*/erofs.ko` 并存。
+EROFS 产物由 `build_erofs` 从 Agent-DX OBS 获取，放入 `erofs/<variant>/erofs.ko`。
 
 ## 6.5 credential_router归档目录
 1、obs://openjiuwen-ci/credential_router/package/daily/agentos_b050/last_successful_build/archive.tar.gz

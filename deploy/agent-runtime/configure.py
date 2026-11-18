@@ -20,6 +20,12 @@ import time
 import urllib.error
 import urllib.request
 
+def conch_module_enabled():
+    """Internal deployment signal derived from MODULES; not a user switch."""
+    if "AGENTOS_CONCH_MODULE" not in os.environ:
+        return True
+    return os.environ["AGENTOS_CONCH_MODULE"].strip().lower() in ("1", "true", "yes", "on")
+
 
 def migration_module():
     spec = importlib.util.spec_from_file_location("agentos_deploy_migration", Path(__file__).with_name("migration.py"))
@@ -194,6 +200,10 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
     if not isinstance(tool_runtimes, list) or any(value not in ("runsc", "conch") for value in tool_runtimes):
         raise ValueError("runtime.tool_runtimes must list runsc/conch backends")
     tool_runtimes = [*tool_runtimes, runtime.get("tool_runtime", "runsc")]
+    if not conch_module_enabled():
+        if runtime.get("tool_runtime", "runsc") == "conch":
+            raise ValueError("runtime.tool_runtime=conch requires conch in AGENTOS_MODULES")
+        tool_runtimes = [value for value in tool_runtimes if value != "conch"]
     gateway = config.setdefault("gateway", {})
     gateway["agent_client"] = {"type": "agentos_router", "agent_namespace": settings["namespace"]}
     adx_options = gateway.get("adx") or {}
@@ -281,12 +291,14 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
                                          blocked_cidrs=network.get("blocked_cidrs", [])))}
         if defaults["runtime"] == "runsc":
             defaults.update(copy.deepcopy(runsc_defaults))
-    defaults["conch_image"] = runtime.get("conch_image") or (
-        runtime.get("tool_image") if runtime.get("tool_runtime") == "conch" else None
-    ) or "agentos-tools:v1"
+    if "conch" in tool_runtimes:
+        defaults["conch_image"] = runtime.get("conch_image") or (
+            runtime.get("tool_image") if runtime.get("tool_runtime") == "conch" else None
+        ) or "agentos-tools:v1"
     if runsc_defaults is not None:
-        defaults["runtime_defaults"] = {"runsc": runsc_defaults,
-            "conch": {"runtime": "conch", "image": defaults["conch_image"]}}
+        defaults["runtime_defaults"] = {"runsc": runsc_defaults}
+        if "conch" in tool_runtimes:
+            defaults["runtime_defaults"]["conch"] = {"runtime": "conch", "image": defaults["conch_image"]}
     if runtime.get("tool_network") is not None:
         defaults["network"] = copy.deepcopy(runtime["tool_network"])
     if settings.get("profile", "standalone") != "agentos":

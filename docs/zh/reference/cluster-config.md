@@ -45,19 +45,28 @@ cluster:
 | `GATEWAY_HOST` / `GATEWAY_PORT` | gateway 进程监听地址 / 端口（默认端口 19001；host 留空时自动绑定 ingress VIP） |
 | `WEB_PORT` / `WEB_ENABLED` | web 前端端口（默认 19000）/ 是否随 `up` 启动 |
 | `ETCD_ENDPOINTS` | Cron etcd 地址，留空时自动从 `config.yaml` 拼接 |
-| `SANDBOX_TYPE` / `TOOL_SANDBOX_*` | 沙箱类型与工具沙箱配置 |
 
-### 工具沙箱镜像必须预先拉取
+> `SANDBOX_TYPE` / `TOOL_SANDBOX_*` 已不再由 `.env.custom` 提供；ADX 部署由
+> `deploy/agent-runtime/defaults/settings.yaml` 与 `agent-runtime` 的 prepare-env 统一管理。
 
-`install` 与 `up` 均**不会**自动拉取 `TOOL_SANDBOX_IMAGE` 指定的镜像（镜像地址以 `deploy/jiuwenswarm/.env.custom` 的配置为准）。`TOOL_SANDBOX_ENABLE=true` 时，`install` 会检查本机 docker 可用性与镜像是否存在，任一不满足直接中断安装：
+### 工具沙箱镜像由部署准备
+
+默认工具镜像固定为
+`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`。`agentos.sh up`
+的 prepare-env 会：
+
+1. 若固定离线 tar `/root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar` 存在，先 `docker load`；
+2. 检查本地 Docker 镜像；
+3. 本地缺失时始终执行 `docker pull`；
+4. 导出为 Local rootfs 并登记给 sandboxd/runsc。
+
+该镜像引用由部署固定，不支持环境变量覆盖。Agent/用户镜像仍只使用本地已有内容，绝不 pull。
 
 ```bash
-# <TOOL_SANDBOX_IMAGE> 请替换为 .env.custom 中配置的镜像地址
-docker pull <TOOL_SANDBOX_IMAGE>
-
 # 离线环境：有网机器导出 -> 传输 -> 目标主机导入
-docker save -o sandbox-image.tar <TOOL_SANDBOX_IMAGE>
-docker load -i sandbox-image.tar
+docker save -o tool-sandbox_latest.tar \
+  swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest
+docker load -i tool-sandbox_latest.tar
 ```
 
 ## agent SSH 直连密钥

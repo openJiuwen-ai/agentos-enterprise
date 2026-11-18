@@ -24,9 +24,61 @@ LEGACY_CONCH_DEFAULT_IMAGES = tuple(
     for architecture in ("arm64", "amd64")
 )
 
+DEFAULT_TOOL_IMAGE_DIR = Path("/root/resources/MindAgent-image")
+DEFAULT_TOOL_IMAGE_TAR = "tool-sandbox_latest.tar"
+ARCH_DIRECTORY = {"x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}
+
 
 def docker(args, *, check=True):
     return subprocess.run(args, check=check, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+def conch_module_enabled():
+    """Internal deployment signal derived from MODULES; not a user switch."""
+    if "AGENTOS_CONCH_MODULE" not in os.environ:
+        return True
+    return os.environ["AGENTOS_CONCH_MODULE"].strip().lower() in ("1", "true", "yes", "on")
+
+
+def local_image_id(reference):
+    """Return the local image ID, or None when the image is absent."""
+    try:
+        inspected = docker(["docker", "image", "inspect", reference], check=False)
+    except OSError:
+        return None
+    if inspected.returncode:
+        return None
+    try:
+        facts = json.loads(inspected.stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(facts, list) or len(facts) != 1:
+        return None
+    value = facts[0].get("Id", "")
+    return value if re.fullmatch(r"sha256:[0-9a-f]{64}", value) else None
+
+
+def tool_image_archive(settings, reference):
+    """Resolve the fixed offline tar for the deployment-owned tool image."""
+    runtime = settings.get("runtime", {})
+    directory = runtime.get("tool_image_dir") or DEFAULT_TOOL_IMAGE_DIR
+    tar_name = runtime.get("tool_image_tar") or DEFAULT_TOOL_IMAGE_TAR
+    arch_dir = ARCH_DIRECTORY.get(platform.machine())
+    if arch_dir is None:
+        raise ValueError(f"Unsupported architecture for tool sandbox image: {platform.machine()}")
+    resolved = Path(directory).expanduser() / arch_dir / tar_name
+    if not resolved.is_absolute():
+        raise ValueError("runtime.tool_image_dir must be absolute")
+    return resolved
+
+
+def cleanup_old_image(old_id, new_id):
+    """Remove only the previous image ID after its replacement is prepared."""
+    if not old_id or old_id == new_id:
+        return
+    removed = docker(["docker", "rmi", old_id], check=False)
+    if removed.returncode:
+        logging.warning("Old Docker image %s is still referenced; retained it", old_id)
 
 
 def image_metadata(inspection):
@@ -69,20 +121,45 @@ def validate_export(path):
                     raise ValueError("Offline rootfs archive hardlink references a symlink")
 
 
-def prepare_image(reference, options, root):
+def prepare_image(reference, options, root, *, allow_pull=False, default_archive=None, cleanup_old=False, export_rootfs=True):
     if not isinstance(reference, str) or not reference or reference.startswith("-") or any(c.isspace() for c in reference):
         raise ValueError("Offline image reference must be nonempty")
     if not isinstance(options, dict) or options.keys() - {"archive"}:
         raise ValueError("Offline image accepts only an optional archive path")
+
+    old_id = local_image_id(reference) if cleanup_old else None
+    explicit_archive = options.get("archive")
+    archive = explicit_archive or default_archive
+    if explicit_archive:
+        archive_path = Path(explicit_archive)
+        if not archive_path.is_absolute() or not archive_path.is_file():
+            raise ValueError(f"Offline archive for {reference} is missing: {archive_path}")
+        archive = archive_path
+    elif default_archive:
+        archive = Path(default_archive)
+
+    reasons = []
+    if archive and Path(archive).is_file():
+        loaded = docker(["docker", "image", "load", "--input", str(archive)], check=False)
+        if loaded.returncode:
+            reasons.append(f"docker image load failed: {archive}")
+            logging.warning("Failed to load image archive %s for %s; continuing with local image check", archive, reference)
+    elif archive:
+        reasons.append(f"offline archive missing: {archive}")
+
     inspected = docker(["docker", "image", "inspect", reference], check=False)
-    if inspected.returncode and options.get("archive"):
-        archive = Path(options["archive"])
-        if not archive.is_absolute() or not archive.is_file():
-            raise ValueError(f"Offline archive for {reference} is missing: {archive}")
-        docker(["docker", "image", "load", "--input", str(archive)])
+    if inspected.returncode and allow_pull:
+        pulled = docker(["docker", "pull", reference], check=False)
+        if pulled.returncode:
+            detail = (pulled.stderr or pulled.stdout or "").strip()
+            reasons.append("docker pull failed" + (f": {detail.splitlines()[-1]}" if detail else ""))
+            raise ValueError(f"Tool sandbox image {reference} is unavailable; " + "; ".join(reasons))
         inspected = docker(["docker", "image", "inspect", reference], check=False)
     if inspected.returncode:
-        raise ValueError(f"Image {reference} is missing from the local Docker store; offline deployment never pulls images")
+        raise ValueError(
+            f"Image {reference} is missing from the local Docker store; "
+            + ("; ".join(reasons) if reasons else "no offline archive and registry pull is disabled")
+        )
     facts = json.loads(inspected.stdout)
     if not isinstance(facts, list) or len(facts) != 1:
         raise ValueError(f"Invalid local Docker image inspection: {reference}")
@@ -102,10 +179,16 @@ def prepare_image(reference, options, root):
     if process:
         template["process"] = process
     manifest = {"image_id": image_id, "architecture": architecture, "template": template}
+    # Metadata-only nodes (pure master) register the template name for routing;
+    # rootfs export happens on nodes that actually run tool sandboxes.
+    if not export_rootfs:
+        return name, template
     ready = artifact / "manifest.json"
     if ready.is_file():
         if json.loads(ready.read_text()) != manifest or not (artifact / "rootfs").is_dir():
             raise ValueError(f"Offline rootfs artifact is incomplete or has changed: {reference}")
+        if cleanup_old:
+            cleanup_old_image(old_id, image_id)
         return name, template
     with tempfile.TemporaryDirectory(prefix=".import-", dir=objects) as temporary:
         pending = Path(temporary) / name
@@ -132,6 +215,8 @@ def prepare_image(reference, options, root):
             cleanup = docker(["docker", "rm", "--volumes", container], check=False)
             if completed and cleanup.returncode:
                 raise RuntimeError(f"Failed to remove temporary export container {container}")
+    if cleanup_old:
+        cleanup_old_image(old_id, image_id)
     return name, template
 
 
@@ -204,6 +289,8 @@ def image_sources(settings, *, include_users=True):
 
 def requested_conch_images(settings):
     """Conch selectors remain native bindings and never enter Docker export."""
+    if not conch_module_enabled():
+        return {}
     runtime = settings.get("runtime", {})
     bindings = dict(runtime.get("conch_images") or {})
     for backend, image in image_sources(settings):
@@ -231,12 +318,14 @@ def requested_images(settings, *, include_users=True):
     return result
 
 
-def prepare_registry(settings):
+def prepare_registry(settings, *, export_rootfs=True):
     import fcntl
+    runtime = settings.get("runtime", {})
     references = requested_images(settings)
     required = requested_images(settings, include_users=False)
     conch = requested_conch_images(settings)
-    root = Path(settings.get("runtime", {}).get("local_image_root", "/var/lib/agentos/local-images"))
+    tool_reference = runtime.get("tool_image") if runtime.get("tool_runtime", "runsc") == "runsc" else None
+    root = Path(runtime.get("local_image_root", "/var/lib/agentos/local-images"))
     if not root.is_absolute():
         raise ValueError("runtime.local_image_root must be absolute")
     catalog = root / "registry.json"
@@ -248,12 +337,16 @@ def prepare_registry(settings):
         result = json.loads(catalog.read_text()) if catalog.is_file() else {"images": {}, "templates": {}}
         result["legacy_conch_default_images"] = list(LEGACY_CONCH_DEFAULT_IMAGES)
         result["conch_images"] = conch
+        tool_archive = tool_image_archive(settings, tool_reference) if tool_reference else None
         for reference, options in sorted(references.items()):
             try:
                 if not isinstance(options, dict) or options.keys() - {"archive"}:
                     raise ValueError("Offline image accepts only an optional archive path")
+                is_tool_image = reference == tool_reference
                 name = result["images"].get(reference)
-                if name:
+                # The tool image must re-run load when its fixed tar exists:
+                # the tar is authoritative and updates the local tag.
+                if name and not is_tool_image:
                     template = result["templates"][name]
                     artifact = Path(template["path"]).parent
                     manifest = json.loads((artifact / "manifest.json").read_text())
@@ -270,7 +363,16 @@ def prepare_registry(settings):
                         continue
                     if json.loads(current.stdout)[0]["Id"] == manifest["image_id"]:
                         continue
-                name, template = prepare_image(reference, options, root)
+                # Metadata-only export is a tool-image optimization for pure
+                # masters. Other images keep their existing full-export contract.
+                export_for_image = export_rootfs if is_tool_image else True
+                name, template = prepare_image(
+                    reference, options, root,
+                    allow_pull=is_tool_image,
+                    default_archive=tool_archive if is_tool_image else None,
+                    cleanup_old=is_tool_image and export_for_image,
+                    export_rootfs=export_for_image,
+                )
                 result["images"][reference] = name
                 result["templates"][name] = template
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
