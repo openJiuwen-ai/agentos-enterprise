@@ -205,8 +205,6 @@ install_system_openeuler() {
             "xxhash-libs"
             "fuse3-help"
             "pixman-devel"
-            "containernetworking-plugins"
-            "kmod"
         )
         # OVMF 固件包名随架构不同
         if [ "${ARCH_RPM}" = "x86_64" ]; then
@@ -302,9 +300,6 @@ install_system_ubuntu() {
     else
         local conch_pkgs=(
             "rpm"
-            "containernetworking-plugins"
-            "kmod"
-            "procps"
             "libpixman-1-0"
         )
         case "${DETECTED_VERSION}" in

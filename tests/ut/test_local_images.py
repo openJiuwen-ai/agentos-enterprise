@@ -106,6 +106,87 @@ class LocalImageTests(unittest.TestCase):
             images.prepare_image("tools:v1", {"archive": str(archive)}, self.root)
         self.assertIn(["docker", "image", "load", "--input", str(archive)], self.calls)
 
+    def test_tool_image_pull_failure_aborts(self):
+        calls = []
+
+        def docker(args, **kwargs):
+            calls.append(args)
+            if args[1:3] == ["image", "inspect"]:
+                return subprocess.CompletedProcess(args, 1, "", "missing")
+            if args[1] == "pull":
+                return subprocess.CompletedProcess(args, 1, "", "pull denied")
+            raise AssertionError(args)
+
+        with patch.object(images, "docker", docker):
+            with self.assertRaisesRegex(ValueError, "Tool sandbox image tools:v1 is unavailable.*docker pull failed"):
+                images.prepare_image("tools:v1", {}, self.root, allow_pull=True)
+        self.assertIn(["docker", "pull", "tools:v1"], calls)
+
+    def test_metadata_only_export_skips_manifest_and_container(self):
+        with patch.object(images, "docker", self.docker), patch.object(images.platform, "machine", return_value="aarch64"):
+            _, template = images.prepare_image("tools:v1", {}, self.root, export_rootfs=False)
+        artifact = Path(template["path"]).parent
+        self.assertFalse((artifact / "manifest.json").exists())
+        self.assertFalse((artifact / "rootfs").exists())
+        self.assertFalse(any(args[1] == "create" for args in self.calls))
+
+    def test_cleanup_old_keeps_image_when_id_is_unchanged(self):
+        with patch.object(images, "docker", self.docker), patch.object(images.platform, "machine", return_value="aarch64"):
+            images.prepare_image("tools:v1", {}, self.root, cleanup_old=True)
+        self.assertFalse(any(args[1] == "rmi" for args in self.calls))
+
+    def test_cleanup_old_removes_previous_image_when_id_changes(self):
+        old_id = "sha256:" + "a" * 64
+        new_id = "sha256:" + "b" * 64
+        state = {"inspect": 0}
+
+        def docker(args, **kwargs):
+            if args[1:3] == ["image", "inspect"]:
+                image_id = old_id if state["inspect"] == 0 else new_id
+                state["inspect"] += 1
+                self.calls.append(args)
+                value = [{"Id": image_id, "Os": "linux", "Architecture": "arm64", "Config": {}}]
+                return subprocess.CompletedProcess(args, 0, json.dumps(value), "")
+            if args[1] == "rmi":
+                self.calls.append(args)
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return self.docker(args, **kwargs)
+
+        with patch.object(images, "docker", docker), patch.object(images.platform, "machine", return_value="aarch64"):
+            images.prepare_image("tools:v1", {}, self.root, cleanup_old=True)
+        self.assertIn(["docker", "rmi", old_id], self.calls)
+
+    def test_archive_load_failure_still_uses_local_image(self):
+        archive = self.root / "tools.tar"
+        archive.write_bytes(b"not-an-image")
+        loads = []
+
+        def docker(args, **kwargs):
+            if args[1:3] == ["image", "load"]:
+                loads.append(args)
+                return subprocess.CompletedProcess(args, 1, "", "load failed")
+            return self.docker(args, **kwargs)
+
+        with patch.object(images, "docker", docker), patch.object(images.platform, "machine", return_value="aarch64"):
+            _, template = images.prepare_image("tools:v1", {"archive": str(archive)}, self.root)
+        self.assertEqual(len(loads), 1)
+        self.assertTrue((Path(template["path"]) / "image-value").is_file())
+
+    def test_metadata_only_master_disables_export_and_cleanup(self):
+        settings = {"runtime": {"tool_image": "tools:latest", "tool_runtime": "runsc",
+                                "local_image_root": str(self.root / "artifacts")},
+                    "gateway": {"home": str(self.root)}, "workspace_root": str(self.root / "users")}
+        with patch.object(images, "requested_images", return_value={"tools:latest": {}}), \
+                patch.object(images, "requested_conch_images", return_value={}), \
+                patch.object(images, "prepare_image", return_value=("local-x", {"path": "/x"})) as prepare, \
+                patch.object(images.platform, "machine", return_value="x86_64"):
+            result = images.prepare_registry(settings, export_rootfs=False)
+        kwargs = prepare.call_args.kwargs
+        self.assertFalse(kwargs["export_rootfs"])
+        self.assertTrue(kwargs["allow_pull"])
+        self.assertFalse(kwargs["cleanup_old"])
+        self.assertEqual(result["images"], {"tools:latest": "local-x"})
+
     def test_new_user_omits_images_while_preserving_business_defaults(self):
         config = self.root / "config.yaml"
         config.write_text('# keep-comment\ngateway: {}\nmodels:\n  defaults: []\nsandbox:\n  type: adx-environment\n  image: ubuntu:24.04\n  rootfs_template: local-old\n  cpu: 750\n')

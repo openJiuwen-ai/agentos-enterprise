@@ -180,6 +180,17 @@ reverse_modules() {
     echo "${reversed[@]}"
 }
 
+# ===== 判定指定模块列表是否包含某模块 =====
+# 用法: modules_include MODULES agent-runtime
+modules_include() {
+    local name="$1" wanted="$2" mod
+    local -n _mods="${name}"
+    for mod in "${_mods[@]}"; do
+        [ "${mod}" = "${wanted}" ] && return 0
+    done
+    return 1
+}
+
 # ===== 模块生命周期参与判定 =====
 # install/uninstall 全员参与；其余钩子（up/down/restart/status）剔除 INSTALL_ONLY_MODULES
 _module_has_phase() {
@@ -489,8 +500,14 @@ deploy_up() {
     ensure_agentos_user
     ensure_etcd_ready
     ensure_redis_ready
-    [ -r "${EROFS_SH}" ] || error "erofs script not found or not readable: ${EROFS_SH}"
-    bash "${EROFS_SH}" up || error "EROFS module is not available; run './agentos.sh install' first"
+    # EROFS 只服务于 ADX（agent-runtime）。裁剪部署未包含 agent-runtime 时，
+    # 不能因为内核 EROFS 不可用而阻断无关模块的 up。
+    if modules_include MODULES agent-runtime; then
+        [ -r "${EROFS_SH}" ] || error "erofs script not found or not readable: ${EROFS_SH}"
+        bash "${EROFS_SH}" up || error "EROFS module is not available; run './agentos.sh install' first"
+    else
+        info "Skipping EROFS: agent-runtime is not in MODULES"
+    fi
     info "Modules: $(modules_for_hook up)"
     run_hooks up
     _print_summary up
@@ -546,8 +563,14 @@ deploy_install() {
     info "Starting full install (local only)"
     info "Modules: ${MODULES[*]}"
     info "Python version: ${PYTHON_VERSION}"
-    [ -r "${EROFS_SH}" ] || error "erofs script not found or not readable: ${EROFS_SH}"
-    bash "${EROFS_SH}" install || error "EROFS artifact installation failed"
+    # 仅当 install 阶段包含 agent-runtime 时准备 EROFS 产物；裁剪部署不应被
+    # 无关内核模块前置条件阻断。
+    if modules_include INSTALL_MODULES agent-runtime; then
+        [ -r "${EROFS_SH}" ] || error "erofs script not found or not readable: ${EROFS_SH}"
+        bash "${EROFS_SH}" install || error "EROFS artifact installation failed"
+    else
+        info "Skipping EROFS artifacts: agent-runtime is not in the install module set"
+    fi
     # 先把 deploy 目录持久化到 ~/.agentos/deploy，避免安装包/解压目录被删除后无法 up/down
     _persist_deploy_dir
     run_hooks install
