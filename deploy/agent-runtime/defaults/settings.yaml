@@ -49,17 +49,26 @@ runtime:
   # tool_image_dir: /root/resources/MindAgent-image
   # tool_image_tar: tool-sandbox_latest.tar
   local_image_bindings_file: ${ADX_LOCAL_IMAGE_BINDINGS_FILE}
+  # With runsc enabled, Local rootfs defaults to descendants of <local_image_root>/objects.
+  # Override with deployment-controlled absolute directories. An empty list disables it.
+  # allowed_local_rootfs_dirs: [/var/lib/agentos/local-images/objects]
   # Optional offline Docker archive paths, keyed by their original image reference.
   # local_images:
+  #   my-tools:v1: {}  # already loaded in the local Docker store
   #   ubuntu:24.04:
   #     archive: /root/resources/images/ubuntu-24.04.tar
-  # Supervisor uses its registered builtin binding; runsc tools use the default local rootfs.
+  # Deployment exports these images once and provides Local paths and image
+  # metadata to builtin launch/workspace settings. Third-party launch-spec writers
+  # prepare their own complete Local specs. ADX receives the Local source directly.
+  # Supervisor retains its builtin binding; deployment resolves the selected tool_image.
   # Explicit agent_image/tool_image values must match the selected runtime.
   # Optional native ADX checkpoint_storage mapping; cross-node restore requires shared storage.
   # Keep checkpoint files outside user workspace mounts.
   runtime_control:
     key_file: ${ADX_CONFIG_DIR}/secrets/runtime-control-key
 network:
+  # Optional Supervisor IPv4 pool. When unset, each node selects and reuses a route-compatible pool.
+  # supervisor_subnet: <IPv4 CIDR>
   # Outbound business access: N0 closed, N1 explicit origins, N2 public Internet.
   # These presets apply to the managed runsc AgentServer and tool runtimes.
   agent_profile: N2

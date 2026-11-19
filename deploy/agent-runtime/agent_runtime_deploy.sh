@@ -6,15 +6,13 @@
 #
 # 角色映射：
 #   master 节点     -> coordinator profile   adx-coordinator（调度/心跳/路由发布）
-#   非 master 节点  -> node + ingress-api profile
+#   所有节点        -> node + ingress-api profile
 #                      node:        adxlet（内嵌 Relay，Environment 生命周期）
 #                      ingress-api: API Server（内嵌 Ingress，回环和受限网桥入口）
 #   redis           已外置独立部署（agentos-redis.service，随 ./agentos.sh init 启动，见 ../redis.sh）
 #
 # 启动顺序（由 adxctl supervisor 保证）：Redis -> Coordinator -> node(adxlet) -> ingress-api(API Server)
-# 非 master 节点的 node / ingress-api 是两份独立部署（adxctl 同一 state_dir 只能运行一个部署）。
-# 单节点拓扑（cluster_nodes 只有一项）：唯一节点既是 master，
-# 也补齐 node 部署（等价 standalone）；所有节点均提供本地 HTTP Ingress。
+# node / ingress-api 是两份独立部署（adxctl 同一 state_dir 只能运行一个部署）。
 #
 # 用法:
 #   ./agent_runtime_deploy.sh up --ip 192.168.1.1
@@ -104,12 +102,17 @@ _adx_prepare_environment() {
         || error "Failed to provision ADX credentials through deployment SSH"
     local redis_host="${ADX_MASTER_HOST}"
     [ "${IS_MASTER}" != "1" ] || redis_host="127.0.0.1"
+    local sandbox_bridge=0
+    if _adx_use_bundled_sandboxd; then
+        sandbox_bridge=1
+    fi
     local cluster_config
     cluster_config=$(_adx_cluster_config)
     "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/adx_integration.py" prepare-env \
         --config "${cluster_config}" --environment-file "${ADX_ENV_FILE}" \
         --node-ip "${node_ip}" --redis-host "${redis_host}" --python "$(command -v "${ADX_BUSINESS_PYTHON}")" \
-        --config-dir "${ADX_CONFIG_DIR}" || error "Failed to prepare ADX deployment environment"
+        --config-dir "${ADX_CONFIG_DIR}" --sandbox-bridge "${sandbox_bridge}" \
+        || error "Failed to prepare ADX deployment environment"
     _adx_load_environment
     info "Prepared ADX environment: ${ADX_ENV_FILE}"
 }
@@ -132,7 +135,6 @@ BIND_IP="${BIND_IP:-}"
 CMD=""
 IS_MASTER=""
 ADX_MASTER_HOST=""
-IS_SINGLE_NODE=""
 ADXCTL_BIN=""
 
 # ===== 日志函数 =====
@@ -321,11 +323,9 @@ _adx_version() {
 # Fixed YAML is shipped in the release; adxctl expands environment bindings.
 _adx_install_default() {
     local profile="$1" target="$2"
-    # MODULES 不含 conch 时，默认节点模板也要裁掉 conch class/socket，
-    # 避免 ADX 启动阶段探测不存在的 conchd。
-    if [ "${profile}" = "node" ] && [ "${AGENTOS_CONCH_MODULE:-1}" != "1" ]; then
+    if [ "${profile}" = "node" ]; then
         "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/adx_integration.py" default-config \
-            --profile node --config "${target}" && return 0
+            --profile node --config "${target}" --environment-file "${ADX_ENV_FILE}" && return 0
         return 1
     fi
     install -m 600 "${SCRIPT_DIR}/defaults/${profile}.yaml" "${target}"
@@ -341,7 +341,7 @@ _adx_apply_tracing() {
 }
 
 # ===== 角色推导 =====
-# master 节点 -> coordinator 部署；非 master -> node + ingress-api 部署。
+# master 节点额外部署 coordinator；所有节点部署 node + ingress-api。
 # The configured inventory determines placement. Existing units only affect cleanup.
 _adx_detect_role() {
     IS_MASTER=""
@@ -349,7 +349,7 @@ _adx_detect_role() {
     local_ip=$(get_local_ip) || return 1
     # Freeze selection for role detection, certificates, and all rendered configs.
     BIND_IP="${local_ip}"
-    IS_SINGLE_NODE=$(_adx_cfg single-node) || return 1
+    _adx_cfg single-node >/dev/null || return 1
     if _adx_cfg is-master-node >/dev/null 2>&1; then
         IS_MASTER=1
         ADX_MASTER_HOST="${local_ip}"
@@ -360,7 +360,7 @@ _adx_detect_role() {
     fi
     info "Local IP: ${local_ip}"
     if [ "${IS_MASTER}" = "1" ]; then
-        info "Role: master -> coordinator$([ "${IS_SINGLE_NODE}" = "1" ] && echo " + node + ingress-api (single-node topology)")"
+        info "Role: master -> coordinator + node + ingress-api"
     else
         info "Role: non-master -> node + ingress-api"
     fi
@@ -430,12 +430,9 @@ _adx_prepare_coordinator() {
 
 }
 
-# ===== 公共准备：node 部署（非 master 节点；单节点拓扑下 master 也需要）=====
+# ===== 公共准备：node 部署 =====
 _adx_prepare_node() {
     _adx_require_adxctl
-    if [ "${IS_MASTER}" = "1" ] && [ "${IS_SINGLE_NODE}" != "1" ]; then
-        error "node deployment is only for non-master nodes (or single-node masters)"
-    fi
 
     "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/adx_integration.py" check \
         --environment-file "${ADX_ENV_FILE}" || error "ADX business dependencies are not ready"
@@ -445,6 +442,7 @@ _adx_prepare_node() {
     if _adx_use_bundled_sandboxd; then
         "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/adx_integration.py" runsc-node-config \
             --config "${ADX_NODE_CONFIG_FILE}" --runsc-socket "${ADX_SANDBOXD_SOCKET}" \
+            --environment-file "${ADX_ENV_FILE}" \
             || error "Failed to configure ADX runsc node"
     else
         _adx_install_default node "${ADX_NODE_CONFIG_FILE}"
@@ -455,7 +453,7 @@ _adx_prepare_node() {
     success "node deployment config validated"
 }
 
-# ===== 公共准备：ingress-api 部署（非 master 节点；单节点拓扑下 master 也需要）=====
+# ===== 公共准备：ingress-api 部署 =====
 _adx_prepare_ingress() {
     _adx_require_adxctl
 
@@ -466,7 +464,7 @@ _adx_prepare_ingress() {
     _adx_link_logs "${ADX_INGRESS_STATE_DIR}"
     "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/adx_integration.py" ingress-config \
         --config "${ADX_INGRESS_CONFIG_FILE}" --environment-file "${ADX_ENV_FILE}" \
-        || error "Failed to configure ADX ingress local rootfs templates"
+        || error "Failed to configure ADX ingress Local rootfs allowlist"
     _adx_apply_tracing "${ADX_INGRESS_CONFIG_FILE}"
     "${ADXCTL_BIN}" -c "${ADX_INGRESS_CONFIG_FILE}" validate || error "adxctl validate failed (see above)"
     _adx_assert_effective_config "${ADX_INGRESS_CONFIG_FILE}" ingress-api
@@ -716,9 +714,7 @@ _adx_cleanup_legacy_executor() {
     fi
 }
 
-# ===== up / down 分发：区分 master（coordinator）与非 master（node + ingress-api）=====
-# 先做角色推导（config.py is-master-node），
-# master 走 coordinator 变体，非 master 走 node/agent 变体
+# ===== up / down 分发 =====
 deploy_adx_up() {
     _adx_detect_role || error "Cannot determine ADX node role from config.yaml"
     _adx_prepare_environment
@@ -771,7 +767,7 @@ _adx_rollback_units() {
     done
 }
 
-# node + ingress-api 两份部署（非 master 节点；单节点拓扑下 master 同样调用）：
+# node + ingress-api 两份部署：
 # 先完成两份配置生成与校验，再按 agent-dx 推荐顺序拉起（node 先于 ingress-api）；
 # 任一 enable / 等待失败都回滚本次已启动的全部 unit（disable --now）
 _adx_up_worker_units() {
@@ -825,23 +821,8 @@ deploy_adx_up_systemd() {
         _adx_wait_unit_active "${ADX_SVC}" \
             || { _adx_rollback_units "${ADX_SVC}"; error "${ADX_SVC} not active (rolled back), see: journalctl -u ${ADX_SVC}"; }
         success "${ADX_SVC} up (coordinator)"
-
-        # 单节点拓扑：唯一节点同时承担 node + ingress-api
-        if [ "${IS_SINGLE_NODE}" = "1" ]; then
-            _adx_up_worker_units
-        else
-            _adx_prepare_ingress
-            _adx_generate_unit "${ADX_INGRESS_SVC}" "${ADX_INGRESS_CONFIG_FILE}" "AgentOS ADX Ingress API"
-            systemctl daemon-reload
-            _adx_restart_changed_unit "${ADX_INGRESS_SVC}" "${ADX_INGRESS_CONFIG_FILE}" "${ADX_INGRESS_STATE_DIR}"
-            systemctl enable --now "${ADX_INGRESS_SVC}" && _adx_wait_unit_active "${ADX_INGRESS_SVC}" \
-                || { _adx_rollback_units "${ADX_INGRESS_SVC}" "${ADX_SVC}"; error "Failed to start ${ADX_INGRESS_SVC}"; }
-            _adx_refresh_ingress_unit_tls
-        fi
-    else
-        # 非 master：node + ingress-api 两份部署
-        _adx_up_worker_units
     fi
+    _adx_up_worker_units
 }
 
 deploy_adx_down_systemd() {
@@ -907,7 +888,7 @@ _adx_stop_supervisor() {
     return 1
 }
 
-# node + ingress-api 两份 supervisor（非 master 节点；单节点拓扑下 master 同样调用）：
+# node + ingress-api 两份 supervisor：
 # 先完成两份配置生成与校验，再依次拉起
 _adx_up_worker_supervisors() {
     _adx_prepare_node
@@ -934,21 +915,8 @@ deploy_adx_up_process() {
             || error "failed to apply coordinator deployment configuration (process mode)"
         _adx_start_supervisor "${ADX_CONFIG_FILE}" "${ADX_STATE_DIR}" \
             || error "failed to start coordinator deployment (process mode)"
-
-        # 单节点拓扑：唯一节点同时承担 node + ingress-api
-        if [ "${IS_SINGLE_NODE}" = "1" ]; then
-            _adx_up_worker_supervisors
-        else
-            _adx_prepare_ingress
-            _adx_restart_changed_supervisor "${ADX_INGRESS_CONFIG_FILE}" "${ADX_INGRESS_STATE_DIR}" \
-                || error "failed to apply master ingress-api deployment configuration (process mode)"
-            _adx_start_supervisor "${ADX_INGRESS_CONFIG_FILE}" "${ADX_INGRESS_STATE_DIR}" \
-                || error "failed to start master ingress-api deployment (process mode)"
-        fi
-    else
-        # 非 master：node + ingress-api 两份部署
-        _adx_up_worker_supervisors
     fi
+    _adx_up_worker_supervisors
 }
 
 deploy_adx_down_process() {
@@ -1025,19 +993,10 @@ deploy_adx_status() {
     ver=$(_adx_version)
     _adx_detect_role >/dev/null 2>&1 || true
 
-    # 按角色选择要探测的 unit / 部署文件；角色推导失败时兜底探测全部
-    # 单节点拓扑下 master 也部署了 node + ingress-api，一并探测
-    local -a svcs
-    if [ "${IS_MASTER}" = "1" ]; then
-        if [ "${IS_SINGLE_NODE}" = "1" ]; then
-            svcs=("${ADX_SVC}" "${ADX_NODE_SVC}" "${ADX_INGRESS_SVC}")
-        else
-            svcs=("${ADX_SVC}" "${ADX_INGRESS_SVC}")
-        fi
-    elif [ "${IS_MASTER}" = "0" ]; then
+    # 角色推导失败时兜底探测全部。
+    local -a svcs=("${ADX_SVC}" "${ADX_NODE_SVC}" "${ADX_INGRESS_SVC}")
+    if [ "${IS_MASTER}" = "0" ]; then
         svcs=("${ADX_NODE_SVC}" "${ADX_INGRESS_SVC}")
-    else
-        svcs=("${ADX_SVC}" "${ADX_NODE_SVC}" "${ADX_INGRESS_SVC}")
     fi
 
     # systemd 模式：本机存在任一角色 unit 才按 unit 探测，否则回退进程模式
@@ -1077,13 +1036,9 @@ deploy_adx_status() {
             "${ADX_NODE_CONFIG_FILE}") role="node" ;;
             *) role="ingress-api" ;;
         esac
-        # 只探测当前角色对应的部署文件（单机 master 也探测 node/ingress-api；角色未知时探测全部存在的）
-        local wanted=0
-        case "${role}:${IS_MASTER}" in
-            "coordinator:1"|"ingress-api:1"|"node:0"|"ingress-api:0"|"coordinator:"|"node:"|"ingress-api:") wanted=1 ;;
-            "node:1") [ "${IS_SINGLE_NODE}" = "1" ] && wanted=1 ;;
-        esac
-        [ "${wanted}" = "1" ] || continue
+        if [ "${role}" = "coordinator" ] && [ "${IS_MASTER}" = "0" ]; then
+            continue
+        fi
         if [ -f "${conf}" ]; then
             _adx_status_process "${conf}" "${ver}" "${role}" || rc=1
         else
@@ -1141,13 +1096,12 @@ Usage: ./agent_runtime_deploy.sh [COMMAND] [OPTIONS]
 
 角色映射（沿用旧 master/agent 划分，按节点角色自动选择 profile）:
   master 节点      -> coordinator profile   （Coordinator，redis 已外置经 redis_url 接入）
-  非 master 节点   -> node profile          （adxlet + 内嵌 Relay）
+  所有节点         -> node profile          （adxlet + 内嵌 Relay）
                    +  ingress-api profile   （API Server + 内嵌 Ingress，回环和受限网桥入口）
 
 启动顺序（adxctl supervisor 保证）: Redis -> Coordinator -> node(adxlet) -> ingress-api(API Server)
-非 master 节点的 node / ingress-api 是两份独立部署（各自 deployment yaml / state_dir / unit）。
-单节点拓扑（cluster_nodes 只有一项）时唯一节点既是 master，
-也部署 node + ingress-api。Gateway 通过本节点 HTTPS Ingress 接入。
+node / ingress-api 是两份独立部署（各自 deployment yaml / state_dir / unit）。
+Gateway 通过本节点 Ingress 接入。
 
 Commands (Required):
   up        角色推导后生成本机部署文件并启动（默认 systemd 托管）

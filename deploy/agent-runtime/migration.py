@@ -28,6 +28,15 @@ def tool_image_source(sandbox: dict, environment: dict | None = None) -> dict:
     result = copy.deepcopy(sandbox)
     values = environment or {}
 
+    for name, key in (("TOOL_SANDBOX_TYPE", "type"), ("TOOL_SANDBOX_EXECUTOR", "executor")):
+        if values.get(name):
+            result[key] = values[name].strip()
+    if values.get("TOOL_SANDBOX_ENABLE"):
+        enabled = values["TOOL_SANDBOX_ENABLE"].strip().lower()
+        if enabled not in ("true", "false", "1", "0"):
+            raise ValueError("TOOL_SANDBOX_ENABLE must be true or false")
+        result["enabled"] = enabled in ("true", "1")
+
     def replace(match):
         value = values.get(match.group(1))
         return value if value else (match.group(2) or "")
@@ -48,6 +57,17 @@ def tool_image_source(sandbox: dict, environment: dict | None = None) -> dict:
     for key in ('cpu', 'cpu_limit', 'memory', 'mem_limit', 'idle_timeout'):
         if isinstance(result.get(key), str):
             result[key] = int(result[key]) if result[key] else None
+    for name, key, limit in (("TOOL_SANDBOX_CPU", "cpu", "cpu_limit"),
+                              ("TOOL_SANDBOX_MEMORY", "memory", "mem_limit"),
+                              ("TOOL_SANDBOX_IDLE_TIMEOUT", "idle_timeout", None)):
+        if values.get(name):
+            value = int(values[name])
+            if value < 0 or key != "idle_timeout" and value == 0:
+                raise ValueError(f"{name} is outside the supported ADX range")
+            result[key] = value
+            if limit:
+                result[limit] = max(result.get(limit) or value, value)
+
     for key in ('user', 'group'):
         value = values.get('TOOL_SANDBOX_' + key.upper())
         if value and value.strip():
@@ -97,7 +117,7 @@ def legacy_tool_image(sandbox: dict, default_conch_images=()) -> str | None:
             return None
         raise ValueError(
             f"Custom Conch template {image} cannot be exported through Docker; "
-            "prepare a Local rootfs and configure sandbox.type=adx-environment with rootfs_template"
+            "prepare a Local rootfs and configure sandbox.type=adx-environment with rootfs.type=local"
         )
     if executor != "docker":
         raise ValueError(f"Cannot convert image for historical sandbox.executor={executor}")
@@ -107,7 +127,8 @@ def legacy_tool_image(sandbox: dict, default_conch_images=()) -> str | None:
 logger = logging.getLogger(__name__)
 
 ADX_TOOL_KEYS = (
-    "image", "rootfs_template", "local_images", "runtime", "workdir", "mounts", "cpu", "cpu_limit", "memory", "mem_limit",
+    "image", "rootfs", "prepared_image", "image_env", "local_images", "runtime", "workdir", "mounts",
+    "cpu", "cpu_limit", "memory", "mem_limit",
     "idle_timeout", "user", "group", "network", "connection", "env", "create_timeout",
     "schedule_timeout", "endpoint_file", "legacy_conch_default_images", "conch_image", "runtime_defaults", "restart_policy",
 )
@@ -115,19 +136,30 @@ ADX_TOOL_KEYS = (
 
 def select_local_rootfs(sandbox: dict, deployment: dict) -> dict:
     """Translate an image reference through the OS-prepared offline catalog."""
+    rootfs = sandbox.get("rootfs")
+    prepared = sandbox.get("prepared_image")
+    if isinstance(rootfs, dict) and rootfs.get("type") == "local":
+        if not isinstance(prepared, dict) or prepared.get("path") != rootfs.get("path"):
+            sandbox.pop("prepared_image", None)
+            if prepared:
+                sandbox.pop("image_env", None)
+            return sandbox
     images = deployment.get("local_images")
     if images is None:
         return sandbox
-    if not isinstance(images, dict) or any(not isinstance(key, str) or not isinstance(value, str)
-                                           or not value for key, value in images.items()):
-        raise ValueError("local_images must map image references to registered local rootfs names")
+    if not isinstance(images, dict) or any(not isinstance(key, str) or not isinstance(value, dict)
+            or not isinstance(value.get("path"), str) or not value["path"].startswith('/')
+            for key, value in images.items()):
+        raise ValueError("local_images must map image references to prepared Local rootfs metadata")
     sandbox["local_images"] = copy.deepcopy(images)
     image = sandbox.get("image")
-    if image:
-        template = images.get(image)
-        if not template:
-            raise ValueError(f"Image {image} has no prepared local rootfs; offline deployment must prepare it first")
-        sandbox["rootfs_template"] = template
+    artifact = images.get(image) if image else None
+    if image and not artifact:
+        raise ValueError(f"Image {image} has no prepared local rootfs; offline deployment must prepare it first")
+    if artifact:
+        sandbox["rootfs"] = {"type": "local", "path": artifact["path"]}
+        sandbox["image_env"] = copy.deepcopy(artifact.get("env") or {})
+        sandbox["prepared_image"] = {"reference": image, "path": artifact["path"]}
     return sandbox
 
 
@@ -145,6 +177,23 @@ def workspace_sandbox(sandbox: dict) -> dict:
     else:
         result.pop('connection', None)
     return result
+
+
+def clear_workspace_image(sandbox: dict) -> dict:
+    """Remove a Gateway workspace image and its defaults from a new-user seed."""
+    artifact = (sandbox.get("local_images") or {}).get(sandbox.get("image")) or {}
+    environment = dict(sandbox.get("env") or {})
+    if "image_env" not in sandbox:
+        for key, value in (artifact.get("env") or {}).items():
+            if environment.get(key) == value:
+                environment.pop(key)
+    if environment:
+        sandbox["env"] = environment
+    else:
+        sandbox.pop("env", None)
+    for key in ("image", "rootfs", "image_env", "prepared_image"):
+        sandbox.pop(key, None)
+    return sandbox
 
 
 def workspace_overrides(path, document: dict) -> dict:
@@ -268,9 +317,12 @@ def migrate_adx_sandbox(local: dict | None, deployment: dict) -> dict:
             deployment.get("image") if previous_runtime == "conch" else None
         ) or "agentos-tools:v1"
         # Python and Local-rootfs metadata belong to the runsc deployment.
-        for key in ("runtime_identity", "local_images", "rootfs_template", "network", "env", "mounts"):
+        for key in ("runtime_identity", "local_images", "rootfs", "network", "env", "mounts"):
             deployment.pop(key, None)
         local = copy.deepcopy(local)
+        if local.pop("prepared_image", None):
+            local.pop("rootfs", None)
+            local.pop("image_env", None)
         if local.get("type") == "jiuwenbox-conch" and local.get("template_name"):
             local["image"] = local["template_name"]
         _warn_conch_native_network()
@@ -299,6 +351,8 @@ def migrate_adx_sandbox(local: dict | None, deployment: dict) -> dict:
         skip_legacy = legacy and (key in ("runtime", "connection")
                                   or (key == "image" and deployment.get("runtime") not in ("runsc", "conch")))
         if key in local and not skip_legacy and not (legacy and local[key] is None and key != 'restart_policy'):
+            if key == "rootfs" and isinstance(local[key], dict) and local[key].get("type") != "local":
+                continue
             result[key] = copy.deepcopy(local[key])
     for request, limit in (("cpu", "cpu_limit"), ("memory", "mem_limit")):
         if local.get(request) is not None and limit not in local:
@@ -316,7 +370,12 @@ def migrate_adx_sandbox(local: dict | None, deployment: dict) -> dict:
         rootfs = {}
     if not isinstance(rootfs, dict):
         raise ValueError("sandbox.rootfs must be a mapping")
-    unsupported = set(rootfs) - {"workdir", "mounts", "user"}
+    allowed_rootfs = {"workdir", "mounts", "user"}
+    if rootfs.get("type") == "local":
+        # Older workspaces may contain readonly. ADX owns the access mode.
+        allowed_rootfs.update({"type", "path", "readonly"})
+        result["rootfs"] = {key: copy.deepcopy(rootfs[key]) for key in ("type", "path") if key in rootfs}
+    unsupported = set(rootfs) - allowed_rootfs
     if unsupported:
         raise ValueError("sandbox.rootfs fields require explicit ADX migration: " + ", ".join(sorted(unsupported)))
     if "workdir" not in local and rootfs.get("workdir"):
@@ -379,7 +438,8 @@ def migrate_adx_sandbox(local: dict | None, deployment: dict) -> dict:
     connection["verify_tls"] = bool(use_tls)
     if not use_tls or "use_tls" in connection:
         connection["use_tls"] = bool(use_tls)
-    result.update(type="adx-environment", enabled=True, startup_mode="external", connection=connection)
+    result.update(type="adx-environment", enabled=local.get("enabled", deployment.get("enabled", True)),
+                  startup_mode="external", connection=connection)
     if deployment.get("url"):
         result["url"] = deployment["url"]
     else:

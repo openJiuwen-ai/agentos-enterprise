@@ -93,8 +93,6 @@ _AGENTOS_ENV_CLEANUP = (
     "YR_PYTHON_VERSION", "YR_FUNC_CODE_DIR", "FUNC_SVC_NAME", "FUNCTION_ID", "SANDBOX_TYPE",
     "MGR_CPU", "MGR_MEMORY", "MGR_MIN_INSTANCE", "MGR_MAX_INSTANCE", "MGR_CONCURRENT_NUM",
     "GATEWAY_CONCURRENCY", "GATEWAY_INVOKE_TIMEOUT",
-    "TOOL_SANDBOX_TYPE", "TOOL_SANDBOX_ENABLE", "TOOL_SANDBOX_IMAGE", "TOOL_SANDBOX_EXECUTOR",
-    "TOOL_SANDBOX_USER", "TOOL_SANDBOX_GROUP",
     "ADX_GATEWAY_TOKEN", "JIUWENSWARM_ADX_API_TOKEN",
 )
 _TOOL_ENV_SETTINGS = (
@@ -116,6 +114,27 @@ def business_environment(settings):
     retained = dotenv_values(installed, interpolate=False) if installed.is_file() else {}
     retained.update({key: value for key, value in values.items() if value})
     return retained
+
+
+def normalize_tool_inputs(settings):
+    """Resolve deployment dotenv inputs once for image preparation and config generation."""
+    if settings.get("profile", "standalone") != "agentos":
+        return settings
+    values = business_environment(settings)
+    runtime = settings.setdefault("runtime", {})
+    config = data_directory(settings) / "config/config.yaml"
+    sandbox = (read_yaml(config).get("sandbox") or {}) if config.is_file() else {}
+    selector = migration_module().tool_image_source(sandbox, values)
+    if not selector.get("type"):
+        selector["type"] = "adx-environment"
+    if values.get("TOOL_SANDBOX_EXECUTOR"):
+        selector["runtime"] = "conch" if values["TOOL_SANDBOX_EXECUTOR"].strip() == "conch" else "runsc"
+    runtime["tool_runtime"] = migration_module().tool_source_runtime(selector, runtime.get("tool_runtime", "runsc"))
+    runtime["_tool_inputs_normalized"] = True
+    for key in ("image", "cpu", "memory", "idle_timeout", "user", "group", "enabled"):
+        if key in selector:
+            runtime["tool_" + key] = selector[key]
+    return settings
 
 
 def retain_gateway_environment(settings):
@@ -151,7 +170,7 @@ def migrate_python_environment(path):
 
 
 def migrate_tool_environment(config, path):
-    """Preserve effective legacy resource overrides in YAML before removing them."""
+    """Apply supported dotenv resource inputs to the prepared YAML."""
     from dotenv import dotenv_values
 
     if not Path(path).is_file():
@@ -179,7 +198,24 @@ def migrate_tool_environment(config, path):
 def local_image_bindings(runtime):
     path = runtime.get("local_image_bindings_file")
     bindings = json.loads(Path(path).read_text()) if path else runtime.get("local_image_bindings")
-    return json.loads(bindings) if isinstance(bindings, str) else bindings
+    bindings = json.loads(bindings) if isinstance(bindings, str) else bindings
+    if bindings is None:
+        return None
+    if not isinstance(bindings, dict) or not isinstance(bindings.get("images", {}), dict):
+        raise ValueError("Local image bindings must contain an images mapping")
+    bindings = copy.deepcopy(bindings)
+    for reference, value in bindings.get("images", {}).items():
+        if isinstance(value, str):
+            value = bindings.get("templates", {}).get(value)
+        if (not isinstance(value, dict) or not isinstance(value.get("path"), str)
+                or not value["path"].startswith("/")):
+            raise ValueError(f"Image {reference} must have a prepared Local rootfs")
+        if value.get("env") is not None and (not isinstance(value["env"], dict)
+                or any(not isinstance(k, str) or not isinstance(v, str) for k, v in value["env"].items())):
+            raise ValueError(f"Image {reference} environment must contain string values")
+        bindings["images"][reference] = value
+    bindings.pop("templates", None)
+    return bindings
 
 
 def gateway_config(config, settings, environment=None, *, deployment_owned=False, migration_defaults=None):
@@ -189,6 +225,8 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
     if environment and Path(environment).is_file():
         from dotenv import dotenv_values
         values = dotenv_values(environment, interpolate=False)
+    if deployment_owned and settings.get("profile", "standalone") == "agentos":
+        values = business_environment(settings)
     config["sandbox"] = tool_image_source(config.get("sandbox") or {}, values)
     runtime = settings["runtime"]
     network = settings.get("network", {})
@@ -270,10 +308,12 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
         # merged separately and must retain their explicit restrictions.
         config["sandbox"].pop("network", None)
     defaults = {
-        "enabled": True, "type": "adx-environment",
+        "enabled": runtime.get("tool_enabled", True), "type": "adx-environment",
         "runtime": runtime.get("tool_runtime", "runsc"),
-        "cpu": 2000, "memory": 4096, "cpu_limit": 2000, "mem_limit": 4096,
-        "idle_timeout": 60, "user": str(account.pw_uid), "group": str(account.pw_gid),
+        "cpu": runtime.get("tool_cpu", 2000), "memory": runtime.get("tool_memory", 4096),
+        "cpu_limit": runtime.get("tool_cpu", 2000), "mem_limit": runtime.get("tool_memory", 4096),
+        "idle_timeout": runtime.get("tool_idle_timeout", 600),
+        "user": runtime.get("tool_user", str(account.pw_uid)), "group": runtime.get("tool_group", str(account.pw_gid)),
         "restart_policy": copy.deepcopy(runtime.get("tool_restart_policy", DEFAULT_RESTART_POLICY)),
         "connection": {"verify_tls": True},
     }
@@ -309,8 +349,15 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
             defaults["local_images"] = copy.deepcopy(bindings.get("images", {}))
             defaults["runtime_defaults"]["runsc"]["local_images"] = copy.deepcopy(bindings.get("images", {}))
             defaults["legacy_conch_default_images"] = copy.deepcopy(bindings.get("legacy_conch_default_images", []))
-        if runtime.get("agent_runtime") == "runsc":
-            gateway["adx"]["local_images"] = copy.deepcopy(bindings.get("images", {}))
+        if runtime.get("agent_runtime") == "runsc" and runtime.get("agent_image"):
+            prepared = bindings.get("images", {}).get(runtime["agent_image"])
+            if (not isinstance(prepared, dict) or not isinstance(prepared.get("path"), str)
+                    or not prepared["path"].startswith("/")):
+                raise ValueError("The builtin Agent image must have a prepared Local rootfs")
+            launch = gateway["adx"]["builtin_launch"]
+            launch["rootfs"] = {"type": "local", "path": prepared["path"]}
+            launch["image_env"] = copy.deepcopy(prepared.get("env") or {})
+            gateway["adx"].pop("builtin_image", None)
     if migration_defaults is not None:
         migration_defaults.update(copy.deepcopy(defaults))
     config["sandbox"] = migrate_adx_sandbox(config.get("sandbox"), defaults)
@@ -419,14 +466,11 @@ def write_user_template(config, settings):
     prepared.pop('gateway', None)
     sandbox = prepared['sandbox']
     if sandbox.get('runtime') == 'runsc':
-        for key in ('image', 'rootfs_template'):
-            sandbox.pop(key, None)
+        sandbox = migration_module().clear_workspace_image(sandbox)
         image = config['sandbox'].get('deployment_image')
         if image:
             sandbox['image'] = image
-            catalog = config['sandbox'].get('local_images') or {}
-            if image in catalog:
-                sandbox['rootfs_template'] = catalog[image]
+            sandbox = migration_module().select_local_rootfs(sandbox, config['sandbox'])
     prepared['sandbox'] = migration_module().workspace_sandbox(sandbox)
     path = data_directory(settings) / 'config/agentos-user-template.yaml'
     if not path.is_file() or read_yaml(path) != prepared:
@@ -526,6 +570,7 @@ def validate_user_configs(settings, *, failures=None):
 def preflight(settings):
     """Validate node inputs; incompatible users are reported independently."""
     retain_gateway_environment(settings)
+    normalize_tool_inputs(settings)
     check_business(settings)
     validate_user_configs(settings)
     config = data_directory(settings) / "config/config.yaml"
@@ -549,11 +594,13 @@ def apply_deployment_tracing(config, deployment_config, *, users_root=None):
     if users_root is not None and users_root.is_dir():
         _, _, failed = trace["sync_users"](users_root, endpoint=endpoints[0] if endpoints else "")
         if failed:
-            raise ValueError("Existing-user trace sync failed; fix the reported configs and retry up")
+            logging.warning("Tracing sync failed for %d existing user configuration(s); "
+                            "continuing startup. See the reported paths above.", failed)
 
 
 def configure(settings):
     retain_gateway_environment(settings)
+    normalize_tool_inputs(settings)
     check_business(settings)
     workspace = Path(settings["workspace_root"])
     if not workspace.is_dir():
@@ -575,9 +622,8 @@ def configure(settings):
             write_yaml(config, read_yaml(options["base_config"]))
     env_file = data / "config/.env"
     custom = Path(settings.get("business_env_file") or Path(__file__).resolve().parents[1] / "jiuwenswarm/.env.custom")
-    value = migrate_tool_environment(gateway_config(read_yaml(config), settings, env_file if env_file.exists() else custom,
-                                                   deployment_owned=True),
-                                     env_file if env_file.exists() else custom)
+    value = gateway_config(read_yaml(config), settings, env_file if env_file.exists() else custom,
+                           deployment_owned=True)
     agentos = value["gateway"].setdefault("agentos", {})
     if settings.get("profile", "standalone") == "standalone":
         agentos.update(auth_enabled=False, auth_service_url="", registry={"endpoint": ""})
@@ -645,8 +691,7 @@ def update_environment(path, settings, owner=None, *, service=False):
     token = Path(settings["token_file"]).read_text().strip()
     values = {}
     if service and settings.get("profile", "standalone") == "agentos":
-        retired = {*_AGENTOS_ENV_CLEANUP, *(item[0] for item in _TOOL_ENV_SETTINGS),
-                   "JIUWENSWARM_ADX_NODE_INGRESS_URL", "ADX_TOKEN"}
+        retired = {*_AGENTOS_ENV_CLEANUP, "JIUWENSWARM_ADX_NODE_INGRESS_URL", "ADX_TOKEN"}
         values.update({key: value for key, value in business_environment(settings).items()
                        if value and key not in retired})
     values["SSL_CERT_FILE"] = settings["ca_file"]
@@ -681,8 +726,7 @@ def update_environment(path, settings, owner=None, *, service=False):
         set_key(str(path), key, str(setting))
     existing = dotenv_values(path, interpolate=False)
     if settings.get("profile", "standalone") == "agentos":
-        resource_keys = tuple(item[0] for item in _TOOL_ENV_SETTINGS)
-        for key in (*_AGENTOS_ENV_CLEANUP, *resource_keys):
+        for key in _AGENTOS_ENV_CLEANUP:
             if key in existing:
                 unset_key(str(path), key)
     os.chown(path, owner.st_uid, owner.st_gid)
@@ -793,10 +837,10 @@ def check_business(settings):
     if "runsc" in selected and bindings.get("images"):
         import adx_environment
         from openjiuwen.extensions.sys_operation.sandbox.providers import adx_environment as core_adx
-        if "local-rootfs-templates" not in getattr(adx_environment, "SDK_CAPABILITIES", ()):
-            raise ValueError("Offline images require adx-environment 0.1.0rc5 or newer")
-        if "local-rootfs-templates" not in getattr(core_adx, "ADX_ENVIRONMENT_CAPABILITIES", ()):
-            raise ValueError("Agent Core must support registered local rootfs templates")
+        if "local-rootfs" not in getattr(adx_environment, "SDK_CAPABILITIES", ()):
+            raise ValueError("Offline images require adx-environment with LocalRootfs support")
+        if "local-rootfs" not in getattr(core_adx, "ADX_ENVIRONMENT_CAPABILITIES", ()):
+            raise ValueError("Agent Core must support caller-prepared Local rootfs")
 
 
 def shell_identity(settings):

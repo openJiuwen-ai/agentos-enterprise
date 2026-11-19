@@ -14,6 +14,10 @@ _OBSERVABILITY_BLOCKS = ("team_observability:", "agent_observability:")
 _OBSERVABILITY_KEYS = ("enabled", "exporter", "endpoint")
 
 
+class MissingTraceBlockError(ValueError):
+    """A historical config does not define a required tracing block."""
+
+
 def normalize_endpoint(value: str) -> str:
     """Return the Python OTLP/gRPC endpoint with an http scheme.
 
@@ -39,7 +43,7 @@ def _block_bounds(lines: list[str], header: str) -> tuple[int, int]:
             start = index
             break
     if start < 0:
-        raise ValueError(f"{header} block not found")
+        raise MissingTraceBlockError(f"{header} block not found")
 
     end = len(lines)
     for index in range(start + 1, len(lines)):
@@ -122,17 +126,20 @@ def sync_users(root: Path, *, endpoint: str) -> tuple[int, int, int]:
         raise ValueError(f"User root directory not found: {root}")
     if endpoint:
         normalize_endpoint(endpoint)
-    updated = unchanged = failed = 0
+    updated = unchanged = failed = skipped = 0
     for path in sorted(root.glob("*/.jiuwenswarm/config/config.yaml")):
         try:
             if apply_template(path, endpoint=endpoint):
                 updated += 1
             else:
                 unchanged += 1
+        except MissingTraceBlockError as exc:
+            skipped += 1
+            print(f"WARNING: Skipping tracing sync for {path}: {exc}; configuration unchanged", file=sys.stderr)
         except (OSError, ValueError) as exc:
             failed += 1
             print(f"Failed to sync {path}: {exc}", file=sys.stderr)
-    print(f"User trace sync: updated={updated}, unchanged={unchanged}, failed={failed}")
+    print(f"User trace sync: updated={updated}, unchanged={unchanged}, skipped={skipped}, failed={failed}")
     return updated, unchanged, failed
 
 

@@ -177,6 +177,8 @@ def install_sandboxd(release, config_dir, unit_path):
                 .replace("/run/sandboxd/", "/run/agentos-sandboxd/"))
 
     config = render((examples / "sandboxd.toml").read_text())
+    # Use sandboxd's native instance capacity for AgentOS.
+    config = re.sub(r"(?m)^[ \t]*max_instance_num[ \t]*=[^\n]*\n?", "", config)
     config = config.replace('runsc = ""', f'runsc = "{config_dir}/agentos-runsc.json"')
     config = config.replace('/image-manager"', '/image-manager-nonroot"')
     network = _network_module()
@@ -281,17 +283,32 @@ def strip_conch_backend(config):
     return config
 
 
-def write_default_config(output, profile):
+def apply_supervisor_network(config, values):
+    service = config["service_overrides"]["adxlet"]
+    supervisor = service["config"].get("jiuwenbox", {}).get("classes", {}).get("supervisor")
+    pool = values.get("ADX_SUPERVISOR_CIDR")
+    if supervisor is None or not pool:
+        return
+    supervisor["policy"].setdefault("network", {}).setdefault("uplink", {})["subnet"] = pool
+    key = "ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS"
+    service["env"][key] = ",".join([
+        service["env"][key], pool, *json.loads(values["ADX_SUPERVISOR_LEGACY_CIDRS"]),
+    ])
+
+
+def write_default_config(output, profile, environment=None):
     """Render a fixed profile, stripping Conch when the module is not deployed."""
     if profile not in ("node", "ingress", "coordinator"):
         raise ValueError("unsupported ADX profile: " + str(profile))
     config = read_yaml(DEFAULTS / f"{profile}.yaml")
     if profile == "node" and not conch_module_enabled():
         strip_conch_backend(config)
+    if profile == "node" and environment is not None and environment.is_file():
+        apply_supervisor_network(config, read_environment(environment))
     write_yaml(output, config)
 
 
-def write_runsc_node_config(output, socket):
+def write_runsc_node_config(output, socket, environment=None):
     if not socket.is_absolute():
         raise ValueError("runsc requires an absolute Unix socket path")
     node = read_yaml(DEFAULTS / "node.yaml")
@@ -300,7 +317,7 @@ def write_runsc_node_config(output, socket):
     adxlet.pop("network_baseline", None)
     adxlet.pop("network_peer_aliases", None)
     adxlet.setdefault("execd_env", {})["ADX_EXECD_CONTROL_SOCKET_PATH"] = "/tmp/adx"
-    environment = Path(os.environ.get("ADX_CONFIG_DIR", "/opt/adx/config")) / "deployment.env"
+    environment = environment or Path(os.environ.get("ADX_CONFIG_DIR", "/opt/adx/config")) / "deployment.env"
     if environment.is_file():
         values = read_environment(environment)
         settings = load_settings(environment)
@@ -331,20 +348,32 @@ def write_runsc_node_config(output, socket):
                                       advertised_address=context["runtime_control_url"])
     if environment.is_file():
         bindings = local_image_bindings(read_environment(environment))
-        adxlet["local_rootfs_templates"] = literal_deployment_value(bindings.get("templates", {}))
         classes = adxlet.get("jiuwenbox", {}).get("classes", {})
         if "conch" in classes:
             images = classes["conch"]["images"]
             process = copy.deepcopy(images["agentos-tools:v1"]["process"])
             for reference, selector in bindings.get("conch_images", {}).items():
                 images[reference] = {**copy.deepcopy(selector), "process": process}
+        apply_supervisor_network(node, values)
     write_yaml(output, node)
 
 
 def write_ingress_config(output, environment_file):
     config = read_yaml(DEFAULTS / "ingress.yaml")
-    bindings = local_image_bindings(read_environment(environment_file))
-    config["service_overrides"]["apiserver"]["config"]["local_rootfs_templates"] = literal_deployment_value(bindings.get("templates", {}))
+    settings = load_settings(environment_file)
+    runtime = settings.get("runtime", {})
+    allowed_dirs = runtime.get("allowed_local_rootfs_dirs")
+    if allowed_dirs is None:
+        image_root = Path(runtime.get("local_image_root", "/var/lib/agentos/local-images"))
+        allowed_dirs = [str(image_root / "objects")] if "runsc" in selected_runtimes(settings) else []
+    if not isinstance(allowed_dirs, list) or any(
+        not isinstance(path, str) or not Path(path).is_absolute() for path in allowed_dirs
+    ):
+        raise ValueError("runtime.allowed_local_rootfs_dirs must list absolute directories")
+    if allowed_dirs:
+        config["service_overrides"]["apiserver"]["config"]["allowed_local_rootfs_dirs"] = (
+            literal_deployment_value(allowed_dirs)
+        )
     write_yaml(output, config)
 
 
@@ -377,10 +406,10 @@ def deployment_node_context(release, options, *, node_id=None):
                                         runtime_control_port=options.get('runtime_control_port', 19103))
 
 
-def ingress_listeners(context, *, worker):
+def ingress_listeners(context, *, sandbox_bridge):
     local = {'listen': f'127.0.0.1:{context["ingress_port"]}', 'tls': False, 'allow_http_credentials': True}
     listeners = [local]
-    if worker:
+    if sandbox_bridge:
         listeners.append({'listen': f'{context["bridge_ip"]}:{context["ingress_port"]}',
             'tls': False, 'allow_http_credentials': True, 'allowed_routes': [
                 {'path': 'exact:/healthz', 'method': 'GET'}, {'path': 'exact:/readyz', 'method': 'GET'},
@@ -390,11 +419,10 @@ def ingress_listeners(context, *, worker):
     return listeners
 
 
-def node_ingress_bindings(context, settings, *, worker):
-    """Use the sandbox bridge only when a selected backend prepares it."""
-    runsc = backend_enabled(settings, "runsc")
-    listeners = ingress_listeners(context, worker=worker and runsc)
-    url = context["ingress_url"] if runsc else f'http://127.0.0.1:{context["ingress_port"]}'
+def node_ingress_bindings(context, *, sandbox_bridge):
+    """Use the sandbox bridge only when this deployment starts sandboxd."""
+    listeners = ingress_listeners(context, sandbox_bridge=sandbox_bridge)
+    url = context["ingress_url"] if sandbox_bridge else f'http://127.0.0.1:{context["ingress_port"]}'
     return listeners, url
 
 
@@ -517,11 +545,19 @@ def read_environment(path):
     return values
 
 
+def normalize_tool_inputs(settings):
+    spec = importlib.util.spec_from_file_location("agentos_application_inputs", Path(__file__).with_name("configure.py"))
+    application = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(application)
+    return application.normalize_tool_inputs(settings)
+
+
 def load_settings(environment_file=None):
     path = environment_file or Path(os.environ.get("ADX_CONFIG_DIR", "/opt/adx/config")) / "deployment.env"
     variables = {"ADX_LOCAL_IMAGE_BINDINGS_FILE": str(Path(path).parent / "local-images.json"),
                  **read_environment(path)}
-    return network_settings(expand_defaults(read_yaml(DEFAULTS / "settings.yaml"), variables), variables)
+    settings = network_settings(expand_defaults(read_yaml(DEFAULTS / "settings.yaml"), variables), variables)
+    return normalize_tool_inputs(settings)
 
 
 def write_environment(path, variables):
@@ -634,15 +670,14 @@ def system_ca_file(exclude=None):
     raise ValueError("System CA bundle is missing; install ca-certificates before deployment")
 
 
-def prepare_environment(config_path, output, node_ip, python, config_dir, *, redis_host=None):
+def prepare_environment(config_path, output, node_ip, python, config_dir, *, sandbox_bridge, redis_host=None):
     config = read_yaml(config_path)
     values = deployment_variables(config, node_ip, python, config_dir)
-    settings = expand_defaults(read_yaml(DEFAULTS / "settings.yaml"), values)
+    settings = normalize_tool_inputs(expand_defaults(read_yaml(DEFAULTS / "settings.yaml"), values))
     if not Path(settings["token_file"]).is_file():
         raise ValueError("business credential is missing; run Master up and verify the deployment SSH connection")
     context = deployment_node_context(Path(values["ADX_PACKAGE_DIR"]), settings.get("network", {}), node_id=values.get("ADX_NODE_ID"))
-    worker = len(json.loads(values["ADX_CLUSTER_NODES"])) == 1 or node_ip not in config["cluster"]["master_nodes"]
-    listeners, node_url = node_ingress_bindings(context, settings, worker=worker)
+    listeners, node_url = node_ingress_bindings(context, sandbox_bridge=sandbox_bridge)
     values["ADX_INGRESS_LISTENERS"] = json.dumps(listeners, separators=(",", ":"))
     values["ADX_BRIDGE_IP"] = context["bridge_ip"]
     values["ADX_SANDBOX_CIDR"] = context["sandbox_cidr"]
@@ -650,6 +685,14 @@ def prepare_environment(config_path, output, node_ip, python, config_dir, *, red
     values["ADX_PYTHON_MOUNTS"] = json.dumps(python_mounts(python))
     values["ADX_AGENT_RUNTIME"] = settings["runtime"].get("agent_runtime", "supervisor")
     values["ADX_TOOL_RUNTIME"] = settings["runtime"].get("tool_runtime", "runsc")
+    if "supervisor" in selected_runtimes(settings):
+        previous = read_environment(output).get("ADX_SUPERVISOR_CIDR") if Path(output).is_file() else None
+        pool, legacy = _network_module().supervisor_network(
+            settings.get("network", {}).get("supervisor_subnet"), previous, context["sandbox_cidr"],
+        )
+        values["ADX_SUPERVISOR_CIDR"] = pool
+        values["ADX_SUPERVISOR_LEGACY_CIDRS"] = json.dumps(legacy, separators=(",", ":"))
+        print("Supervisor address pool: " + pool)
     values["ADX_NODE_CONTEXT_FILE"] = "/etc/agentos/sandboxd/node-context.json"
     if settings["ingress_url"].startswith("https://"):
         ensure_ingress_certificate(config_dir, node_ip)
@@ -684,7 +727,7 @@ def prepare_environment(config_path, output, node_ip, python, config_dir, *, red
     spec = importlib.util.spec_from_file_location("agentos_local_images", Path(__file__).with_name("local_images.py"))
     images = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(images)
-    bindings = images.prepare_registry(settings, export_rootfs=worker)
+    bindings = images.prepare_registry(settings)
     catalog = Path(values["ADX_LOCAL_IMAGE_BINDINGS_FILE"])
     catalog.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".local-images-", dir=catalog.parent)
@@ -889,6 +932,7 @@ def main():
     parser.add_argument("--environment-file", type=Path, default=Path(os.environ.get("ADX_CONFIG_DIR", "/opt/adx/config")) / "deployment.env")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--node-ip")
+    parser.add_argument("--sandbox-bridge", choices=("0", "1"))
     parser.add_argument("--runsc-socket", type=Path)
     parser.add_argument("--redis-host")
     parser.add_argument("--config-dir", type=Path, default=Path(os.environ.get("ADX_CONFIG_DIR", "/opt/adx/config")))
@@ -898,7 +942,7 @@ def main():
             parser.error("default-config requires --config")
         if args.profile is None:
             parser.error("default-config requires --profile")
-        write_default_config(args.config, args.profile)
+        write_default_config(args.config, args.profile, args.environment_file)
         return
     if args.action == "coordinator-config":
         if args.config is None:
@@ -943,7 +987,7 @@ def main():
     if args.action == "runsc-node-config":
         if args.config is None or args.runsc_socket is None:
             parser.error("runsc-node-config requires --config and --runsc-socket")
-        write_runsc_node_config(args.config, args.runsc_socket)
+        write_runsc_node_config(args.config, args.runsc_socket, args.environment_file)
         return
     if args.action == "release-label":
         print(release_label(args.release))
@@ -955,10 +999,10 @@ def main():
         install_sdk(args.release, args.python, args.wheelhouse)
         return
     if args.action == "prepare-env":
-        if not args.config or not args.node_ip:
-            parser.error("prepare-env requires --config and --node-ip")
+        if not args.config or not args.node_ip or args.sandbox_bridge is None:
+            parser.error("prepare-env requires --config, --node-ip and --sandbox-bridge")
         prepare_environment(args.config, args.environment_file, args.node_ip, args.python, args.config_dir,
-                            redis_host=args.redis_host)
+                            sandbox_bridge=args.sandbox_bridge == "1", redis_host=args.redis_host)
     elif args.action == "export-env":
         for key, value in read_environment(args.environment_file).items():
             print("export " + key + "=" + shlex.quote(value))

@@ -2,8 +2,12 @@
 """AgentOS tracing switch application tests."""
 
 from pathlib import Path
+import contextlib
+import io
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -85,14 +89,30 @@ class AgentOSTraceTests(unittest.TestCase):
         self.assertEqual(reverted.count("  exporter: otlp_grpc  # otlp_grpc / otlp_http / file"), 2)
         self.assertEqual(reverted.count("  endpoint:  # OTLP gRPC endpoint"), 2)
 
-    def test_missing_telemetry_block_is_an_error(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "gateway.yaml"
-            path.write_text("gateway:\n  x: 1\n", encoding="utf-8")
-            with self.assertRaises(ValueError):
-                agentos_trace.apply_template(path, endpoint="collector:4317")
+    def test_incomplete_user_tracing_configs_are_skipped_without_writes(self):
+        cases = (
+            "models: {}\ngateway:\n  x: 1",
+            TEMPLATE.split("agent_observability:")[0],
+            "telemetry:\n  enabled: false\nobservability:\n  team:\n    enabled: false\nmodels: {}\n",
+        )
+        for original in cases:
+            for endpoint in ("collector:4317", ""):
+                with self.subTest(original=original, endpoint=endpoint), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    path = root / "alice/.jiuwenswarm/config/config.yaml"
+                    path.parent.mkdir(parents=True)
+                    path.write_text(original)
+                    before = path.stat().st_mtime_ns
+                    errors = io.StringIO()
+                    with contextlib.redirect_stderr(errors):
+                        self.assertEqual(agentos_trace.sync_users(root, endpoint=endpoint), (0, 0, 0))
+                    self.assertIn("WARNING: Skipping tracing sync", errors.getvalue())
+                    self.assertIn(str(path), errors.getvalue())
+                    self.assertIn("block not found", errors.getvalue())
+                    self.assertEqual(path.read_text(), original)
+                    self.assertEqual(path.stat().st_mtime_ns, before)
 
-    def test_sync_existing_users_preserves_config_and_reports_failures(self):
+    def test_sync_existing_users_preserves_incomplete_configs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             good = root / "alice/.jiuwenswarm/config/config.yaml"
@@ -101,10 +121,48 @@ class AgentOSTraceTests(unittest.TestCase):
                 path.parent.mkdir(parents=True)
             good.write_text(TEMPLATE, encoding="utf-8")
             bad.write_text("models: {}\n", encoding="utf-8")
-            self.assertEqual(agentos_trace.sync_users(root, endpoint="collector:4317"), (1, 0, 1))
+            self.assertEqual(agentos_trace.sync_users(root, endpoint="collector:4317"), (1, 0, 0))
             self.assertIn("session_map_scope: per_chat_bot_user", good.read_text())
             self.assertEqual(bad.read_text(), "models: {}\n")
-            self.assertEqual(agentos_trace.sync_users(root, endpoint="collector:4317"), (0, 1, 1))
+            self.assertEqual(agentos_trace.sync_users(root, endpoint="collector:4317"), (0, 1, 0))
+
+    def test_sync_cli_succeeds_when_legacy_user_is_skipped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "alice/.jiuwenswarm/config/config.yaml"
+            path.parent.mkdir(parents=True)
+            original = "models: {}\n"
+            path.write_text(original)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "deploy/scripts/agentos_trace.py"),
+                 "--users-root", str(root), "--endpoint", "collector:4317"],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("WARNING: Skipping tracing sync", result.stderr)
+            self.assertIn("skipped=1, failed=0", result.stdout)
+            self.assertEqual(path.read_text(), original)
+
+    def test_unreadable_user_trace_config_does_not_abort_deployment(self):
+        spec = importlib.util.spec_from_file_location("trace_runtime", ROOT / "deploy/agent-runtime/configure.py")
+        runtime = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runtime)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            template = root / "gateway.yaml"
+            template.write_text(TEMPLATE)
+            cluster = root / "cluster.yaml"
+            cluster.write_text(json.dumps({"trace_otlp_endpoints": ["collector:4317"]}))
+            users = root / "users"
+            good = users / "alice/.jiuwenswarm/config/config.yaml"
+            bad = users / "bob/.jiuwenswarm/config/config.yaml"
+            good.parent.mkdir(parents=True)
+            good.write_text(TEMPLATE)
+            bad.mkdir(parents=True)
+            with self.assertLogs(level="WARNING") as captured:
+                runtime.apply_deployment_tracing(template, cluster, users_root=users)
+            self.assertIn("Tracing sync failed for 1 existing user", "\n".join(captured.output))
+            self.assertIn("http://collector:4317", good.read_text())
+            self.assertEqual(agentos_trace.sync_users(users, endpoint="collector:4317"), (0, 1, 1))
 
     def test_current_observability_structure(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -185,18 +185,18 @@ class LocalImageTests(unittest.TestCase):
         self.assertFalse(kwargs["export_rootfs"])
         self.assertTrue(kwargs["allow_pull"])
         self.assertFalse(kwargs["cleanup_old"])
-        self.assertEqual(result["images"], {"tools:latest": "local-x"})
+        self.assertEqual(result["images"], {"tools:latest": {"path": "/x"}})
 
     def test_new_user_omits_images_while_preserving_business_defaults(self):
         config = self.root / "config.yaml"
-        config.write_text('# keep-comment\ngateway: {}\nmodels:\n  defaults: []\nsandbox:\n  type: adx-environment\n  image: ubuntu:24.04\n  rootfs_template: local-old\n  cpu: 750\n')
+        config.write_text('# keep-comment\ngateway: {}\nmodels:\n  defaults: []\nsandbox:\n  type: adx-environment\n  image: ubuntu:24.04\n  rootfs: {type: local, path: /objects/tools/rootfs}\n  cpu: 750\n')
         config.chmod(0o640)
         config.with_name(".env").write_text('TOOL_SANDBOX_IMAGE=ubuntu:24.04\nMODEL_NAME=keep-model\n')
         images.initialize_user_defaults(config)
         import yaml
         value = yaml.safe_load(config.read_text())
         self.assertNotIn("image", value["sandbox"])
-        self.assertNotIn("rootfs_template", value["sandbox"])
+        self.assertNotIn("rootfs", value["sandbox"])
         self.assertEqual(value["models"], {"defaults": []})
         self.assertEqual(value["sandbox"]["cpu"], 750)
         self.assertIn("# keep-comment", config.read_text())
@@ -207,7 +207,7 @@ class LocalImageTests(unittest.TestCase):
         settings = {"runtime": {"tool_runtime": "runsc", "local_image_root": str(self.root / "artifacts")}, "gateway": {"home": str(self.root)},
                     "workspace_root": str(self.root / "users")}
         with patch.object(images, "docker") as docker:
-            self.assertEqual(images.prepare_registry(settings), {"images": {}, "templates": {},
+            self.assertEqual(images.prepare_registry(settings), {"images": {},
                 "legacy_conch_default_images": list(images.LEGACY_CONCH_DEFAULT_IMAGES), "conch_images": {}})
         docker.assert_not_called()
 
@@ -342,9 +342,22 @@ class LocalImageTests(unittest.TestCase):
         with patch.object(images, "docker", new_tag), patch.object(images.platform, "machine", return_value="aarch64"):
             second = images.prepare_registry(settings)
         self.assertNotEqual(first["images"]["tools:latest"], second["images"]["tools:latest"])
-        self.assertEqual(len(second["templates"]), 2)
-        for template in second["templates"].values():
+        self.assertNotIn("templates", second)
+        for template in [first["images"]["tools:latest"], second["images"]["tools:latest"]]:
             self.assertEqual((Path(template["path"]) / "image-value").read_text(), "hello")
+
+    def test_previous_name_catalog_is_read_as_direct_metadata_without_reexport(self):
+        settings = {"runtime": {"local_image_root": str(self.root), "local_images": {"tools:v1": {}}},
+                    "gateway": {"home": str(self.root)}, "workspace_root": str(self.root / "users")}
+        with patch.object(images, "docker", self.docker), patch.object(images.platform, "machine", return_value="aarch64"):
+            name, artifact = images.prepare_image("tools:v1", {}, self.root)
+        (self.root / "registry.json").write_text(json.dumps({
+            "images": {"tools:v1": name}, "templates": {name: artifact},
+        }))
+        with patch.object(images, "docker", side_effect=FileNotFoundError("Docker is unavailable")):
+            prepared = images.prepare_registry(settings)
+        self.assertEqual(prepared["images"]["tools:v1"], artifact)
+        self.assertNotIn("templates", prepared)
 
     def test_new_conch_user_retains_its_required_image_binding(self):
         config = self.root / "config.yaml"
@@ -356,9 +369,9 @@ class LocalImageTests(unittest.TestCase):
 
 def test_prepared_new_user_keeps_explicit_deployment_image(tmp_path):
     path = tmp_path / "config.yaml"
-    original = 'sandbox: {type: adx-environment, runtime: runsc, image: "tools:v2", rootfs_template: local-v2}\n'
+    original = ('sandbox: {type: adx-environment, runtime: runsc, image: "tools:v2", '
+                'rootfs: {type: local, path: /objects/tools/rootfs}}\n')
     path.write_text(original)
-    # Prepared templates already distinguish deployment defaults from Gateway history.
     images.initialize_user_defaults(path)
     import yaml
     assert yaml.safe_load(path.read_text()) == yaml.safe_load(original)

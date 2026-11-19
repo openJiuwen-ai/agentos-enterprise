@@ -179,7 +179,7 @@ def prepare_image(reference, options, root, *, allow_pull=False, default_archive
     if process:
         template["process"] = process
     manifest = {"image_id": image_id, "architecture": architecture, "template": template}
-    # Metadata-only nodes (pure master) register the template name for routing;
+    # Metadata-only nodes (pure master) record the prepared execution-node path;
     # rootfs export happens on nodes that actually run tool sandboxes.
     if not export_rootfs:
         return name, template
@@ -265,7 +265,7 @@ def image_sources(settings, *, include_users=True):
     home = Path(settings.get('gateway', {}).get('home', str(Path.home())))
     gateway = home / '.jiuwenswarm/config/config.yaml'
     for path in configuration_paths(settings) if include_users else [gateway]:
-        if not path.is_file():
+        if not path.is_file() or path == gateway and settings.get("runtime", {}).get("_tool_inputs_normalized"):
             continue
         migration = migration_module()
         try:
@@ -330,11 +330,14 @@ def prepare_registry(settings, *, export_rootfs=True):
         raise ValueError("runtime.local_image_root must be absolute")
     catalog = root / "registry.json"
     if not references and not catalog.exists():
-        return {"images": {}, "templates": {}, "legacy_conch_default_images": list(LEGACY_CONCH_DEFAULT_IMAGES), "conch_images": conch}
+        return {"images": {}, "legacy_conch_default_images": list(LEGACY_CONCH_DEFAULT_IMAGES), "conch_images": conch}
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".prepare.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        result = json.loads(catalog.read_text()) if catalog.is_file() else {"images": {}, "templates": {}}
+        previous = json.loads(catalog.read_text()) if catalog.is_file() else {"images": {}}
+        # Read the previous name-based catalog once; publish direct artifact metadata.
+        result = {"images": {reference: previous.get("templates", {})[value] if isinstance(value, str) else value
+                             for reference, value in previous.get("images", {}).items()}}
         result["legacy_conch_default_images"] = list(LEGACY_CONCH_DEFAULT_IMAGES)
         result["conch_images"] = conch
         tool_archive = tool_image_archive(settings, tool_reference) if tool_reference else None
@@ -343,11 +346,9 @@ def prepare_registry(settings, *, export_rootfs=True):
                 if not isinstance(options, dict) or options.keys() - {"archive"}:
                     raise ValueError("Offline image accepts only an optional archive path")
                 is_tool_image = reference == tool_reference
-                name = result["images"].get(reference)
-                # The tool image must re-run load when its fixed tar exists:
-                # the tar is authoritative and updates the local tag.
-                if name and not is_tool_image:
-                    template = result["templates"][name]
+                template = result["images"].get(reference)
+                # A fixed tool archive may update its tag on every deployment.
+                if template and not is_tool_image:
                     artifact = Path(template["path"]).parent
                     manifest = json.loads((artifact / "manifest.json").read_text())
                     if manifest["template"] != template or not Path(template["path"]).is_dir():
@@ -363,18 +364,16 @@ def prepare_registry(settings, *, export_rootfs=True):
                         continue
                     if json.loads(current.stdout)[0]["Id"] == manifest["image_id"]:
                         continue
-                # Metadata-only export is a tool-image optimization for pure
-                # masters. Other images keep their existing full-export contract.
+                # Pure masters only need metadata for the deployment tool image.
                 export_for_image = export_rootfs if is_tool_image else True
-                name, template = prepare_image(
+                _, template = prepare_image(
                     reference, options, root,
                     allow_pull=is_tool_image,
                     default_archive=tool_archive if is_tool_image else None,
                     cleanup_old=is_tool_image and export_for_image,
                     export_rootfs=export_for_image,
                 )
-                result["images"][reference] = name
-                result["templates"][name] = template
+                result["images"][reference] = template
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 if reference in required:
                     raise
@@ -406,14 +405,11 @@ def initialize_user_defaults(path):
     if not isinstance(sandbox, dict) or sandbox.get('type') != 'adx-environment':
         raise ValueError('New user template requires deployment migration before create-user')
     if 'gateway' in config and sandbox.get('runtime', 'runsc') == 'runsc':
-        for key in ('image', 'rootfs_template'):
-            sandbox.pop(key, None)
+        sandbox = migration_module().clear_workspace_image(sandbox)
         image = config.get('sandbox', {}).get('deployment_image')
         if image:
             sandbox['image'] = image
-            catalog = sandbox.get('local_images') or {}
-            if image in catalog:
-                sandbox['rootfs_template'] = catalog[image]
+            sandbox = migration_module().select_local_rootfs(sandbox, config['sandbox'])
     config['sandbox'] = migration_module().workspace_sandbox(sandbox)
     output = StringIO()
     parser.dump(config, output)

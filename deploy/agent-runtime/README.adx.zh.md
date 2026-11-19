@@ -150,7 +150,7 @@ Conch 代码、配置与发布件保留，但默认 `MODULES` 不调度 conch，
 Docker executor 使用 runsc。发布包安装时可在 `runtime.local_images` 按镜像引用配置
 `archive: /absolute/path/image.tar`；准备过程先检查本地 Docker store，缺失时执行 `docker image load`，
 随后用 `docker create --pull=never --network none` 和 export 构建 Local rootfs。
-准备好的不可变 rootfs 同时注册到 API 与节点，工具创建时选择对应 Local 模板。
+准备结果包含实际 Local 路径、镜像环境和启动信息，由 Gateway/Core 直接构造创建参数。
 缺失本地镜像/归档时明确报错，不执行 registry pull。已准备的 rootfs 可在 Docker 不可用时复用。
 部署准备会读取 Workspace API 的运维列表，包含未激活的 autofs 用户键；用户 YAML 和原模板不重写。
 
@@ -207,7 +207,7 @@ Gateway 服务环境保存 `ADX_TOKEN`，AgentServer 创建时使用应用专用
 
 workspace 在宿主挂载 NFS/autofs 或 MooseFS，再通过 ADX Local bind 挂入；
 挂载不可用时明确失败。会话、文件和数据库不随工具空闲回收删除；不增加独占 workspace
-假设。工具 idle timeout 为 60 秒，后续调用可重建。Team 的共享 SQLite 参数继续保留。
+假设。工具沙箱默认空闲 600 秒后回收，后续调用可重建。Team 的共享 SQLite 参数继续保留。
 
 runsc 的 Execd 检查点控制 socket 使用可写的 `/tmp/adx`。默认保留节点本地 checkpoint
 目录；跨节点恢复需另准备所有执行节点可访问的共享 checkpoint store，放在用户挂载之外：
@@ -258,21 +258,53 @@ runtime:
 
 未指定 archive 时，优先使用本节点 Docker 镜像库中的对应引用；Agent/用户镜像缺失时明确报错、
 不执行 pull，部署自有的工具镜像缺失时始终允许 `docker pull`。
-请在各部署节点准备同一架构、同一内容的镜像或离线包，Master 的 API 配置也需要相同的
-映射元数据。镜像通过不可变 image ID 存放于 `/var/lib/agentos/local-images/objects/local-<digest>`，
+请在各部署节点准备同一架构、同一内容的镜像或离线包。镜像通过不可变 image ID 存放于
+`/var/lib/agentos/local-images/objects/local-<digest>`，
 保存文件系统及 Env、Entrypoint、Cmd、WorkingDir、User。每份制品内容固定；
 同名 tag 指向新的本地镜像时，会生成新制品并更新引用映射，保留旧制品及登记。
 已登记的制品在 Docker 镜像被清理或 Docker 不可用后仍可复用，供运行中沙箱及 checkpoint 使用。
 若需指定存储根目录，使用
 `runtime.local_image_root`，各节点路径须一致。重复 up 复用已完成的制品，不覆盖现存根目录。
+启用 runsc 时，部署默认将 `<local_image_root>/objects` 写入 ADX API Server 的父目录白名单。
+可用 `runtime.allowed_local_rootfs_dirs` 指定受部署方控制的绝对目录列表，填 `[]` 则关闭显式
+Local rootfs 创建。三方制品也需准备到白名单目录下。
 
-部署将登记信息写入私有 `local-images.json`；`ADX_LOCAL_IMAGE_BINDINGS_FILE` 仅保存该文件路径。
-Swarm 从文件读取镜像引用与注册名称的映射，API Server 和 adxlet
-收到的是通用的 `local_rootfs_templates`，不包含 Docker 操作。API 按名称解析为 Local rootfs，
-并要求目标节点报告该制品能力。沙箱写入仍使用 sandboxd 的独立写层，平台 Execd 通过原有
-bootstrap 挂载提供。不要手工删除仍被沙箱或 checkpoint 使用的制品；本改动不自动清理它们。
+部署将准备结果写入私有 `local-images.json`；`ADX_LOCAL_IMAGE_BINDINGS_FILE` 仅保存该文件路径。
+工作区工具配置保存 Local 路径及环境变量，由 Core 的原有 provider 传给 SDK `LocalRootfs`。
+内置 runsc AgentServer 的 Local 路径由部署直接写入 `gateway.adx.builtin_launch.rootfs`。
+三方 Agent 的镜像转换、Entrypoint/Cmd 解析及环境默认值合并由 launch-spec 写入端完成；
+Registry 保存完整的 `rootfs.type/path`、`cmds`、`code_path`、`rootfs.user` 和 `env_vars`。
+Gateway 按读取到的 Image 或 Local 规格提交 ADX，不查询镜像目录或替换来源。
+旧 `gateway.adx.local_images` 仅接受配置读取兼容，不参与创建；重新生成 Gateway 配置时移除。
+显式 Local rootfs 由 ADX 强制只读。应用数据可写入单独挂载的 workspace，平台 Execd 通过
+bootstrap 挂载提供。仍被沙箱或 checkpoint 使用的制品需保留。
 
-`agentos.sh create-user` 仅在新建 runsc 用户时去掉从 Gateway 模板带来的 image/rootfs_template，
+`agentos.sh create-user` 仅在新建 runsc 用户时去掉从 Gateway 模板带来的 image，
 保留模型和业务配置。历史用户不会被批量删除镜像字段；原 workspace 和会话不变。
-需要同步使用包含 Local rootfs template 能力的 ADX/Swarm/Core，以及 adx-environment 0.1.0rc5
-或更新 SDK，重新打包后部署；仅更新部署脚本不足以使旧 ADX 二进制支持该接口。
+需要同步使用支持公开 Local rootfs 的 ADX、对应 Swarm/Core，以及
+adx-environment 0.1.0rc10 或更新 SDK，重新打包后部署。
+
+
+### 离线镜像配置与重新部署
+
+`TOOL_SANDBOX_IMAGE/CPU/MEMORY/IDLE_TIMEOUT/TYPE/EXECUTOR/USER/GROUP/ENABLE`
+仍可通过部署 `.env.custom` 或用户 `.env` 输入，部署不会删除这些运维输入。
+用户 `.env` 的显式值优先于该用户 YAML；用户 YAML 优先于部署默认值。
+部署 `.env.custom` 的非空值覆盖已安装服务 `.env` 的同名全局默认输入。
+TYPE/EXECUTOR 会转换为 ADX provider 与 runsc/Conch 选择；runsc 的 USER/GROUP
+必须符合部署运行身份，Conch 保留其原有身份约定。
+
+镜像选择是部署期输入。`agentos.sh up` 的准备阶段使用同一次规范化输入，先准备镜像
+并发布 `path/env/process` 元数据，再生成应用配置。仅编辑 IMAGE 或重启 Gateway
+不会重新导出镜像或切换已经运行的工具环境。更新输入后需重新运行部署准备，并显式重建
+受影响的沙箱。
+
+镜像派生的工具配置保留 `prepared_image: {reference, path}` 来源记录，重新配置时刷新
+派生的 `rootfs` 与镜像环境；用户显式填写的 Local 路径保持不变。
+镜像环境写入 `image_env`，按字面值保存。Swarm 展开用户配置后才将其作为默认环境合入，
+用户 `env` 覆盖镜像默认值；`${NAME}` 与 `${NAME:-default}` 在镜像环境中不会被宿主变量替换。
+该处理同时用于工具与内置 AgentServer。三方 launch-spec 写入端仍负责提供完整 Local
+路径、环境和启动规格，Gateway 直接消费注册的规格。
+
+历史 workspace 缺少 tracing 配置段时，部署告警并跳过该文件，不补齐也不写回。
+个别用户 tracing 同步失败保留路径与计数，但不会中断整个 `up`。

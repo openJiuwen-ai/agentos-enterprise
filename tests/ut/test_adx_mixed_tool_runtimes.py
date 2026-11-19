@@ -21,7 +21,7 @@ def deployment():
             'runtime_identity':{'user':'1000','group':'1000','name':'agentos'},
             'mounts':[{'type':'bind','host_path':'/python','target':'/python','options':['ro']}],
             'env':{'PATH':'/python/bin'},'network':tool_policy([]),
-            'conch_image':'agentos-tools:v1','local_images':{'docker:old':'local-digest'}}
+            'conch_image':'agentos-tools:v1','local_images':{'docker:old':{'path':'/objects/local-digest/rootfs'}}}
 
 
 @pytest.mark.parametrize('sandbox', [
@@ -35,7 +35,7 @@ def test_historical_conch_preserves_template_and_never_uses_runsc_mounts(sandbox
     assert sandbox==before
     assert actual['runtime']=='conch'
     assert actual['image']=='conch:custom'
-    assert not ({'rootfs_template','runtime_identity','local_images','network','env','mounts'} & actual.keys())
+    assert not ({'runtime_identity','local_images','network','env','mounts'} & actual.keys())
 
 
 def test_legacy_conch_without_image_uses_the_conch_binding(deployment):
@@ -47,8 +47,17 @@ def test_legacy_conch_without_image_uses_the_conch_binding(deployment):
 def test_docker_is_projected_through_the_prepared_local_catalog(deployment):
     actual=managed_adx_sandbox({'type':'yuanrong','executor':'docker','image':'docker:old'},deployment)
     assert actual['runtime']=='runsc'
-    assert actual['rootfs_template']=='local-digest'
+    assert actual['rootfs']=={'type':'local','path':'/objects/local-digest/rootfs'}
     assert actual['image']=='docker:old'
+
+
+def test_local_rootfs_migration_drops_legacy_readonly(deployment):
+    sandbox = {
+        'type': 'adx-environment',
+        'rootfs': {'type': 'local', 'path': '/objects/user/rootfs', 'readonly': False},
+    }
+    actual = managed_adx_sandbox(sandbox, deployment)
+    assert actual['rootfs'] == {'type': 'local', 'path': '/objects/user/rootfs'}
 
 
 def test_docker_user_can_select_runsc_with_a_conch_deployment_default(deployment):
@@ -56,5 +65,5 @@ def test_docker_user_can_select_runsc_with_a_conch_deployment_default(deployment
     deployment.update(runtime='conch',image='agentos-tools:v1',runtime_defaults={'runsc':runsc})
     actual=managed_adx_sandbox({'type':'yuanrong','executor':'docker','image':'docker:old'},deployment)
     assert actual['runtime']=='runsc'
-    assert actual['rootfs_template']=='local-digest'
+    assert actual['rootfs']=={'type':'local','path':'/objects/local-digest/rootfs'}
     assert actual['runtime_identity']['user']=='1000'

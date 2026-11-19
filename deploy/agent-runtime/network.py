@@ -11,6 +11,45 @@ import subprocess
 import socket
 from urllib.parse import urlsplit
 
+
+def _supervisor_default_pools():
+    from jiuwenbox.supervisor.network import _resolve_uplink_pools
+
+    return _resolve_uplink_pools('')
+
+
+def supervisor_network(configured, previous, sandboxd_cidr):
+    """Select the node's pool and retain Relay access to existing Supervisor links."""
+    routes = json.loads(subprocess.check_output(['ip', '-j', '-4', 'route', 'show', 'table', 'all'], text=True))
+    conflicts = [ipaddress.IPv4Network(sandboxd_cidr)]
+    active = set()
+    for route in routes:
+        destination = route.get('dst', 'default')
+        if destination == 'default' or route.get('type') in ('local', 'broadcast', 'unreachable', 'blackhole', 'prohibit', 'throw'):
+            continue
+        network = ipaddress.IPv4Network(destination, strict=False)
+        if (network.prefixlen == 30 and route.get('protocol') == 'kernel' and route.get('scope') == 'link'
+                and re.fullmatch(r'jwbH[0-9a-f]{8}', route.get('dev', ''))):
+            active.add(network)
+        else:
+            conflicts.append(network)
+
+    requested = configured or previous
+    for cidr in (requested,) if requested else _supervisor_default_pools():
+        pool = ipaddress.IPv4Network(cidr)
+        # is_link_local checks containment, so split broader pools at the IPv4 link-local prefix.
+        subnets = (pool,) if pool.prefixlen >= 16 else pool.subnets(new_prefix=16)
+        if pool.prefixlen > 24 or any(subnet.is_link_local for subnet in subnets):
+            raise ValueError(f'Invalid Supervisor address pool {pool}; use an IPv4 subnet of /24 or larger')
+        conflict = next((route for route in conflicts if pool.overlaps(route)), None)
+        if conflict is None:
+            legacy = [str(link) for link in sorted(active) if not link.subnet_of(pool)]
+            return str(pool), legacy
+        if requested:
+            raise ValueError(f'Supervisor address pool {pool} overlaps {conflict}; configure a different pool')
+    raise ValueError('No available Supervisor address pool; configure network.supervisor_subnet explicitly')
+
+
 def node_context(sandboxd, *, ingress_port=8080, runtime_control_port=19103, node_id=None):
     interface = ipaddress.IPv4Interface(sandboxd['plugin']['network']['ip_range'])
     if interface.ip.is_loopback or interface.ip.is_unspecified or interface.ip in (interface.network.network_address, interface.network.broadcast_address):
