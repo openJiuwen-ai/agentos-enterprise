@@ -14,3 +14,7 @@
 [submodule "yuanrong"]
 	path = agent-runtime/yuanrong
 	url = https://gitcode.com/openeuler/yuanrong.git
+[submodule "agent-core"]
+	path = agent-core
+	url = https://gitcode.com/openJiuwen/agent-core.git
+	branch = release/v0.1.20.agent_os
