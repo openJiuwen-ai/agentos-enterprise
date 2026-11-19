@@ -305,6 +305,7 @@ class WorkspaceApi:
         return Response(200, {**payload, "status": "ok", "etcd": "ok"})
 
     def _create(self, body: dict[str, Any]) -> Response:
+        # uid/gid=0 与组/其他用户可写 mode 由 store 统一拒绝，与 /internal/ensure 一致。
         owner = ws.validate_owner(body.get("owner"))
         uid = _optional_id(body.get("uid"), "uid")
         gid = _optional_id(body.get("gid"), "gid")
@@ -362,14 +363,8 @@ class WorkspaceApi:
         uid = _optional_id(body.get("uid"), "uid")
         gid = _optional_id(body.get("gid"), "gid")
         mode = ws.validate_mode(body.get("mode"))
-        # 权限收紧：内部接口无认证，只允许非 root 身份与默认 0700 权限，
-        # 防止被同网段主机用来在存储根下创建 root 或宽松权限的目录。
-        if uid == 0 or gid == 0:
-            raise ApiError(400, "invalid_request", "internal ensure rejects uid/gid 0")
-        if mode != ws.DEFAULT_MODE:
-            raise ApiError(
-                400, "invalid_request", f"internal ensure only allows mode {ws.DEFAULT_MODE}"
-            )
+        # uid/gid 与 mode 的约束在 local_ensure 内与对外接口共用同一套校验，
+        # 保证归属在本机或远端时结果一致（非法参数统一 400）。
         status, eff_uid, eff_gid, eff_mode = self._store.local_ensure(
             owner, uid, gid, mode
         )
@@ -459,6 +454,9 @@ class WorkspaceApi:
         return Response(status, {"error": code, "message": str(exc)}, headers=headers)
 
     def _map_store_error(self, exc: ws.WorkspaceStoreError) -> tuple[int, str]:
+        # 归属节点拒绝（4xx）保留对端状态码与错误码，不能包装成 503。
+        if isinstance(exc, ws.OwnerRejectedError):
+            return exc.status, exc.code
         for error_type, status, code in _STORE_ERRORS:
             if isinstance(exc, error_type):
                 return status, code

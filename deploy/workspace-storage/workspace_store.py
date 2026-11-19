@@ -44,6 +44,8 @@ DEFAULT_INTERNAL_RETRIES = 1
 DEFAULT_PROBE_TIMEOUT = 1.0
 DEFAULT_WORKSPACE_USER = "agentos"
 DEFAULT_MODE = "0700"
+# 目录创建允许的 mode：只允许属主可写，组/其他用户最多只读。
+ALLOWED_MODES = ("0700", "0750", "0755")
 FALLBACK_UID = 1000
 FALLBACK_GID = 1000
 
@@ -80,6 +82,15 @@ class RecordCorruptError(WorkspaceStoreError):
     pass
 
 
+class OwnerRejectedError(WorkspaceStoreError):
+    """归属节点以 4xx 拒绝了请求；属于确定性错误，换节点重试没有意义。"""
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
 # ===== 校验与默认值 =====
 
 
@@ -104,6 +115,22 @@ def validate_mode(mode: Any) -> str:
     if not isinstance(mode, str) or not _MODE_PATTERN.match(mode):
         raise ValueError(f"invalid workspace mode: {mode!r}")
     return mode.zfill(4)
+
+
+def validate_workspace_permissions(
+    uid: int | None, gid: int | None, mode: str
+) -> None:
+    """对外 API 与内部 ensure 共用的目录权限约束。
+
+    两处必须给出完全一致的结果，否则同一个创建请求会因 HRW 归属落在本机
+    还是远端而出现"本机成功、远端 400"的分叉。
+    """
+    if uid == 0 or gid == 0:
+        raise ValueError("workspace uid/gid must not be 0")
+    if mode not in ALLOWED_MODES:
+        raise ValueError(
+            "workspace mode must be one of " + ", ".join(ALLOWED_MODES)
+        )
 
 
 def validate_id(value: Any, name: str) -> int | None:
@@ -371,6 +398,8 @@ class WorkspaceStore:
         uid = validate_id(uid, "uid")
         gid = validate_id(gid, "gid")
         mode = validate_mode(mode)
+        # 与内部 ensure 共用同一套约束，避免归属在本机与远端出现不同结果。
+        validate_workspace_permissions(uid, gid, mode)
         key = self.key_for(owner)
         # 本次请求中 ensure 失败并已回滚的节点；下一轮在剩余可用节点中重算 HRW。
         rejected: set[str] = set()
@@ -435,6 +464,7 @@ class WorkspaceStore:
                     exc,
                     (
                         OwnerConflictError,
+                        OwnerRejectedError,
                         OwnerNodeUnavailableError,
                         EtcdUnavailableError,
                         RecordCorruptError,
@@ -485,6 +515,7 @@ class WorkspaceStore:
         uid = validate_id(uid, "uid")
         gid = validate_id(gid, "gid")
         mode = validate_mode(mode)
+        validate_workspace_permissions(uid, gid, mode)
         effective_uid = self.default_uid if uid is None else int(uid)
         effective_gid = self.default_gid if gid is None else int(gid)
         path = self.owner_path(owner)
@@ -557,6 +588,17 @@ class WorkspaceStore:
         if status == 409:
             raise OwnerConflictError(
                 str(body.get("message") or f"workspace {record.owner!r} conflicts")
+            )
+        if 400 <= status < 500:
+            # 参数非法或来源被白名单拒绝：换节点重试只会重复同一结论，
+            # 直接保留对端的状态码与消息向上传递。
+            raise OwnerRejectedError(
+                status,
+                str(body.get("error") or "invalid_request"),
+                str(
+                    body.get("message")
+                    or f"ensure on owner node {record.node_ip} rejected with HTTP {status}"
+                ),
             )
         raise OwnerNodeUnavailableError(
             f"ensure on owner node {record.node_ip} failed with HTTP {status}"
