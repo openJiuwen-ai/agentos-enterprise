@@ -198,6 +198,7 @@ def load_trace_endpoints(config_path: Path = DEFAULT_CONFIG_PATH) -> list:
 
     - 缺省 / 空列表 / 空值 ⇒ 返回 []（tracing 关闭）
     - 必须为非空字符串列表；host:port 格式校验由部署脚本完成
+    - AgentRuntime（ADX）只支持 OTLP/HTTP，渲染 ADX 部署配置时 4317 会映射为 4318
     """
     data = load_full_config(config_path)
     endpoints = data.get("trace_otlp_endpoints", [])

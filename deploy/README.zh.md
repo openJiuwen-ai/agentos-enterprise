@@ -201,6 +201,8 @@ cluster:
 
 Gateway 和新用户模板沿用主干的 `config.yaml` 顶层 `trace_otlp_endpoints` 开关：取第一个 collector 的 OTLP gRPC 地址，空列表关闭。配置准备继续使用 `scripts/agentos_trace.py`，保持 `trace_enabled`、telemetry 和 Agent/Team observability 同步。
 
+ADX（agent-runtime）复用同一开关：`up` 把地址渲染为 `tracing.endpoints` 写入 coordinator / node / ingress-api 三份部署 YAML。ADX 只导出 OTLP/HTTP，列表中的 `4317` 自动映射为同地址的 `4318`，其他端口保持不变。`Collector` 需同时开放 gRPC `4317`（Gateway/Swarm）与 HTTP `4318`（ADX），且地址必须从沙箱内 Execd 可达（不能写 `127.0.0.1`/`localhost`）。关闭时三份 YAML 不写 `tracing`，新启动的 ADX 进程不注入 trace 环境变量；默认 `shutdown_mode: preserve` 下既有沙箱内的 Execd 保持启动时环境，需重建 Environment 才能切换。
+
 ### agent-runtime 前置（ADX）
 
 `install` 前需满足以下其一：本机已有 `adxctl`、设置 `ADX_RELEASE_TARBALL` 指向发布包 tarball、或将解压后的发布包目录放置于 `deploy/agent-runtime/adx-release/`（install 兜底调用其 install.sh）。安装需要 root 权限（写入 `/opt/adx` 与 `/usr/local/bin`）及本机 `python3`（发布包完整性校验）。

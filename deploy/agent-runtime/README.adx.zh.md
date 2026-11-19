@@ -159,6 +159,27 @@ Docker executor 使用 runsc。发布包安装时可在 `runtime.local_images` �
 `/run/agentos/node.json` 读取。Core 获取工具环境时重新读取 `ingress_url/node_id`，
 节点变化会建立新的连接作用域。缺失或不一致的节点上下文明确报错。
 
+## Tracing
+
+ADX 复用 `deploy/config.yaml` 顶层的 `trace_otlp_endpoints` 开关。`up` 在生成
+`deployment.yaml`（coordinator）、`deployment-node.yaml`（adxlet/Relay）、
+`deployment-ingress-api.yaml`（apiserver/Ingress）后，把首个地址写入各自的
+`tracing.endpoints`；`adxctl` 再向除 Redis/AFS 外的服务注入
+`ADX_TRACE_ENABLED=true` 与 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`，并同步到
+adxlet 的 `execd_env`，覆盖沙箱内 Execd。
+
+- ADX 只支持 OTLP/HTTP：`4317` 会自动映射为同地址的 `4318`，其他端口原样保留。
+  Collector 需要同时提供 `4317`（Gateway/Swarm 的 gRPC）与 `4318`（ADX 的 HTTP）。
+- 地址必须是沙箱内 Execd 可达的节点/Collector 地址；不要写 `127.0.0.1` 或
+  `localhost`（它们在沙箱内指向沙箱自身）。
+- `trace_otlp_endpoints` 为空时三份 YAML 不写 `tracing`，此后新启动的 ADX
+  进程不注入 trace 环境变量，业务行为不变。ADX 默认 `shutdown_mode: preserve`：
+  `up` 重启前已存在的沙箱及其 Execd 保持启动时的 trace 环境，开关只对之后新建
+  的 Environment/沙箱生效；要让既有沙箱停止或开始导出，需要重建该 Environment
+  （或在 ADX 部署中显式使用 drain 策略）。
+- 修改开关后执行 `agentos.sh up`：systemd 模式下配置变化的 unit 会重启；
+  进程模式（`--no-systemd`）下配置变化的 supervisor 也会重启。
+
 ## 凭据与配置兼容
 
 Master 生成部署级 API token，Worker 经部署账号的密钥 SSH、严格主机校验获取。

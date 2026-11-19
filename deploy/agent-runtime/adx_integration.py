@@ -37,6 +37,7 @@ def write_yaml(path, data):
         with os.fdopen(fd, "w") as stream:
             if owner is not None:
                 os.fchown(stream.fileno(), owner.st_uid, owner.st_gid)
+                os.fchmod(stream.fileno(), owner.st_mode & 0o777)
             yaml.safe_dump(data, stream, allow_unicode=True, sort_keys=False)
         os.replace(temporary, path)
     finally:
@@ -59,6 +60,89 @@ def deployment_config_path(deploy):
 
 
 DEFAULTS = Path(__file__).with_name("defaults")
+
+# The unified AgentOS switch is a host:port list for the Go/C++ OTLP/gRPC
+# exporters. ADX exports OTLP/HTTP only, so the standard gRPC port is mapped
+# to the colocated HTTP receiver; other ports are preserved as configured.
+_TRACE_ENDPOINT_PORT = re.compile(r"\+?[0-9]+")
+_TRACE_GRPC_PORT = 4317
+_TRACE_HTTP_PORT = 4318
+
+
+def normalize_trace_endpoint(value):
+    """Return one ADX OTLP/HTTP endpoint as ``host:port``.
+
+    The AgentOS switch deliberately rejects URL schemes so the gRPC exporters
+    accept it without rewriting. ADX validates OTLP/HTTP endpoints and accepts
+    both forms; normalizing here keeps the generated YAML stable. Validation
+    follows ADX (non-empty non-IPv6 host, u16 port, <=512 bytes) so a value
+    accepted by both the switch and ADX is not rejected during ``up``.
+    """
+    endpoint = str(value or "").strip()
+    if endpoint.startswith("https://"):
+        raise ValueError("trace_otlp_endpoints does not support https")
+    if endpoint.startswith("http://"):
+        endpoint = endpoint[len("http://"):]
+    if "/" in endpoint:
+        raise ValueError("trace_otlp_endpoints must be host:port")
+    if not endpoint or len(endpoint.encode("utf-8")) > 512 or any(
+        character.isspace() or ord(character) < 0x20 for character in endpoint
+    ):
+        raise ValueError("trace_otlp_endpoints must be host:port")
+    host, separator, port_text = endpoint.rpartition(":")
+    if not separator or not host or ":" in host or _TRACE_ENDPOINT_PORT.fullmatch(port_text) is None:
+        raise ValueError("trace_otlp_endpoints must be host:port")
+    port = int(port_text)
+    if not 0 < port < 65536:
+        raise ValueError("trace_otlp_endpoints port must be 1..65535")
+    if port == _TRACE_GRPC_PORT:
+        port = _TRACE_HTTP_PORT
+    return host + ":" + str(port)
+
+
+def trace_endpoints(config):
+    """Return the ADX OTLP/HTTP endpoints derived from ``trace_otlp_endpoints``."""
+    values = config.get("trace_otlp_endpoints", [])
+    if values is None:
+        values = []
+    if not isinstance(values, list) or not all(
+        isinstance(value, str) and value.strip() for value in values
+    ):
+        raise ValueError("trace_otlp_endpoints must be a list of non-empty strings")
+    if len(values) > 8:
+        raise ValueError("trace_otlp_endpoints accepts at most 8 entries")
+    return [normalize_trace_endpoint(value) for value in values]
+
+
+def tracing_endpoints(environment_file):
+    """Read the rendered ADX trace endpoints from the deployment environment."""
+    path = Path(environment_file) if environment_file else (
+        Path(os.environ.get("ADX_CONFIG_DIR", "/opt/adx/config")) / "deployment.env"
+    )
+    if not path.is_file():
+        return []
+    values = read_environment(path)
+    raw = values.get("ADX_TRACE_ENDPOINTS", "[]")
+    try:
+        endpoints = json.loads(raw)
+    except (TypeError, ValueError):
+        raise ValueError("ADX_TRACE_ENDPOINTS must be a JSON list") from None
+    if not isinstance(endpoints, list) or not all(
+        isinstance(endpoint, str) and endpoint.strip() for endpoint in endpoints
+    ):
+        raise ValueError("ADX_TRACE_ENDPOINTS must be a JSON list of non-empty strings")
+    return [normalize_trace_endpoint(endpoint) for endpoint in endpoints]
+
+
+def apply_tracing_config(config_file, environment_file=None):
+    """Add or remove the deployment-level tracing policy in one ADX YAML file."""
+    config = read_yaml(config_file)
+    endpoints = tracing_endpoints(environment_file)
+    if endpoints:
+        config["tracing"] = {"endpoints": endpoints}
+    else:
+        config.pop("tracing", None)
+    write_yaml(config_file, config)
 
 
 def conch_module_enabled(environment=None):
@@ -374,6 +458,7 @@ def deployment_variables(config, node_ip, python, config_dir):
         "ADX_RUNTIME_ROOTFS": os.environ.get("ADX_RUNTIME_ROOTFS", package + "/runtime/adx-runtime-rootfs.img"),
         "ADX_CA_BUNDLE_FILE": os.environ.get("ADX_CA_BUNDLE_FILE", "/etc/agentos/adx-ca-bundle.pem"),
         "ADX_GATEWAY_HOME": str(Path.home()),
+        "ADX_TRACE_ENDPOINTS": json.dumps(trace_endpoints(config), separators=(",", ":")),
         "ADX_TOOL_TEMPLATE": os.environ.get("SANDBOX_IMAGE_REGISTRY", "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev").rstrip("/") + "/tool-sandbox-conch:latest-" + architecture,
         "ADX_RELAY_PEERS": ",".join(dict.fromkeys(["127.0.0.1/32", *(str(node) + "/32" for node in nodes), node_ip + "/32"])),
     }
@@ -795,7 +880,7 @@ def backend_enabled(settings, backend):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("sdk", "check", "prepare-env", "export-env", "components", "gateway-ready", "release-label", "runsc-node-config", "install-sandboxd", "ingress-cert", "ingress-cert-loaded", "ingress-ready", "backend-enabled", "node-ready", "coordinator-config", "ingress-config", "default-config"))
+    parser.add_argument("action", choices=("sdk", "check", "prepare-env", "export-env", "components", "gateway-ready", "release-label", "runsc-node-config", "install-sandboxd", "ingress-cert", "ingress-cert-loaded", "ingress-ready", "backend-enabled", "node-ready", "coordinator-config", "ingress-config", "default-config", "apply-tracing"))
     parser.add_argument("--backend", choices=("conch", "jiuwenbox", "runsc"))
     parser.add_argument("--profile", choices=("node", "ingress", "coordinator"))
     parser.add_argument("--release", type=Path, default=Path("/opt/adx/current"))
@@ -819,6 +904,11 @@ def main():
         if args.config is None:
             parser.error("coordinator-config requires --config")
         write_coordinator_config(args.config, args.environment_file)
+        return
+    if args.action == "apply-tracing":
+        if args.config is None:
+            parser.error("apply-tracing requires --config")
+        apply_tracing_config(args.config, args.environment_file)
         return
     if args.action == "node-ready":
         if args.config is None:

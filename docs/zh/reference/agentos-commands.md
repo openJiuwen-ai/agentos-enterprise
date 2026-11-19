@@ -61,6 +61,8 @@ bash deploy/agentos.sh <COMMAND> [OPTIONS]
 >
 > 配置文件生效规则：`up` 读取的是 `install` 时持久化到 `~/.agentos/deploy/config.yaml` 的副本——直接修改该副本后 `up` 立即生效；修改仓库/安装包内的 `deploy/config.yaml` 则需重新执行 `install` 同步（`install` 会用安装包 deploy 目录整体覆盖 `~/.agentos/deploy`，注意此前对副本的修改会被覆盖）。
 > 地址为 **host:port 形式，不要带 `http://` 前缀**（otel-go v1.24.0 限制；带前缀会被部署脚本剥离并告警）；参考栈 `jiuwenswarm/deploy/observability`（collector 4317，需先拉起）。主备语义：**取第一个地址注入**（部署级主备），主地址不可达时修改列表后重新 `up` 切换。关闭时不注入任何 tracing 管道（等价现状默认）；collector 不可达不影响业务，仅 span 丢失。
+>
+> AgentRuntime（ADX）复用同一开关：`up` 将地址写入 coordinator / node / ingress-api 三份部署 YAML 的 `tracing.endpoints`。ADX 只支持 OTLP/HTTP，列表中的 `4317` 会自动映射为同地址的 `4318`；Collector 需同时开放 `4317`（gRPC）与 `4318`（HTTP），且地址必须从沙箱内 Execd 可达（不能写 `127.0.0.1`/`localhost`）。默认 `shutdown_mode=preserve` 下，开关只对之后新建的 Environment/沙箱生效，既有沙箱需重建才能切换。
 
 ## etcd.sh 子命令
 

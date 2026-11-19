@@ -240,12 +240,49 @@ _adx_config_hash() {
     if [ -f "$1" ]; then sha256sum "$1" | awk '{print $1}'; else printf 'missing\n'; fi
 }
 
+# Record the config a unit/supervisor was started with. Comparing against this
+# marker (not a hash taken earlier in the same up) keeps retries safe after a
+# partially failed up that rewrote the YAML but did not restart the process.
+_adx_applied_config_file() {
+    printf '%s/adx-applied-config.hash\n' "$1"
+}
+
+_adx_mark_applied_config() {
+    local conf="$1" state_dir="$2"
+    _adx_config_hash "${conf}" > "$(_adx_applied_config_file "${state_dir}")"
+}
+
 _adx_restart_changed_unit() {
-    local svc="$1" conf="$2" previous="$3"
-    if [ "$(_adx_config_hash "${conf}")" != "${previous}" ] && systemctl is-active --quiet "${svc}"; then
+    local svc="$1" conf="$2" state_dir="$3"
+    local current applied
+    current=$(_adx_config_hash "${conf}")
+    applied="$(_adx_applied_config_file "${state_dir}")"
+    if [ -f "${applied}" ] && [ "$(cat "${applied}")" = "${current}" ]; then
+        return 0
+    fi
+    if systemctl is-active --quiet "${svc}"; then
         info "Applying changed deployment configuration to ${svc}"
         systemctl restart "${svc}" || error "Failed to apply configuration to ${svc}"
     fi
+    _adx_mark_applied_config "${conf}" "${state_dir}"
+}
+
+# Process mode (--no-systemd) equivalent: a running supervisor keeps the config
+# it started with, so stop it when the rendered deployment YAML changed; the
+# following _adx_start_supervisor then starts it with the new tracing policy.
+_adx_restart_changed_supervisor() {
+    local conf="$1" state_dir="$2"
+    local pidfile="${state_dir}/adx-supervisor.pid"
+    local current applied
+    [ -f "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null || return 0
+    current=$(_adx_config_hash "${conf}")
+    applied="$(_adx_applied_config_file "${state_dir}")"
+    if [ -f "${applied}" ] && [ "$(cat "${applied}")" = "${current}" ]; then
+        return 0
+    fi
+    info "Applying changed deployment configuration to $(basename "${conf}")"
+    _adx_stop_supervisor "${conf}" "${state_dir}" || return 1
+    return 0
 }
 
 # ===== 组件日志目录软链 =====
@@ -292,6 +329,15 @@ _adx_install_default() {
         return 1
     fi
     install -m 600 "${SCRIPT_DIR}/defaults/${profile}.yaml" "${target}"
+}
+
+# The unified trace_otlp_endpoints switch is rendered into every ADX deployment
+# YAML (coordinator / node / ingress-api); ADX exports OTLP/HTTP on 4318.
+_adx_apply_tracing() {
+    local conf="$1"
+    "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/adx_integration.py" apply-tracing \
+        --config "${conf}" --environment-file "${ADX_ENV_FILE}" \
+        || error "Failed to apply tracing policy to ${conf}"
 }
 
 # ===== 角色推导 =====
@@ -376,6 +422,7 @@ _adx_prepare_coordinator() {
     "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/adx_integration.py" coordinator-config \
         --config "${ADX_CONFIG_FILE}" --environment-file "${ADX_ENV_FILE}" \
         || error "Cannot prepare coordinator checkpoint storage"
+    _adx_apply_tracing "${ADX_CONFIG_FILE}"
     "${ADXCTL_BIN}" -c "${ADX_CONFIG_FILE}" validate || error "adxctl validate failed (see above)"
     _adx_assert_effective_config "${ADX_CONFIG_FILE}" coordinator
     success "coordinator deployment config validated"
@@ -402,6 +449,7 @@ _adx_prepare_node() {
     else
         _adx_install_default node "${ADX_NODE_CONFIG_FILE}"
     fi
+    _adx_apply_tracing "${ADX_NODE_CONFIG_FILE}"
     "${ADXCTL_BIN}" -c "${ADX_NODE_CONFIG_FILE}" validate || error "adxctl validate failed (see above)"
     _adx_assert_effective_config "${ADX_NODE_CONFIG_FILE}" node
     success "node deployment config validated"
@@ -419,6 +467,7 @@ _adx_prepare_ingress() {
     "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/adx_integration.py" ingress-config \
         --config "${ADX_INGRESS_CONFIG_FILE}" --environment-file "${ADX_ENV_FILE}" \
         || error "Failed to configure ADX ingress local rootfs templates"
+    _adx_apply_tracing "${ADX_INGRESS_CONFIG_FILE}"
     "${ADXCTL_BIN}" -c "${ADX_INGRESS_CONFIG_FILE}" validate || error "adxctl validate failed (see above)"
     _adx_assert_effective_config "${ADX_INGRESS_CONFIG_FILE}" ingress-api
     success "ingress-api deployment config validated"
@@ -726,9 +775,6 @@ _adx_rollback_units() {
 # 先完成两份配置生成与校验，再按 agent-dx 推荐顺序拉起（node 先于 ingress-api）；
 # 任一 enable / 等待失败都回滚本次已启动的全部 unit（disable --now）
 _adx_up_worker_units() {
-    local previous_node previous_ingress
-    previous_node=$(_adx_config_hash "${ADX_NODE_CONFIG_FILE}")
-    previous_ingress=$(_adx_config_hash "${ADX_INGRESS_CONFIG_FILE}")
     if _adx_use_bundled_sandboxd; then
         [ -f "${ADX_SANDBOXD_UNIT}" ] || error "AgentOS sandboxd unit is missing, run agentos.sh install"
         [ ! -S /run/sandboxd/sandboxd.sock ] || error "Another sandboxd owns /run/sandboxd/sandboxd.sock"
@@ -743,14 +789,14 @@ _adx_up_worker_units() {
     info "Generating ${ADX_INGRESS_SVC} unit (ingress-api)"
     _adx_generate_unit "${ADX_INGRESS_SVC}" "${ADX_INGRESS_CONFIG_FILE}" "AgentOS ADX Ingress API (API Server + Ingress)"
     systemctl daemon-reload
-    _adx_restart_changed_unit "${ADX_NODE_SVC}" "${ADX_NODE_CONFIG_FILE}" "${previous_node}"
+    _adx_restart_changed_unit "${ADX_NODE_SVC}" "${ADX_NODE_CONFIG_FILE}" "${ADX_NODE_RUN_DIR}"
     systemctl enable --now "${ADX_NODE_SVC}" \
         || { _adx_rollback_units "${ADX_NODE_SVC}"; error "Failed to start ${ADX_NODE_SVC}"; }
     if _adx_use_bundled_sandboxd && ! _adx_wait_bundled_sandboxd; then
         _adx_rollback_units "${ADX_NODE_SVC}"
         error "AgentOS sandboxd not ready, see journalctl -u ${ADX_SANDBOXD_SVC}"
     fi
-    _adx_restart_changed_unit "${ADX_INGRESS_SVC}" "${ADX_INGRESS_CONFIG_FILE}" "${previous_ingress}"
+    _adx_restart_changed_unit "${ADX_INGRESS_SVC}" "${ADX_INGRESS_CONFIG_FILE}" "${ADX_INGRESS_STATE_DIR}"
     systemctl enable --now "${ADX_INGRESS_SVC}" \
         || { _adx_rollback_units "${ADX_NODE_SVC}" "${ADX_INGRESS_SVC}"; error "Failed to start ${ADX_INGRESS_SVC} (rolled back)"; }
     _adx_wait_unit_active "${ADX_NODE_SVC}" \
@@ -768,14 +814,12 @@ deploy_adx_up_systemd() {
     _adx_has_systemd || error "systemd not available; agent-runtime up requires systemd (or use --no-systemd)"
 
     if [ "${IS_MASTER}" = "1" ]; then
-        local previous_coordinator previous_ingress
-        previous_coordinator=$(_adx_config_hash "${ADX_CONFIG_FILE}")
         # master：coordinator 部署（redis 已外置，经 redis_url 接入）
         _adx_prepare_coordinator
         info "Generating ${ADX_SVC} unit (coordinator)"
         _adx_generate_unit "${ADX_SVC}" "${ADX_CONFIG_FILE}" "AgentOS ADX Coordinator (Redis + Coordinator)"
         systemctl daemon-reload
-        _adx_restart_changed_unit "${ADX_SVC}" "${ADX_CONFIG_FILE}" "${previous_coordinator}"
+        _adx_restart_changed_unit "${ADX_SVC}" "${ADX_CONFIG_FILE}" "${ADX_STATE_DIR}"
         systemctl enable --now "${ADX_SVC}" \
             || { _adx_rollback_units "${ADX_SVC}"; error "Failed to start ${ADX_SVC}"; }
         _adx_wait_unit_active "${ADX_SVC}" \
@@ -786,11 +830,10 @@ deploy_adx_up_systemd() {
         if [ "${IS_SINGLE_NODE}" = "1" ]; then
             _adx_up_worker_units
         else
-            previous_ingress=$(_adx_config_hash "${ADX_INGRESS_CONFIG_FILE}")
             _adx_prepare_ingress
             _adx_generate_unit "${ADX_INGRESS_SVC}" "${ADX_INGRESS_CONFIG_FILE}" "AgentOS ADX Ingress API"
             systemctl daemon-reload
-            _adx_restart_changed_unit "${ADX_INGRESS_SVC}" "${ADX_INGRESS_CONFIG_FILE}" "${previous_ingress}"
+            _adx_restart_changed_unit "${ADX_INGRESS_SVC}" "${ADX_INGRESS_CONFIG_FILE}" "${ADX_INGRESS_STATE_DIR}"
             systemctl enable --now "${ADX_INGRESS_SVC}" && _adx_wait_unit_active "${ADX_INGRESS_SVC}" \
                 || { _adx_rollback_units "${ADX_INGRESS_SVC}" "${ADX_SVC}"; error "Failed to start ${ADX_INGRESS_SVC}"; }
             _adx_refresh_ingress_unit_tls
@@ -841,6 +884,7 @@ _adx_start_supervisor() {
             if [ "${conf}" = "${ADX_INGRESS_CONFIG_FILE}" ]; then
                 _adx_ingress_tls_loaded || return 1
             fi
+            _adx_mark_applied_config "${conf}" "${state_dir}"
             success "adxctl supervisor up (pid $(cat "${pidfile}")) for $(basename "${conf}")"
             return 0
         fi
@@ -868,8 +912,12 @@ _adx_stop_supervisor() {
 _adx_up_worker_supervisors() {
     _adx_prepare_node
     _adx_prepare_ingress
+    _adx_restart_changed_supervisor "${ADX_NODE_CONFIG_FILE}" "${ADX_NODE_RUN_DIR}" \
+        || error "failed to apply node deployment configuration (process mode)"
     _adx_start_supervisor "${ADX_NODE_CONFIG_FILE}" "${ADX_NODE_RUN_DIR}" \
         || error "failed to start node deployment (process mode)"
+    _adx_restart_changed_supervisor "${ADX_INGRESS_CONFIG_FILE}" "${ADX_INGRESS_STATE_DIR}" \
+        || error "failed to apply ingress-api deployment configuration (process mode)"
     # ingress-api 拉起失败时回滚 node，避免留下半套部署
     _adx_start_supervisor "${ADX_INGRESS_CONFIG_FILE}" "${ADX_INGRESS_STATE_DIR}" || {
         "${ADXCTL_BIN}" -c "${ADX_NODE_CONFIG_FILE}" stop 2>/dev/null || true
@@ -882,6 +930,8 @@ deploy_adx_up_process() {
     if [ "${IS_MASTER}" = "1" ]; then
         # master：coordinator 部署（redis 已外置，经 redis_url 接入）
         _adx_prepare_coordinator
+        _adx_restart_changed_supervisor "${ADX_CONFIG_FILE}" "${ADX_STATE_DIR}" \
+            || error "failed to apply coordinator deployment configuration (process mode)"
         _adx_start_supervisor "${ADX_CONFIG_FILE}" "${ADX_STATE_DIR}" \
             || error "failed to start coordinator deployment (process mode)"
 
@@ -890,6 +940,8 @@ deploy_adx_up_process() {
             _adx_up_worker_supervisors
         else
             _adx_prepare_ingress
+            _adx_restart_changed_supervisor "${ADX_INGRESS_CONFIG_FILE}" "${ADX_INGRESS_STATE_DIR}" \
+                || error "failed to apply master ingress-api deployment configuration (process mode)"
             _adx_start_supervisor "${ADX_INGRESS_CONFIG_FILE}" "${ADX_INGRESS_STATE_DIR}" \
                 || error "failed to start master ingress-api deployment (process mode)"
         fi

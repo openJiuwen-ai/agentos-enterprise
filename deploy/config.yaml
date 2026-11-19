@@ -15,6 +15,9 @@
 #   trace_otlp_endpoints: AgentGateway、AgentRuntime、JiuwenSwarm 统一 tracing 配置
 #     （host:port 形式，不要带 http:// 前缀；支持多项主备）。空列表/缺省关闭各组件配置开关。
 #     取第一个地址注入全部组件（部署级主备）；主地址不可达时修改本列表后重新 up 切换。
+#     AgentRuntime（ADX）只支持 OTLP/HTTP：列表中的 4317（OTLP/gRPC 默认端口）
+#     会自动映射为同地址的 4318（OTLP/HTTP 默认端口），其他端口保持不变；
+#     地址必须是沙箱内 Execd 可达的节点/Collector 地址，不能写 127.0.0.1/localhost。
 
 cluster:
   # etcd 集群节点（奇数节点保证 raft 共识）
@@ -34,5 +37,8 @@ cluster:
 
 # 非空时统一开启现有 tracing 开关并使用 OTLP gRPC；空列表关闭这些开关，修改后执行 up。
 # JiuwenSwarm 的演进、轨迹 UI 和调试采集继续遵循各自已有规则。
+# AgentGateway / JiuwenSwarm 使用 OTLP gRPC，ADX 使用 OTLP/HTTP（见上方 4317→4318 映射）。
+# ADX 开关只对之后启动的进程/沙箱生效；默认 shutdown_mode=preserve 下已有沙箱
+# 内的 Execd 保持启动时环境，需重建 Environment 才能切换。
 # 示例：trace_otlp_endpoints: ["10.0.0.1:4317", "10.0.0.2:4317"]
 trace_otlp_endpoints: []
