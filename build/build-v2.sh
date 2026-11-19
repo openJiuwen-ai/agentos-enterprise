@@ -56,8 +56,8 @@ Options:
 
 Environment:
   A4P_BUILD_PYTHON       Python 3.11+ executable for A4P packaging (default: python3.11)
-  AGENT_CORE_FROM_OBS    Download and bundle Core: 1 (default) or 0 (use preinstalled Core)
-  AGENT_CORE_BASE_URL    Core wheel download directory (default: AgentOS OBS dependencies/agent-core/dist)
+  OPENJIUWEN_VERSION     Core wheel version directory to download (required, e.g. 26.3.0.50)
+  AGENT_CORE_BASE_URL    Core wheel download base (default: AgentOS OBS dependencies/agent-core)
 
 Examples:
   $(basename "$0") --build-type=daily --build-target=agentos_b050
@@ -401,21 +401,16 @@ build_credential_router() {
 
 prepare_core_wheel() {
   SELECTED_CORE_WHEEL=""
-  case "${AGENT_CORE_FROM_OBS:-1}" in
-    0) echo "  Core OBS bundling disabled; deployment requires preinstalled Core"; return 0 ;;
-    1) ;;
-    *) echo "error: AGENT_CORE_FROM_OBS must be 0 or 1" >&2; return 1 ;;
-  esac
-  local core_version core_base
-  core_version=$(sed -nE 's/^[[:space:]]*openjiuwen[[:space:]]*==[[:space:]]*([^[:space:]#]+).*/\1/p' "${DEPLOY_DIR}/requirements.txt")
-  if [[ -z "${core_version}" || "${core_version}" == *$'\n'* ]]; then
-    echo "error: requirements.txt must contain one openjiuwen==VERSION pin" >&2
+  if [[ -z "${OPENJIUWEN_VERSION}" ]]; then
+    echo "error: OPENJIUWEN_VERSION is required to download the Core wheel (e.g. 26.3.0.50)" >&2
     return 1
   fi
-  core_base="${AGENT_CORE_BASE_URL:-https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-os/dependencies/agent-core/dist}"
+  # OBS 路径比原来多一层版本目录：<base>/<OPENJIUWEN_VERSION>/dist/
+  local core_base
+  core_base="${AGENT_CORE_BASE_URL:-https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-os/dependencies/agent-core}"
   mkdir -p "${DOWNLOAD_DIR}/agent-core"
-  SELECTED_CORE_WHEEL="${DOWNLOAD_DIR}/agent-core/openjiuwen-${core_version}-py3-none-any.whl"
-  download_file "${core_base%/}/$(basename "${SELECTED_CORE_WHEEL}")" "${SELECTED_CORE_WHEEL}"
+  SELECTED_CORE_WHEEL="${DOWNLOAD_DIR}/agent-core/openjiuwen-${OPENJIUWEN_VERSION}-py3-none-any.whl"
+  download_file "${core_base%/}/${OPENJIUWEN_VERSION}/dist/$(basename "${SELECTED_CORE_WHEEL}")" "${SELECTED_CORE_WHEEL}"
 }
 
 build_a4p_wheels() {

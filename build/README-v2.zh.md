@@ -351,16 +351,15 @@ archive.tar.gz
 
 ### Core wheel 交付
 
-Core 版本由 `deploy/requirements.txt` 中的 `openjiuwen==VERSION` 指定。
-`AGENT_CORE_FROM_OBS=1`（默认）复用原有下载函数，从以下目录获取
-`openjiuwen-VERSION-py3-none-any.whl` 并放入 Server 包：
+Core 版本由环境变量 `OPENJIUWEN_VERSION` 指定（如 `26.3.0.50`），该值原样用于版本目录名与
+wheel 文件名，需与 OBS 实际路径一致；未设置时构建直接失败。打包时从以下目录获取
+`openjiuwen-<OPENJIUWEN_VERSION>-py3-none-any.whl` 并放入 Server 包：
 
 ```text
-https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-os/dependencies/agent-core/dist/
+https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/agent-os/dependencies/agent-core/<OPENJIUWEN_VERSION>/dist/
 ```
 
-可用 `AGENT_CORE_BASE_URL` 覆盖目录。设置 `AGENT_CORE_FROM_OBS=0` 时跳过下载和随包交付，
-用户在安装前按 requirements 预装同版本 Core。构建不再拉取或编译 Core 源码。
+可用 `AGENT_CORE_BASE_URL` 覆盖 `agent-core` 目录。构建不再拉取或编译 Core 源码。
 
 Server 打包复用 Swarm 原有的启停、健康检查与手动模板刷新脚本；本仓库仅叠加 `agentos_handler.sh` 的目录、配置和 VIP 接线，历史配置迁移位于 `agent-runtime`。
 同时继续接受此前的 ADX 组件归档布局。
