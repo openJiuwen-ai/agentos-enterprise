@@ -371,12 +371,12 @@ workspace 目录通过 NFS + autofs 共享，归属记录存放在 etcd 单键�
 删除采用 rename 到 `.trash` 原子下线后立即后台硬删。有 systemd 时由 `agentos-workspace.service` 托管，无 systemd 时回退 nohup 进程模式（PID 文件 `/var/run/agentos/agentos-workspace.pid`，由 `up`/`down` 同生命周期管理，`status` 可查运行状态）。`WORKSPACE_STORAGE_USE_SYSTEMD=auto/yes/no` 控制托管方式。
 
 - 配置文件：`deploy/workspace-storage/workspace_storage.conf`（完整变量见 `deploy.sh -h`）
-- 服务与端口：`tcp/18889`（`WORKSPACE_API_LISTEN`，`GET /healthz` 健康检查；默认 HTTP 无认证，`/internal/*` 仅集群内可达）。NFS 需放通 rpcbind 与 `tcp/2049`
+- 服务与端口：对外 `tcp/18889`（`WORKSPACE_API_LISTEN`，默认仅 `127.0.0.1`，只提供 `/healthz` `/metrics` `/v1/workspaces`）；内部 `tcp/18890`（`WORKSPACE_INTERNAL_LISTEN`，只提供 `/internal/ensure` `/internal/remove` 与 `/healthz`，需集群内可达且受 `WORKSPACE_INTERNAL_ALLOW` 约束；该白名单留空时按 `config.yaml` 的 `cluster_nodes`（安装时写入 `WORKSPACE_CANDIDATE_NODES`）自动派生出逐节点 `/32`（IPv6 为 `/128`），集群外来源一律 403；内部监听访问 `/v1/*` `/metrics`、对外监听访问 `/internal/*` 均返回 404）。默认 HTTP 无认证，建议内部端口只绑集群网卡并限制来源。NFS 需放通 rpcbind 与 `tcp/2049`
 - 日志：`/var/log/agentos/workspace-storage/workspace-api.log`（unit 的 `StandardOutput/StandardError` 追加写入，文件 0640、目录 0750）；`/etc/logrotate.d/agentos-workspace` 按每日或 100M 轮转、保留 14 份（`copytruncate`，无需重启）。仍可用 `journalctl -u agentos-workspace` 查看
 - 稳定 node_id：`WORKSPACE_NODE_ID` → `ADX_NODE_ID` → `node-<本机 IP 去点>`；与 ADX 同时配置且不一致时 install 直接失败（归属按 node_id 分组）
 - 挂载点：`WORKSPACE_ACCESS_ROOT`（默认 `/home/agentos/users`）；配置了 `AGENTOS_HOME_BASE` 时必须与之一致，否则 agent 看到的是空目录
 - etcd 访问：`WORKSPACE_ETCD_ENDPOINTS`（逗号分隔，可省略 scheme）留空时按 `ETCD_ENDPOINT` → `config.yaml` 的 `etcd_nodes` → `127.0.0.1:32379` 推导；TLS 由 `WORKSPACE_ETCD_TLS` + `WORKSPACE_ETCD_TLS_CA/CERT/KEY` 控制。安装时把端点与 TLS 固化到 `/etc/agentos/workspace-storage/workspace_storage.conf` 供 automount 子进程使用
-- 归属候选集：`WORKSPACE_CANDIDATE_NODES`（逗号分隔）留空时取 `config.yaml` 的 `cluster_nodes`；HRW（Rendezvous Hashing）选出的归属节点在 etcd 事务内用 CAS 写入，保证多节点 API 并发下唯一
+- 归属候选集：`WORKSPACE_CANDIDATE_NODES`（逗号分隔）留空时取 `config.yaml` 的 `cluster_nodes`；新建归属前先按 `WORKSPACE_PROBE_TIMEOUT` 探活候选节点（`GET /healthz`），在存活节点集合上重算 HRW，避免单节点临时故障导致创建失败；已有归属不改派。HRW（Rendezvous Hashing）选出的归属节点在 etcd 事务内用 CAS 写入，保证多节点 API 并发下唯一
 - autofs program map：每次 lookup 查一个 etcd 键；命中且为本机 → `bind` 挂载本地目录，命中远端 → NFS 挂载 `ip:WORKSPACE_STORAGE_ROOT/<owner>`；**etcd 传输层故障（超时/不可达）时回落本地 TSV 缓存** `/var/lib/agentos-workspace/owners.cache`（`owner<TAB>node_ip`），etcd 权威返回“无记录”时不读缓存，直接输出空
 - `.trash` 目录与存储根同一文件系统、权限 `root 0700`，不参与 NFS 导出与孤儿目录巡检；watchdog 按 `WORKSPACE_TRASH_RETENTION` 回收过期项
 - 安装产物：`/opt/agentos/workspace-storage/`（代码）、`/etc/agentos/workspace-storage/service.env`（0600）、`/var/lib/agentos-workspace/owners.cache`（autofs 故障回落缓存）

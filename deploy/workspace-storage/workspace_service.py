@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import logging
 import json
 import os
@@ -66,6 +67,38 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.lower() in ("1", "true", "yes", "on")
 
 
+def _derive_internal_allow(
+    candidate_nodes: tuple[str, ...], node_ip: str
+) -> tuple[str, ...]:
+    """默认按集群节点清单派生 /internal/* 来源白名单。
+
+    ``WORKSPACE_CANDIDATE_NODES`` 在安装时取自 ``config.yaml`` 的
+    ``cluster_nodes``，因此这里只需把它（外加本机 IP）固定成 /32、/128，
+    即可只放通集群节点，拒绝其它来源访问内部端口。
+    """
+    logger = logging.getLogger("workspace_service")
+    nodes = list(candidate_nodes)
+    if node_ip and node_ip not in nodes:
+        nodes.append(node_ip)
+    networks: list[str] = []
+    for item in nodes:
+        try:
+            address = ipaddress.ip_address(str(item).strip())
+        except ValueError:
+            logger.warning("ignore non-IP cluster node in internal allow list: %r", item)
+            continue
+        network = f"{address}/128" if address.version == 6 else f"{address}/32"
+        if network not in networks:
+            networks.append(network)
+    if not networks:
+        # 单机部署或候选集缺失时只允许回环，避免退回宽泛网段。
+        logger.warning(
+            "no valid cluster node IP for internal allow list, fallback to loopback only"
+        )
+        return ("127.0.0.0/8", "::1/128")
+    return tuple(networks)
+
+
 def application_initializer():
     """Resolve the application hook at request time, after deployment prepares it."""
     config_path = _env("WORKSPACE_APPLICATION_CONFIG")
@@ -85,7 +118,17 @@ def application_initializer():
     return initialize
 
 
-def build_components(listen: str):  # pragma: no cover - 组装入口，行为由单测覆盖各模块
+def build_components(listen: str, internal_listen: str = ""):  # pragma: no cover - 组装入口，行为由单测覆盖各模块
+    host, port = api.parse_listen(listen)
+    internal_listen = internal_listen or _env(
+        "WORKSPACE_INTERNAL_LISTEN", api.DEFAULT_INTERNAL_LISTEN
+    )
+    internal_host, internal_port = api.parse_listen(internal_listen)
+    if internal_port == port:
+        raise ValueError(
+            f"internal listen port {internal_port} conflicts with API port {port}"
+        )
+
     etcd_client = etcd.EtcdClient(
         endpoints=_env("WORKSPACE_ETCD_ENDPOINTS"),
         timeout=_env_float("WORKSPACE_ETCD_TIMEOUT", etcd.DEFAULT_TIMEOUT),
@@ -119,13 +162,14 @@ def build_components(listen: str):  # pragma: no cover - 组装入口，行为�
         node_id=_env("WORKSPACE_NODE_ID"),
         storage_root=_env("WORKSPACE_STORAGE_ROOT", ws.DEFAULT_STORAGE_ROOT),
         access_root=access_root,
-        internal_port=_env_int("WORKSPACE_INTERNAL_PORT", ws.DEFAULT_INTERNAL_PORT),
+        internal_port=internal_port,
         internal_timeout=_env_float(
             "WORKSPACE_INTERNAL_TIMEOUT", ws.DEFAULT_INTERNAL_TIMEOUT
         ),
         internal_retries=_env_int(
             "WORKSPACE_INTERNAL_RETRIES", ws.DEFAULT_INTERNAL_RETRIES
         ),
+        probe_timeout=_env_float("WORKSPACE_PROBE_TIMEOUT", ws.DEFAULT_PROBE_TIMEOUT),
         workspace_user=user,
         default_uid=default_uid,
         default_gid=default_gid,
@@ -143,19 +187,28 @@ def build_components(listen: str):  # pragma: no cover - 组装入口，行为�
         ),
     )
 
+    # /internal/* 来源白名单：显式配置优先，留空则按集群节点清单派生，
+    # 未列入 cluster_nodes 的来源一律 403。
+    internal_allow = _env_list("WORKSPACE_INTERNAL_ALLOW")
+    if not internal_allow:
+        internal_allow = _derive_internal_allow(store.candidate_nodes, store.node_ip)
+    logger.info("internal api allow sources: %s", ",".join(internal_allow))
+
     api_object = api.WorkspaceApi(
         store,
         api.ApiConfig(
             node_id=store.node_id,
             node_ip=store.node_ip,
             access_root=access_root,
-            internal_allow=_env_list("WORKSPACE_INTERNAL_ALLOW"),
+            internal_allow=internal_allow,
         ),
         # watchdog 的 workspace_dir_missing / workspace_dir_orphan 一并暴露在 /metrics
         extra_metrics=dog.metrics_lines,
     )
-    host, port = api.parse_listen(listen)
-    return api_object, dog, [(host, port)]
+    return api_object, dog, [
+        api.ListenSpec(host, port),
+        api.ListenSpec(internal_host, internal_port, internal=True),
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover - 进程入口
@@ -163,7 +216,12 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - 进程入�
     parser.add_argument(
         "--listen",
         default=_env("WORKSPACE_API_LISTEN", api.DEFAULT_LISTEN),
-        help="HTTP listen address, default 0.0.0.0:18889",
+        help="public HTTP listen address, default 127.0.0.1:18889",
+    )
+    parser.add_argument(
+        "--internal-listen",
+        default=_env("WORKSPACE_INTERNAL_LISTEN", api.DEFAULT_INTERNAL_LISTEN),
+        help="internal HTTP listen address for /internal/*, default 0.0.0.0:18890",
     )
     parser.add_argument("--log-level", default=_env("WORKSPACE_LOG_LEVEL", "INFO"))
     args = parser.parse_args(argv)
@@ -174,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - 进程入�
     )
     logger = logging.getLogger("workspace_service")
 
-    api_object, dog, listens = build_components(args.listen)
+    api_object, dog, listens = build_components(args.listen, args.internal_listen)
     servers = api.create_servers(api_object, listens)
     threads: list[threading.Thread] = []
     for server in servers:
@@ -182,7 +240,12 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - 进程入�
         thread.start()
         threads.append(thread)
         host, port = server.server_address[:2]
-        logger.info("agentos-workspace listening on %s:%s", host, port)
+        logger.info(
+            "agentos-workspace %s listening on %s:%s",
+            "internal" if getattr(server, "internal", False) else "public",
+            host,
+            port,
+        )
 
     stop_event = threading.Event()
     watchdog_thread = threading.Thread(

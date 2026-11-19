@@ -121,10 +121,11 @@ _ws_load_config() {
     local _env_service_enabled="${WORKSPACE_SERVICE_ENABLED:-}"
     local _env_node_id="${WORKSPACE_NODE_ID:-}"
     local _env_api_listen="${WORKSPACE_API_LISTEN:-}"
-    local _env_internal_port="${WORKSPACE_INTERNAL_PORT:-}"
+    local _env_internal_listen="${WORKSPACE_INTERNAL_LISTEN:-}"
     local _env_internal_allow="${WORKSPACE_INTERNAL_ALLOW:-}"
     local _env_internal_timeout="${WORKSPACE_INTERNAL_TIMEOUT:-}"
     local _env_internal_retries="${WORKSPACE_INTERNAL_RETRIES:-}"
+    local _env_probe_timeout="${WORKSPACE_PROBE_TIMEOUT:-}"
     local _env_watchdog_interval="${WORKSPACE_WATCHDOG_INTERVAL:-}"
     local _env_trash_retention="${WORKSPACE_TRASH_RETENTION:-}"
     local _env_cache_file="${WORKSPACE_CACHE_FILE:-}"
@@ -163,10 +164,11 @@ _ws_load_config() {
     [ -n "${_env_service_enabled}" ]     && WORKSPACE_SERVICE_ENABLED="${_env_service_enabled}"
     [ -n "${_env_node_id}" ]             && WORKSPACE_NODE_ID="${_env_node_id}"
     [ -n "${_env_api_listen}" ]          && WORKSPACE_API_LISTEN="${_env_api_listen}"
-    [ -n "${_env_internal_port}" ]       && WORKSPACE_INTERNAL_PORT="${_env_internal_port}"
+    [ -n "${_env_internal_listen}" ]     && WORKSPACE_INTERNAL_LISTEN="${_env_internal_listen}"
     [ -n "${_env_internal_allow}" ]      && WORKSPACE_INTERNAL_ALLOW="${_env_internal_allow}"
     [ -n "${_env_internal_timeout}" ]    && WORKSPACE_INTERNAL_TIMEOUT="${_env_internal_timeout}"
     [ -n "${_env_internal_retries}" ]    && WORKSPACE_INTERNAL_RETRIES="${_env_internal_retries}"
+    [ -n "${_env_probe_timeout}" ]       && WORKSPACE_PROBE_TIMEOUT="${_env_probe_timeout}"
     [ -n "${_env_watchdog_interval}" ]   && WORKSPACE_WATCHDOG_INTERVAL="${_env_watchdog_interval}"
     [ -n "${_env_trash_retention}" ]     && WORKSPACE_TRASH_RETENTION="${_env_trash_retention}"
     [ -n "${_env_cache_file}" ]          && WORKSPACE_CACHE_FILE="${_env_cache_file}"
@@ -195,11 +197,12 @@ _ws_load_config() {
     : "${WORKSPACE_ENABLED:="true"}"
     : "${WORKSPACE_NODE_ID:=""}"
     : "${WORKSPACE_NODE_IP:=""}"
-    : "${WORKSPACE_API_LISTEN:="0.0.0.0:18889"}"
-    : "${WORKSPACE_INTERNAL_PORT:="18889"}"
+    : "${WORKSPACE_API_LISTEN:="127.0.0.1:18889"}"
+    : "${WORKSPACE_INTERNAL_LISTEN:="0.0.0.0:18890"}"
     : "${WORKSPACE_INTERNAL_ALLOW:=""}"
     : "${WORKSPACE_INTERNAL_TIMEOUT:="3"}"
     : "${WORKSPACE_INTERNAL_RETRIES:="1"}"
+    : "${WORKSPACE_PROBE_TIMEOUT:="1"}"
     : "${WORKSPACE_WATCHDOG_INTERVAL:="60"}"
     : "${WORKSPACE_TRASH_RETENTION:="86400"}"
     : "${WORKSPACE_CACHE_FILE:="/var/lib/agentos-workspace/owners.cache"}"
@@ -704,10 +707,11 @@ WORKSPACE_ENABLED="${WORKSPACE_ENABLED}"
 WORKSPACE_NODE_ID="${_WS_NODE_ID}"
 WORKSPACE_NODE_IP="${_WS_NODE_IP:-}"
 WORKSPACE_API_LISTEN="${WORKSPACE_API_LISTEN}"
-WORKSPACE_INTERNAL_PORT="${WORKSPACE_INTERNAL_PORT}"
+WORKSPACE_INTERNAL_LISTEN="${WORKSPACE_INTERNAL_LISTEN}"
 WORKSPACE_INTERNAL_ALLOW="${WORKSPACE_INTERNAL_ALLOW}"
 WORKSPACE_INTERNAL_TIMEOUT="${WORKSPACE_INTERNAL_TIMEOUT}"
 WORKSPACE_INTERNAL_RETRIES="${WORKSPACE_INTERNAL_RETRIES}"
+WORKSPACE_PROBE_TIMEOUT="${WORKSPACE_PROBE_TIMEOUT}"
 WORKSPACE_ACCESS_ROOT="${WORKSPACE_ACCESS_ROOT}"
 WORKSPACE_STORAGE_ROOT="${WORKSPACE_STORAGE_ROOT}"
 WORKSPACE_CACHE_FILE="${WORKSPACE_CACHE_FILE}"
@@ -782,7 +786,7 @@ EnvironmentFile=${_WS_SERVICE_ENV_FILE}
 # 落固定文件，便于留存与采集；logrotate 用 copytruncate，无需重启服务
 StandardOutput=append:${WORKSPACE_LOG_FILE}
 StandardError=append:${WORKSPACE_LOG_FILE}
-ExecStart=${python_bin} ${_WS_SERVICE_HOME}/workspace_service.py --listen ${WORKSPACE_API_LISTEN}
+ExecStart=${python_bin} ${_WS_SERVICE_HOME}/workspace_service.py --listen ${WORKSPACE_API_LISTEN} --internal-listen ${WORKSPACE_INTERNAL_LISTEN}
 Restart=on-failure
 RestartSec=5s
 KillMode=mixed
@@ -867,7 +871,7 @@ _ws_install_service() {
     fi
 
     # 端口/防火墙提示（脚本不自动改防火墙，避免覆盖现场策略）
-    info "Firewall/ports: workspace API tcp/${WORKSPACE_API_LISTEN##*:} (no auth, /internal/* must be cluster-internal); NFS needs rpcbind + tcp/2049"
+    info "Firewall/ports: public API tcp/${WORKSPACE_API_LISTEN##*:} on 127.0.0.1 only; internal API tcp/${WORKSPACE_INTERNAL_LISTEN##*:} must be cluster-only (no auth, /internal/* relies on WORKSPACE_INTERNAL_ALLOW); NFS needs rpcbind + tcp/2049"
 }
 
 # ===== 无 systemd：nohup 进程模式（与 agent-gateway / jiuwenbox 保持一致）=====
@@ -912,7 +916,8 @@ _ws_start_service_nohup() {
         . "${_WS_SERVICE_ENV_FILE}"
         set +a
         nohup "${python_bin}" "${_WS_SERVICE_HOME}/workspace_service.py" \
-            --listen "${WORKSPACE_API_LISTEN}" >>"${WORKSPACE_LOG_FILE}" 2>&1 &
+            --listen "${WORKSPACE_API_LISTEN}" \
+            --internal-listen "${WORKSPACE_INTERNAL_LISTEN}" >>"${WORKSPACE_LOG_FILE}" 2>&1 &
         echo $! >"${_WS_PID_FILE}"
     )
 
@@ -2017,10 +2022,12 @@ Environment Variables:
   WORKSPACE_SERVICE_ENABLED    是否部署 agentos-workspace 服务（auto/yes/no，默认 auto）
   WORKSPACE_ENABLED            服务内部功能开关（true/false，默认 true）
   WORKSPACE_NODE_ID            稳定节点 ID；留空取 ADX_NODE_ID，再回落 node-<本机IP>
-  WORKSPACE_API_LISTEN         API 监听地址（默认 0.0.0.0:18889）
-  WORKSPACE_INTERNAL_PORT      节点间内部调用端口（默认 18889）
+  WORKSPACE_API_LISTEN         对外 API 监听地址（默认 127.0.0.1:18889，不含 /internal/*）
+  WORKSPACE_INTERNAL_LISTEN    内部 API 监听地址（默认 0.0.0.0:18890，承载 /internal/*）
+  WORKSPACE_PROBE_TIMEOUT      新建归属前探活候选节点的超时，秒（默认 1）
   WORKSPACE_INTERNAL_ALLOW     /internal/* 允许的来源网段，逗号分隔 CIDR
-                               （留空取内置默认：回环 + RFC1918 + 链路本地 + IPv6 ULA）
+                               （留空按 WORKSPACE_CANDIDATE_NODES 派生 /32、/128，
+                                 未显式配置候选集时即 config.yaml cluster_nodes）
   WORKSPACE_INTERNAL_TIMEOUT   节点间内部调用超时，秒，正整数（默认 3）
   WORKSPACE_INTERNAL_RETRIES   节点间内部调用重试次数，正整数（默认 1）
   WORKSPACE_LOG_FILE           服务日志文件（默认 /var/log/agentos/workspace-storage/workspace-api.log）

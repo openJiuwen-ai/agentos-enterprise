@@ -5,7 +5,9 @@
 - 归属存 etcd 单 key，目录操作只在归属节点执行；
 - POST 返回 201/200 时目录已就绪，不存在 202 或异步中间态；
 - ``access_path`` 由服务端按 ``WORKSPACE_ACCESS_ROOT`` 拼装；
-- 默认 HTTP 无认证，``/internal/*`` 只接受 ``WORKSPACE_INTERNAL_ALLOW`` 配置允许的来源；
+- 默认 HTTP 无认证，按监听角色做路由隔离：对外监听只提供
+  ``/healthz`` ``/metrics`` ``/v1/workspaces``；内部监听只提供 ``/internal/*``
+  与 ``/healthz``，且内部接口只接受 ``WORKSPACE_INTERNAL_ALLOW`` 允许的来源；
 - ``GET /v1/workspaces`` 仅供运维（ops-only）排查，不是业务调用路径。
 """
 
@@ -26,10 +28,22 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import workspace_store as ws
 
 DEFAULT_PORT = 18889
-DEFAULT_LISTEN = "0.0.0.0:18889"
+# 对外接口只监听回环，供本机 Gateway/运维访问。
+DEFAULT_LISTEN = "127.0.0.1:18889"
+# 内部接口单独监听，节点间代理走该端口；不能绑定 127.0.0.1。
+DEFAULT_INTERNAL_LISTEN = "0.0.0.0:18890"
 DEFAULT_ACCESS_ROOT = "/home/agentos/users"
 MAX_BODY_BYTES = 1 << 20
 logger = logging.getLogger("workspace_api")
+
+
+@dataclass(frozen=True)
+class ListenSpec:
+    """一个 HTTP 监听及其路由角色。"""
+
+    host: str
+    port: int
+    internal: bool = False
 
 
 @dataclass
@@ -161,6 +175,7 @@ class WorkspaceApi:
         headers: dict[str, str] | None = None,
         body: bytes = b"",
         client_ip: str | None = None,
+        internal: bool = False,
     ) -> Response:
         headers = {str(key).lower(): str(value) for key, value in (headers or {}).items()}
         parsed = urlsplit(target)
@@ -168,7 +183,13 @@ class WorkspaceApi:
         started = time.perf_counter()
         try:
             response = self._dispatch(
-                method, unquote(parsed.path), parse_qs(parsed.query), headers, body, client_ip
+                method,
+                unquote(parsed.path),
+                parse_qs(parsed.query),
+                headers,
+                body,
+                client_ip,
+                internal,
             )
         except ApiError as exc:
             payload: dict[str, Any] = {"error": exc.code, "message": exc.message}
@@ -193,15 +214,23 @@ class WorkspaceApi:
         headers: dict[str, str],
         body: bytes,
         client_ip: str | None = None,
+        internal: bool = False,
     ) -> Response:
         if path == "/healthz":
             if method != "GET":
                 raise ApiError(405, "method_not_allowed", "method not allowed")
             return self._healthz()
 
-        # 内部接口先按配置校验来源，不允许的来源直接 403，不进入业务逻辑。
         if path in ("/internal/ensure", "/internal/remove"):
+            # 对外监听不暴露内部接口，按未知路由处理。
+            if not internal:
+                raise ApiError(404, "not_found", f"unknown route: {method} {path}")
+            # 内部接口先按配置校验来源，不允许的来源直接 403，不进入业务逻辑。
             self._require_internal_source(client_ip)
+
+        # 内部监听只承载 /internal/* 与 /healthz，不暴露业务与管理路由。
+        if internal and (path == "/metrics" or path.startswith("/v1/")):
+            raise ApiError(404, "not_found", f"unknown route: {method} {path}")
 
         if path == "/metrics":
             if method != "GET":
@@ -276,6 +305,7 @@ class WorkspaceApi:
         return Response(200, {**payload, "status": "ok", "etcd": "ok"})
 
     def _create(self, body: dict[str, Any]) -> Response:
+        # uid/gid=0 与组/其他用户可写 mode 由 store 统一拒绝，与 /internal/ensure 一致。
         owner = ws.validate_owner(body.get("owner"))
         uid = _optional_id(body.get("uid"), "uid")
         gid = _optional_id(body.get("gid"), "gid")
@@ -333,6 +363,8 @@ class WorkspaceApi:
         uid = _optional_id(body.get("uid"), "uid")
         gid = _optional_id(body.get("gid"), "gid")
         mode = ws.validate_mode(body.get("mode"))
+        # uid/gid 与 mode 的约束在 local_ensure 内与对外接口共用同一套校验，
+        # 保证归属在本机或远端时结果一致（非法参数统一 400）。
         status, eff_uid, eff_gid, eff_mode = self._store.local_ensure(
             owner, uid, gid, mode
         )
@@ -422,6 +454,9 @@ class WorkspaceApi:
         return Response(status, {"error": code, "message": str(exc)}, headers=headers)
 
     def _map_store_error(self, exc: ws.WorkspaceStoreError) -> tuple[int, str]:
+        # 归属节点拒绝（4xx）保留对端状态码与错误码，不能包装成 503。
+        if isinstance(exc, ws.OwnerRejectedError):
+            return exc.status, exc.code
         for error_type, status, code in _STORE_ERRORS:
             if isinstance(exc, error_type):
                 return status, code
@@ -441,8 +476,9 @@ class _WorkspaceHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], api: WorkspaceApi):
+    def __init__(self, address: tuple[str, int], api: WorkspaceApi, *, internal: bool = False):
         self.api = api
+        self.internal = internal
         super().__init__(address, _WorkspaceHandler)
 
 
@@ -463,7 +499,12 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         self._send(
             self.server.api.handle(
-                method, self.path, dict(self.headers.items()), body, self.client_address[0]
+                method,
+                self.path,
+                dict(self.headers.items()),
+                body,
+                self.client_address[0],
+                internal=bool(getattr(self.server, "internal", False)),
             )
         )
 
@@ -493,12 +534,14 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
 
 
 def create_servers(
-    api: WorkspaceApi, listens: Iterable[tuple[str, int]]
+    api: WorkspaceApi, listens: Iterable[ListenSpec]
 ) -> list[ThreadingHTTPServer]:
     servers: list[ThreadingHTTPServer] = []
     try:
-        for host, port in listens:
-            servers.append(_WorkspaceHTTPServer((host, port), api))
+        for spec in listens:
+            servers.append(
+                _WorkspaceHTTPServer((spec.host, spec.port), api, internal=spec.internal)
+            )
     except Exception:
         for server in servers:
             server.server_close()
