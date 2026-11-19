@@ -11,7 +11,8 @@
   ``POST /internal/ensure``；
 - 同步 remove：归属节点先 ``rename`` 到 ``.trash``，立即后台硬删，再条件删除归属；
   删除链路同时 best-effort ``umount -l`` 访问根上的残留挂载，避免同名重建命中旧 inode；
-- 不写任何 meta / by-node / nodes key，不维护状态机或心跳。
+- 不写任何 meta / by-node / nodes key，不维护状态机或心跳；仅在新建归属时按需
+  探活候选节点，在可用节点集合上重算 HRW，避免故障节点导致创建失败。
 """
 
 from __future__ import annotations
@@ -37,9 +38,10 @@ from workspace_mount import unmount_access_path
 
 DEFAULT_ETCD_PREFIX = "/agent-runtime/workspace"
 DEFAULT_STORAGE_ROOT = "/home/agentos/.users"
-DEFAULT_INTERNAL_PORT = 18889
+DEFAULT_INTERNAL_PORT = 18890
 DEFAULT_INTERNAL_TIMEOUT = 3.0
 DEFAULT_INTERNAL_RETRIES = 1
+DEFAULT_PROBE_TIMEOUT = 1.0
 DEFAULT_WORKSPACE_USER = "agentos"
 DEFAULT_MODE = "0700"
 FALLBACK_UID = 1000
@@ -219,6 +221,7 @@ class WorkspaceStore:
         internal_port: int = DEFAULT_INTERNAL_PORT,
         internal_timeout: float = DEFAULT_INTERNAL_TIMEOUT,
         internal_retries: int = DEFAULT_INTERNAL_RETRIES,
+        probe_timeout: float = DEFAULT_PROBE_TIMEOUT,
         workspace_user: str = DEFAULT_WORKSPACE_USER,
         default_uid: int | None = None,
         default_gid: int | None = None,
@@ -253,6 +256,7 @@ class WorkspaceStore:
         self.internal_port = int(internal_port)
         self.internal_timeout = float(internal_timeout)
         self.internal_retries = max(0, int(internal_retries))
+        self.probe_timeout = float(probe_timeout)
         self.workspace_user = workspace_user or DEFAULT_WORKSPACE_USER
         self.default_uid, self.default_gid = resolve_default_ids(
             self.workspace_user, default_uid, default_gid
@@ -332,6 +336,29 @@ class WorkspaceStore:
 
     # ===== 同步创建 =====
 
+    def probe_node(self, node_ip: str) -> bool:
+        """探测候选节点能否服务；本机直接视为可用，不依赖自身 HTTP 监听。"""
+        if node_ip == self.node_ip:
+            return True
+        host = f"[{node_ip}]" if ":" in node_ip and not node_ip.startswith("[") else node_ip
+        url = f"http://{host}:{self.internal_port}/healthz"
+        try:
+            with urllib.request.urlopen(url, timeout=self.probe_timeout) as response:
+                return 200 <= int(response.status) < 300
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            logger.debug("probe candidate %s failed: %s", node_ip, exc)
+            return False
+
+    def available_candidates(self) -> tuple[str, ...]:
+        """剔除探活失败的候选节点；全部不可用时抛 NoCandidateError。"""
+        candidates = self.candidate_nodes
+        if not candidates:
+            raise NoCandidateError("workspace candidate list is empty")
+        alive = tuple(node_ip for node_ip in candidates if self.probe_node(node_ip))
+        if not alive:
+            raise NoCandidateError("no reachable workspace candidate node")
+        return alive
+
     def ensure_owner(
         self,
         owner: str,
@@ -345,60 +372,82 @@ class WorkspaceStore:
         gid = validate_id(gid, "gid")
         mode = validate_mode(mode)
         key = self.key_for(owner)
+        # 本次请求中 ensure 失败并已回滚的节点；下一轮在剩余可用节点中重算 HRW。
+        rejected: set[str] = set()
 
-        won = False
-        hit = self._call("get", key)
-        if hit is not None:
-            value = hit[0] if isinstance(hit, (tuple, list)) else hit
-            node_ip = str(value or "").strip()
-        else:
-            candidates = self.candidate_nodes
-            if not candidates:
-                raise NoCandidateError("workspace candidate list is empty")
-            winner = hrw_select(owner, candidates)
-            if winner is None:
-                raise NoCandidateError("HRW returned no candidate")
-            won, existing = self._call("put_if_absent", key, winner)
-            if won:
-                node_ip = winner
+        while True:
+            won = False
+            hit = self._call("get", key)
+            if hit is not None:
+                # 已有归属绝不改派：归属节点本地磁盘才是数据权威。
+                value = hit[0] if isinstance(hit, (tuple, list)) else hit
+                node_ip = str(value or "").strip()
             else:
-                node_ip = str(existing or "").strip()
-                if not node_ip:
-                    current = self._call("get", key)
-                    if current is None:
-                        raise RecordCorruptError(
-                            f"claim for {owner!r} failed without an existing record"
+                remaining = tuple(
+                    node_ip
+                    for node_ip in self.available_candidates()
+                    if node_ip not in rejected
+                )
+                if not remaining:
+                    raise NoCandidateError("no reachable workspace candidate node")
+                winner = hrw_select(owner, remaining)
+                if winner is None:
+                    raise NoCandidateError("HRW returned no candidate")
+                won, existing = self._call("put_if_absent", key, winner)
+                if won:
+                    node_ip = winner
+                else:
+                    node_ip = str(existing or "").strip()
+                    if not node_ip:
+                        current = self._call("get", key)
+                        if current is None:
+                            raise RecordCorruptError(
+                                f"claim for {owner!r} failed without an existing record"
+                            )
+                        node_ip = str(
+                            current[0] if isinstance(current, (tuple, list)) else current
                         )
-                    node_ip = str(current[0] if isinstance(current, (tuple, list)) else current)
-        record = self._record(owner, node_ip)
+            record = self._record(owner, node_ip)
 
-        try:
-            if record.node_ip == self.node_ip:
-                status, eff_uid, eff_gid, eff_mode = self.local_ensure(
-                    owner, uid, gid, mode
-                )
-            else:
-                status, eff_uid, eff_gid, eff_mode = self._proxy_ensure(
-                    record, uid, gid, mode
-                )
-        except Exception as exc:
-            if won:
-                self._rollback_claim(key, record.node_ip)
-            if isinstance(
-                exc,
-                (
-                    OwnerConflictError,
-                    OwnerNodeUnavailableError,
-                    EtcdUnavailableError,
-                    RecordCorruptError,
-                ),
-            ):
+            try:
+                if record.node_ip == self.node_ip:
+                    status, eff_uid, eff_gid, eff_mode = self.local_ensure(
+                        owner, uid, gid, mode
+                    )
+                else:
+                    status, eff_uid, eff_gid, eff_mode = self._proxy_ensure(
+                        record, uid, gid, mode
+                    )
+            except Exception as exc:
+                retryable = isinstance(exc, (OwnerNodeUnavailableError, OSError, ValueError))
+                if won:
+                    self._rollback_claim(key, record.node_ip)
+                    if retryable:
+                        logger.warning(
+                            "ensure %r on %s failed, retry with remaining candidates: %s",
+                            owner,
+                            record.node_ip,
+                            exc,
+                        )
+                        rejected.add(record.node_ip)
+                        continue
+                if isinstance(
+                    exc,
+                    (
+                        OwnerConflictError,
+                        OwnerNodeUnavailableError,
+                        EtcdUnavailableError,
+                        RecordCorruptError,
+                    ),
+                ):
+                    raise
+                if isinstance(exc, (OSError, ValueError)):
+                    raise OwnerNodeUnavailableError(
+                        f"ensure {owner!r} on {record.node_ip} failed: {exc}"
+                    ) from exc
                 raise
-            if isinstance(exc, (OSError, ValueError)):
-                raise OwnerNodeUnavailableError(
-                    f"ensure {owner!r} on {record.node_ip} failed: {exc}"
-                ) from exc
-            raise
+            break
+
         logger.debug(
             "ensure %s owner=%s status=%s uid=%s gid=%s mode=%s",
             "created" if won else "exists",
