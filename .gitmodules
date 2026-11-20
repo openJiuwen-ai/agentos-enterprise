@@ -1,6 +1,7 @@
 [submodule "jiuwenswarm"]
 	path = jiuwenswarm
 	url = https://gitcode.com/openJiuwen/jiuwenswarm.git
+	branch = releases/0.2.8
 [submodule "conch"]
 	path = conch
 	url = https://gitcode.com/openeuler/Conch.git
@@ -11,9 +12,6 @@
 [submodule "agent-dx"]
 	path = agent-runtime/agent-dx
 	url = https://gitcode.com/openJiuwen/agent-dx.git
-[submodule "yuanrong"]
-	path = agent-runtime/yuanrong
-	url = https://gitcode.com/openeuler/yuanrong.git
 [submodule "agent-core"]
 	path = agent-core
 	url = https://gitcode.com/openJiuwen/agent-core.git
