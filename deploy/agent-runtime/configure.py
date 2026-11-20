@@ -124,13 +124,23 @@ def normalize_tool_inputs(settings):
     runtime = settings.setdefault("runtime", {})
     config = data_directory(settings) / "config/config.yaml"
     sandbox = (read_yaml(config).get("sandbox") or {}) if config.is_file() else {}
-    selector = migration_module().tool_image_source(sandbox, values)
+    migration = migration_module()
+    selector = migration.tool_image_source(sandbox, values)
     if not selector.get("type"):
         selector["type"] = "adx-environment"
     if values.get("TOOL_SANDBOX_EXECUTOR"):
         selector["runtime"] = "conch" if values["TOOL_SANDBOX_EXECUTOR"].strip() == "conch" else "runsc"
-    runtime["tool_runtime"] = migration_module().tool_source_runtime(selector, runtime.get("tool_runtime", "runsc"))
+    default = runtime.get("tool_runtime", "runsc")
+    selected = migration.tool_source_runtime(selector, default)
+    fallback = selected == "conch" and not conch_module_enabled()
+    if fallback:
+        logging.warning("Conch is absent from AGENTOS_MODULES; using runsc for the default tool sandbox")
+        if default == "conch":
+            runtime.pop("tool_image", None)
+        selector.pop("image", None)
+    runtime["tool_runtime"] = "runsc" if fallback else selected
     runtime["_tool_inputs_normalized"] = True
+    runtime["_conch_tool_fallback"] = fallback
     for key in ("image", "cpu", "memory", "idle_timeout", "user", "group", "enabled"):
         if key in selector:
             runtime["tool_" + key] = selector[key]
@@ -220,15 +230,19 @@ def local_image_bindings(runtime):
 
 def gateway_config(config, settings, environment=None, *, deployment_owned=False, migration_defaults=None):
     config = copy.deepcopy(config)
-    tool_image_source = migration_module().tool_image_source
+    migration = migration_module()
     values = {}
     if environment and Path(environment).is_file():
         from dotenv import dotenv_values
         values = dotenv_values(environment, interpolate=False)
     if deployment_owned and settings.get("profile", "standalone") == "agentos":
         values = business_environment(settings)
-    config["sandbox"] = tool_image_source(config.get("sandbox") or {}, values)
+    config["sandbox"] = migration.tool_image_source(config.get("sandbox") or {}, values)
     runtime = settings["runtime"]
+    conch_enabled = conch_module_enabled()
+    if (migration_defaults is not None and not conch_enabled
+            and migration.tool_source_runtime(config["sandbox"], runtime.get("tool_runtime", "runsc")) == "conch"):
+        return None
     network = settings.get("network", {})
     from jiuwenswarm.extensions.agentos.agentos_router.adx.network import network_profile
     from jiuwenswarm.extensions.agentos.agentos_router.adx.config import DEFAULT_RESTART_POLICY, normalize_restart_policy
@@ -238,10 +252,20 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
     if not isinstance(tool_runtimes, list) or any(value not in ("runsc", "conch") for value in tool_runtimes):
         raise ValueError("runtime.tool_runtimes must list runsc/conch backends")
     tool_runtimes = [*tool_runtimes, runtime.get("tool_runtime", "runsc")]
-    if not conch_module_enabled():
+    if not conch_enabled:
+        fallback = runtime.get("_conch_tool_fallback", False)
         if runtime.get("tool_runtime", "runsc") == "conch":
-            raise ValueError("runtime.tool_runtime=conch requires conch in AGENTOS_MODULES")
+            logging.warning("Conch is absent from AGENTOS_MODULES; using runsc for the default tool sandbox")
+            runtime = {**runtime, "tool_runtime": "runsc"}
+            runtime.pop("tool_image", None)
+            tool_runtimes.append("runsc")
+            fallback = True
         tool_runtimes = [value for value in tool_runtimes if value != "conch"]
+        if deployment_owned and fallback:
+            sandbox = config["sandbox"]
+            for key in ("executor", "template_name", "conch", "image", "rootfs", "image_env", "prepared_image"):
+                sandbox.pop(key, None)
+            sandbox.update(type="adx-environment", runtime="runsc")
     gateway = config.setdefault("gateway", {})
     gateway["agent_client"] = {"type": "agentos_router", "agent_namespace": settings["namespace"]}
     adx_options = gateway.get("adx") or {}
@@ -284,7 +308,7 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
             gateway["adx"]["builtin_launch"]["workspace_mount_options"] = copy.deepcopy(runtime["workspace_mount_options"])
     gateway.setdefault("agentos", {})["workspace_root"] = settings["workspace_root"]
     account = pwd.getpwnam(runtime["user"]) if runtime.get("user") else pwd.getpwuid(os.getuid())
-    migrate_adx_sandbox = migration_module().migrate_adx_sandbox
+    migrate_adx_sandbox = migration.migrate_adx_sandbox
     if deployment_owned:
         # Older generated Gateway files also injected AgentServer's Python into
         # tools. Remove those exact defaults while retaining explicit mounts.
@@ -537,8 +561,12 @@ def validate_user_configs(settings, *, failures=None):
                 source = user_config.read_bytes()
                 document = migration_module().workspace_overrides(user_config, yaml.safe_load(source))
                 defaults = {}
-                updated = migrate_tool_environment(
-                    gateway_config(document, settings, user_config.with_name(".env"), migration_defaults=defaults), user_config.with_name(".env"))
+                env_file = user_config.with_name(".env")
+                updated = gateway_config(document, settings, env_file, migration_defaults=defaults)
+                if updated is None:
+                    logging.warning("Skipping workspace migration because Conch is unavailable: %s", user_config)
+                    continue
+                updated = migrate_tool_environment(updated, env_file)
                 seed = {'type': 'adx-environment', 'runtime': updated['sandbox']['runtime']}
                 updated['_adx_deployment_defaults'] = migration_module().workspace_sandbox(
                     migration_module().migrate_adx_sandbox(seed, defaults))
@@ -575,7 +603,8 @@ def preflight(settings):
     validate_user_configs(settings)
     config = data_directory(settings) / "config/config.yaml"
     if config.is_file():
-        migrate_tool_environment(gateway_config(read_yaml(config), settings, config.with_name(".env")), config.with_name(".env"))
+        env_file = config.with_name(".env")
+        migrate_tool_environment(gateway_config(read_yaml(config), settings, env_file, deployment_owned=True), env_file)
 
 
 def apply_deployment_tracing(config, deployment_config, *, users_root=None):
@@ -648,6 +677,12 @@ def configure(settings):
     # Prepare the dotenv seed for application workspace initialization.
     seed_env = template.with_suffix('.env')
     write_private(seed_env, env_file.read_text(), mode=0o600)
+    if settings["runtime"].get("_conch_tool_fallback"):
+        from dotenv import dotenv_values, unset_key
+        seed_values = dotenv_values(seed_env, interpolate=False)
+        for key in ("TOOL_SANDBOX_TYPE", "TOOL_SANDBOX_EXECUTOR", "TOOL_SANDBOX_IMAGE"):
+            if key in seed_values:
+                unset_key(str(seed_env), key)
     update_environment(seed_env, settings)
     owner = template.stat()
     os.chown(seed_env, owner.st_uid, owner.st_gid)

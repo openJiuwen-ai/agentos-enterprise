@@ -1,4 +1,5 @@
 """Prepared Local sources cross deployment boundaries without a Gateway catalog."""
+import copy
 import importlib.util
 from pathlib import Path
 
@@ -158,6 +159,103 @@ def test_operator_inputs_are_preserved_and_shared_by_artifact_preparation(settin
     deploy.update_environment(env_file, settings, service=True)
     assert "custom:v2" in env_file.read_text()
     assert "TOOL_SANDBOX_CPU" in env_file.read_text()
+
+
+@pytest.mark.parametrize(("sandbox", "dotenv_source"), [
+    ({"type": "yuanrong", "executor": "conch", "image": "old-conch:v1", "cpu": 700}, None),
+    ({"type": "jiuwenbox-conch", "template_name": "old-conch:v1", "cpu": 700}, None),
+    ({"type": "adx-environment", "runtime": "conch", "image": "old-conch:v1", "cpu": 700}, None),
+    ({}, ".env.custom"),
+    ({}, ".env"),
+])
+def test_disabled_conch_warns_and_configures_runsc(settings, tmp_path, monkeypatch, caplog, sandbox, dotenv_source):
+    from dotenv import dotenv_values
+
+    monkeypatch.setenv("AGENTOS_CONCH_MODULE", "0")
+    monkeypatch.setattr(deploy, "check_business", lambda _: None)
+    monkeypatch.setattr(deploy, "validate_user_configs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(deploy, "apply_deployment_tracing", lambda *args, **kwargs: None)
+    config_dir = deploy.data_directory(settings) / "config"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"sandbox": sandbox}))
+    custom = tmp_path / "operator.env"
+    legacy_env = ("TOOL_SANDBOX_TYPE=yuanrong\nTOOL_SANDBOX_EXECUTOR=conch\n"
+                  "TOOL_SANDBOX_IMAGE=old-conch:v1\nTOOL_SANDBOX_CPU=700\n")
+    custom.write_text(legacy_env if dotenv_source == ".env.custom" else "")
+    if dotenv_source == ".env":
+        (config_dir / ".env").write_text(legacy_env)
+    token = tmp_path / "token"
+    token.write_text("test-token")
+    settings.update(business_env_file=str(custom), token_file=str(token))
+    Path(settings["workspace_root"]).mkdir()
+    settings["runtime"].update(
+        tool_image="default-runsc:v1", local_image_bindings={"images": {
+            "default-runsc:v1": {"path": "/objects/runsc/rootfs"},
+        }},
+    )
+
+    for _ in range(2):
+        deploy.preflight(copy.deepcopy(settings))
+        deploy.configure(copy.deepcopy(settings))
+        configured = deploy.read_yaml(config_path)["sandbox"]
+        assert configured["runtime"] == "runsc"
+        assert configured["cpu"] == 700
+        assert configured["image"] == "default-runsc:v1"
+        assert configured["rootfs"] == {"type": "local", "path": "/objects/runsc/rootfs"}
+        assert "conch" not in configured["runtime_defaults"]
+        seed = dotenv_values(config_dir / "agentos-user-template.env")
+        assert "TOOL_SANDBOX_EXECUTOR" not in seed
+        assert "TOOL_SANDBOX_IMAGE" not in seed
+    assert custom.read_text() == (legacy_env if dotenv_source == ".env.custom" else "")
+    assert "Conch is absent from AGENTOS_MODULES" in caplog.text
+
+
+@pytest.mark.parametrize(("conch_module", "dotenv_selector"), [("0", False), ("0", True), ("1", False)])
+def test_workspace_migration_skips_unavailable_conch(
+    settings, tmp_path, monkeypatch, caplog, conch_module, dotenv_selector,
+):
+    from jiuwenswarm.extensions.agentos.agentos_router.adx.workspace import MIGRATION_ERROR_FILE
+
+    monkeypatch.setenv("AGENTOS_CONCH_MODULE", conch_module)
+    monkeypatch.setattr(deploy, "check_business", lambda _: None)
+    monkeypatch.setattr(deploy, "apply_deployment_tracing", lambda *args, **kwargs: None)
+    config_dir = deploy.data_directory(settings) / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text("{}\n")
+    token = tmp_path / "token"
+    token.write_text("test-token")
+    settings.update(business_env_file=str(tmp_path / "operator.env"), token_file=str(token))
+
+    users = Path(settings["workspace_root"])
+    conch_config = users / "alice/.jiuwenswarm/config/config.yaml"
+    runsc_config = users / "bob/.jiuwenswarm/config/config.yaml"
+    for path in (conch_config, runsc_config):
+        path.parent.mkdir(parents=True)
+        path.with_name(".env").write_text("KEEP_USER_SETTING=yes\n")
+    legacy_sandbox = {"type": "yuanrong", "executor": "conch", "image": "legacy-conch:v1"}
+    if dotenv_selector:
+        legacy_sandbox.pop("executor")
+        conch_config.with_name(".env").write_text("TOOL_SANDBOX_EXECUTOR=conch\n")
+    conch_config.write_text(yaml.safe_dump({"sandbox": legacy_sandbox}))
+    runsc_config.write_text("sandbox: {type: yuanrong, executor: docker, cpu: 700}\n")
+    original = conch_config.read_bytes(), conch_config.with_name(".env").read_bytes()
+    migration = deploy.migration_module()
+    monkeypatch.setattr(migration, "configuration_paths", lambda _: [conch_config, runsc_config])
+    monkeypatch.setattr(deploy, "migration_module", lambda: migration)
+
+    deploy.preflight(copy.deepcopy(settings))
+    deploy.configure(copy.deepcopy(settings))
+
+    assert deploy.read_yaml(runsc_config)["sandbox"]["runtime"] == "runsc"
+    assert deploy.read_yaml(runsc_config)["sandbox"]["cpu"] == 700
+    assert not conch_config.with_name(MIGRATION_ERROR_FILE).exists()
+    if conch_module == "0":
+        assert (conch_config.read_bytes(), conch_config.with_name(".env").read_bytes()) == original
+        assert not conch_config.with_name("adx-sandbox-defaults.json").exists()
+        assert "Skipping workspace migration because Conch is unavailable" in caplog.text
+    else:
+        assert deploy.read_yaml(conch_config)["sandbox"]["runtime"] == "conch"
 
 
 @pytest.mark.parametrize("dotenv_image, expected", [("", "custom:v1"), ("custom:v2", "custom:v2")])
