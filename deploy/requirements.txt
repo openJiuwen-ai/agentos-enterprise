@@ -136,6 +136,7 @@ openai==2.46.0
 openai-codex==0.144.4
 openai-codex-cli-bin==0.144.4
 openapi-pydantic==0.5.1
+openjiuwen-security==0.0.1
 openpyxl==3.1.5
 opentelemetry-api==1.41.1
 opentelemetry-exporter-otlp-proto-common==1.41.1
@@ -246,6 +247,8 @@ trafilatura==2.1.0
 transformers==5.14.1
 tree-sitter==0.25.2
 tree-sitter-bash==0.25.1
+tree-sitter-batch==0.11.1
+tree-sitter-pwsh==0.38.1
 truststore==0.10.4
 tzdata==2026.6
 typer==0.27.0
