@@ -32,6 +32,8 @@ warning() { echo -e "\033[33m⚠️  $@\033[0m" >&2; }
 # _AFS_ERROR_EMITTED: error() 已给出人话错误时，ERR trap 不再重复打印调用栈噪音
 _AFS_ERROR_EMITTED=""
 error()   { _AFS_ERROR_EMITTED="yes"; echo -e "\033[31m❌ $@\033[0m" >&2; exit 1; }
+# 同 error，但用指定退出码（如 user-exists 的 2 = 判不出来）。
+error_exit() { local c="$1"; shift; _AFS_ERROR_EMITTED="yes"; echo -e "\033[31m❌ $@\033[0m" >&2; exit "${c}"; }
 
 # ===== 未捕获失败的兜底诊断 =====
 _afs_err_trap() {
@@ -62,6 +64,7 @@ _afs_load_config() {
     local _env_api_listen="${AFS_WORKSPACE_API_LISTEN:-}" _env_api_enabled="${AFS_WORKSPACE_API_ENABLED:-}"
     local _env_egress="${AFS_EGRESS_ROOT:-}" _env_data="${AFS_DATA_ROOT:-}"
     local _env_outlet_users="${AFS_OUTLET_USERS_ROOT:-}" _env_outlet_import="${AFS_OUTLET_IMPORT_ROOT:-}"
+    local _env_outlet_interval="${AFS_OUTLET_MIRROR_INTERVAL_MS:-}"
     local _env_ownerfs_mount="${AFS_OWNERFS_MOUNT:-}"
     local _env_ownerfs_data="${AFS_OWNERFS_DATA_DIR:-}" _env_ownerfs_adopt="${AFS_OWNERFS_ADOPT_ON_STARTUP:-}"
     local _env_tls_script="${AFS_TLS_PREPARE_SCRIPT:-}" _env_default_user="${AFS_WORKSPACE_DEFAULT_USER:-}"
@@ -92,6 +95,7 @@ _afs_load_config() {
     [ -n "${_env_egress}" ] && AFS_EGRESS_ROOT="${_env_egress}"
     [ -n "${_env_outlet_users}" ] && AFS_OUTLET_USERS_ROOT="${_env_outlet_users}"
     [ -n "${_env_outlet_import}" ] && AFS_OUTLET_IMPORT_ROOT="${_env_outlet_import}"
+    [ -n "${_env_outlet_interval}" ] && AFS_OUTLET_MIRROR_INTERVAL_MS="${_env_outlet_interval}"
     [ -n "${_env_ownerfs_mount}" ] && AFS_OWNERFS_MOUNT="${_env_ownerfs_mount}"
     [ -n "${_env_ownerfs_data}" ] && AFS_OWNERFS_DATA_DIR="${_env_ownerfs_data}"
     [ -n "${_env_ownerfs_adopt}" ] && AFS_OWNERFS_ADOPT_ON_STARTUP="${_env_ownerfs_adopt}"
@@ -138,6 +142,15 @@ _afs_load_config() {
     # 它必须与数据池根是同一处，否则 NFS 导出与真实数据分离（对端挂到空目录）。
     # 因此兜底跟随 AFS_OWNERFS_DATA_DIR，而不是 AFS_DATA_ROOT/ownerfs。
     : "${AFS_OUTLET_USERS_ROOT:="${AFS_OWNERFS_DATA_DIR}"}"
+    # outlet mirror 收敛周期：只影响 egress 名字的发布延迟，不影响数据读写路径。
+    : "${AFS_OUTLET_MIRROR_INTERVAL_MS:="50"}"
+    # 等 egress 名发布成 symlink 的上限（秒）。正常是毫秒级，这个值只是兜底：
+    # 10s 还没发布基本就是 mirror 卡住了。三处等待共用（agentos.sh 里同值）。
+    : "${AFS_EGRESS_PUBLISH_WAIT:="10"}"
+    case "${AFS_EGRESS_PUBLISH_WAIT}" in
+        ''|*[!0-9]*) error "AFS_EGRESS_PUBLISH_WAIT must be a positive integer (got: '${AFS_EGRESS_PUBLISH_WAIT}')" ;;
+        0) error "AFS_EGRESS_PUBLISH_WAIT must be > 0 (got: 0)" ;;
+    esac
     : "${AFS_OWNERFS_ADOPT_ON_STARTUP:="yes"}"
     : "${AFS_TLS_PREPARE_SCRIPT:=""}"
     : "${AFS_TLS_DAYS:="365"}"
@@ -159,6 +172,10 @@ _afs_load_config() {
     case "${AFS_TLS_DAYS}" in ''|*[!0-9]*) error "Invalid AFS_TLS_DAYS: ${AFS_TLS_DAYS} (positive integer, days)" ;; esac
     [ "${AFS_TLS_DAYS}" -gt 0 ] || error "AFS_TLS_DAYS must be a positive number of days (got: ${AFS_TLS_DAYS})"
     case "${AFS_OWNERFS_ADOPT_ON_STARTUP}" in yes|no) ;; *) error "Invalid AFS_OWNERFS_ADOPT_ON_STARTUP: ${AFS_OWNERFS_ADOPT_ON_STARTUP} (yes/no)" ;; esac
+    # AFS 侧校验范围是 10..=60000，超界会在 node 启动时被拒，这里提前拦住。
+    case "${AFS_OUTLET_MIRROR_INTERVAL_MS}" in ''|*[!0-9]*) error "Invalid AFS_OUTLET_MIRROR_INTERVAL_MS: ${AFS_OUTLET_MIRROR_INTERVAL_MS} (integer, milliseconds)" ;; esac
+    [ "${AFS_OUTLET_MIRROR_INTERVAL_MS}" -ge 10 ] && [ "${AFS_OUTLET_MIRROR_INTERVAL_MS}" -le 60000 ] \
+        || error "AFS_OUTLET_MIRROR_INTERVAL_MS must be within 10..=60000 (got: ${AFS_OUTLET_MIRROR_INTERVAL_MS})"
     # ownerfs_data_dir 必须是绝对路径（AFS 侧同一校验：ownerfs.rs 的 "must be absolute"）。
     case "${AFS_OWNERFS_DATA_DIR}" in
         /*) ;;
@@ -191,19 +208,43 @@ _afs_load_config() {
         true|false) ;;
         *) error "AFS_MKDIR_LOAD_BALANCE must be true or false (got: '${AFS_MKDIR_LOAD_BALANCE}')" ;;
     esac
-    # workspace 创建/删除通道（已双通道）:
-    #   fuse = FUSE mkdir / 清空 + rmdir（走完整 Meta 删除链）
-    #   api  = POST/DELETE /v1/workspaces（同步 egress 就绪 + node_id 校验；删除走
-    #          .ownerfs-trash 归档语义）。api 需要 AFS_WORKSPACE_API_ENABLED=yes。
-    AFS_CREATE_MODE="${AFS_CREATE_MODE:-fuse}"
+    # workspace 创建/删除通道:
+    #   api  = POST/DELETE /v1/workspaces（同步 egress 就绪 + node_id 校验；删除入
+    #          .ownerfs-trash）。与业务真实路径同源，home_dir == access_path 可硬校验。
+    #   fuse = FUSE mkdir / rmdir，仅在 API 关闭或排障时使用。
+    # API 前提在 _afs_require_create_mode_ready 里按需检查，不在这里：放这里会让
+    # status/down/clean 也被无关开关拦住，出问题时连 down 都跑不了。
+    AFS_CREATE_MODE="${AFS_CREATE_MODE:-api}"
     case "${AFS_CREATE_MODE}" in
-        fuse) ;;
-        api)  [ "${AFS_WORKSPACE_API_ENABLED}" = "yes" ] \
-                  || error "AFS_CREATE_MODE=api requires AFS_WORKSPACE_API_ENABLED=yes (the workspace API listener must be rendered first)" ;;
-        *)    error "AFS_CREATE_MODE must be fuse or api (got: '${AFS_CREATE_MODE}')" ;;
+        fuse|api) ;;
+        *) error "AFS_CREATE_MODE must be fuse or api (got: '${AFS_CREATE_MODE}')" ;;
     esac
     # python 解析（config.py 角色推导用；YR_PYTHON_VERSION 由 agentos.sh 导出，独立运行时默认 3.11）
     AFS_PYTHON_BIN="$(_afs_python_bin)"
+}
+
+# api 通道的前置条件，仅在真正走 API 的子命令里调用。
+# 拆成"判"与"报"两步，好让 user-exists 用 exit 2 报（判不出来），
+# 其他子命令用 exit 1。
+_afs_create_mode_ready() {
+    [ "${AFS_CREATE_MODE}" = "api" ] || return 0
+    [ "${AFS_WORKSPACE_API_ENABLED}" = "yes" ] && return 0
+    _AFS_CREATE_MODE_READY_ERR="AFS_CREATE_MODE=api requires AFS_WORKSPACE_API_ENABLED=yes (the workspace API listener must be rendered first).
+  若只想用 FUSE 通道：在 afs.conf 设 AFS_CREATE_MODE=\"fuse\"。"
+    return 1
+}
+
+_afs_require_create_mode_ready() {
+    _afs_create_mode_ready || error "${_AFS_CREATE_MODE_READY_ERR}"
+}
+
+# afs-node 是否在服务或正在接管挂载（activating 时 is-active --quiet 返回 3）。
+_afs_node_holds_mount() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    case "$(systemctl is-active agentos-afs-node 2>/dev/null)" in
+        active|activating|reloading) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # ===== 跳过判定 =====
@@ -561,6 +602,7 @@ _afs_render_node_toml() {
     _afs_toml_set "${out}" outlet_import_root "\"${AFS_OUTLET_IMPORT_ROOT}\""
     _afs_toml_set "${out}" outlet_public_root "\"${AFS_EGRESS_ROOT}\""
     _afs_toml_set "${out}" outlet_nfs_addr "\"${BIND_IP}\""
+    _afs_toml_set "${out}" outlet_mirror_interval_ms "${AFS_OUTLET_MIRROR_INTERVAL_MS}"
     _afs_toml_set "${out}" ownerfs_mount "\"${AFS_OWNERFS_MOUNT}\""
     _afs_toml_set "${out}" tls_ca_certificate "\"${AFS_ROOT}/tls/ca.pem\""
     _afs_toml_set "${out}" tls_identity_certificate "\"${AFS_ROOT}/tls/${AFS_NODE_ID}.pem\""
@@ -699,6 +741,26 @@ _afs_resolve_exec_start() {
     fi
 }
 
+# ===== 本地挂载面准备脚本 =====
+# 源文件 afs-prepare-outlets.sh，install 时投放到 ${AFS_ROOT}/bin/，
+# 供 node.service 的 ExecStartPre 与 up 共用。
+_afs_prepare_outlets_path() { printf '%s\n' "${AFS_ROOT}/bin/afs-prepare-outlets.sh"; }
+
+_afs_install_prepare_outlets() {
+    local src="${SCRIPT_DIR}/afs-prepare-outlets.sh" dst
+    dst="$(_afs_prepare_outlets_path)"
+    [ -f "${src}" ] || error "afs-prepare-outlets.sh not found at ${src}
+  node.service 的 ExecStartPre 依赖它；缺失会导致 node 无法启动。
+  修复：确认 deploy/afs/afs-prepare-outlets.sh 随包交付。"
+    install -d -m 755 "${AFS_ROOT}/bin"
+    # 原子替换，避免 systemd 执行到写了一半的文件。
+    local tmp="${dst}.new.$$"
+    install -m 755 "${src}" "${tmp}" && mv -f -- "${tmp}" "${dst}" || {
+        rm -f -- "${tmp}" 2>/dev/null || true
+        error "failed to install ${src} → ${dst}"
+    }
+}
+
 _afs_write_wait_ready() {
     install -d -m 755 "${AFS_ROOT}/bin"
     cat > "${_AFS_WAIT_READY}" <<'EOF'
@@ -797,7 +859,7 @@ _afs_unit_log_lines() {
 }
 
 _afs_render_units() {
-    local exec_start meta_rest_host is_master=no
+    local exec_start meta_rest_host is_master=no prepare_outlets
     local node_log_lines meta_log_lines
     exec_start=$(_afs_resolve_exec_start)
     _afs_is_master && is_master=yes
@@ -808,6 +870,8 @@ _afs_render_units() {
     fi
     install -d -m 755 "${AFS_ROOT}/bin"
     _afs_write_wait_ready
+    _afs_install_prepare_outlets
+    prepare_outlets="$(_afs_prepare_outlets_path)"
     node_log_lines="$(_afs_unit_log_lines node)"
     meta_log_lines="$(_afs_unit_log_lines meta)"
     # 日志落盘：目录/文件必须先建好——append: 在 ExecStartPre 之前打开 stdout，
@@ -841,11 +905,9 @@ ${node_log_lines}
 # unless the unit name equals the escaped mountpoint path) -> ExecStartPre instead.
 # /run dirs are lost on reboot and afs-node only canonicalizes (never creates)
 # mountpoints, so they are rebuilt unconditionally before every start.
+# 顺序是契约：本地挂载面必须先于 meta 门禁，否则 meta 不可达时 egress 是裸 ext4。
+ExecStartPre=${prepare_outlets} ${AFS_OWNERFS_MOUNT} ${AFS_OUTLET_IMPORT_ROOT} ${AFS_EGRESS_ROOT}
 ExecStartPre=${AFS_ROOT}/bin/afs-wait-ready.sh http://${meta_rest_host}:${AFS_META_REST_PORT}/health 60
-ExecStartPre=/bin/mkdir -p ${AFS_OWNERFS_MOUNT} ${AFS_OUTLET_IMPORT_ROOT} ${AFS_EGRESS_ROOT}
-# Conditional tmpfs mount: skip if already tmpfs (prevents layer stacking across
-# restarts; residual non-tmpfs layers are cleaned by up/down).
-ExecStartPre=-/bin/sh -c 'findmnt -no FSTYPE --target ${AFS_EGRESS_ROOT} 2>/dev/null | head -1 | grep -qx tmpfs || /bin/mount -t tmpfs -o mode=0755,nodev,nosuid tmpfs ${AFS_EGRESS_ROOT}'
 ExecStart=${exec_start}
 Restart=on-failure
 RestartSec=5s
@@ -995,8 +1057,7 @@ _afs_check_outlets() {
     # ownerfs_mount: 挂载点必须存在且【未挂载】——afs-node 启动时自己挂（预挂会报 already mounted）
     # 例外: afs-node 运行态下 FUSE 自挂载存在是预期（幂等重跑 up 时服务已运行）
     [ -d "${AFS_OWNERFS_MOUNT}" ] || error "outlet check failed: ${AFS_OWNERFS_MOUNT} must exist (mountpoint dir; run install)"
-    if mountpoint -q "${AFS_OWNERFS_MOUNT}" 2>/dev/null \
-        && ! systemctl is-active --quiet agentos-afs-node 2>/dev/null; then
+    if mountpoint -q "${AFS_OWNERFS_MOUNT}" 2>/dev/null && ! _afs_node_holds_mount; then
         error "outlet check failed: ${AFS_OWNERFS_MOUNT} must NOT be pre-mounted (afs-node mounts it itself); umount it first"
     fi
 }
@@ -1064,37 +1125,13 @@ afs_do_up() {
     fi
     _afs_resolve_node_id
 
-    local _ef
-    _ef="$(findmnt -no FSTYPE --mountpoint "${AFS_EGRESS_ROOT}" 2>/dev/null | head -1 || true)"
-    if [ -n "${_ef}" ] && [ "${_ef}" != "tmpfs" ]; then
-        case "${_ef}" in
-            autofs|autofs4)
-                # 不是"残留"，是另一个后端的现役挂载 —— 措辞必须区分，否则会被当成垃圾清掉
-                warning "egress ${AFS_EGRESS_ROOT} 正由 autofs（workspace-storage 后端）提供服务。"
-                warning "  → AFS 需要该路径作为 tmpfs，将先卸载 autofs（这是必要步骤，非异常）。"
-                warning "  → 卸载后该路径下的 workspace 立刻不可访问，且 agentos-workspace 仍可能显示 active。"
-                warning "  → 若这是误操作，恢复方式：停止 AFS 后重新 'workspace-storage/deploy.sh up'"
-                ;;
-            *)
-                warning "egress occupied by ${_ef}; umounting residual layer(s) before tmpfs mount"
-                ;;
-        esac
-        local _u=0
-        while [ "${_u}" -lt 5 ]; do
-            _ef="$(findmnt -no FSTYPE --mountpoint "${AFS_EGRESS_ROOT}" 2>/dev/null | head -1 || true)"
-            [ -z "${_ef}" ] && break
-            [ "${_ef}" = "tmpfs" ] && break
-            umount -l "${AFS_EGRESS_ROOT}" 2>/dev/null || break
-            _u=$((_u+1))
-            sleep 1
-        done
-    fi
-    if ! mountpoint -q "${AFS_EGRESS_ROOT}" 2>/dev/null; then
-        mount -t tmpfs -o mode=0755,nodev,nosuid tmpfs "${AFS_EGRESS_ROOT}" 2>/dev/null \
-            || error "failed to mount tmpfs at ${AFS_EGRESS_ROOT}; check residual mounts (findmnt -t autofs) under it"
-    fi
-    install -d -m 755 "${AFS_OWNERFS_MOUNT}" 2>/dev/null || true
-    install -d -m 755 "${AFS_OUTLET_IMPORT_ROOT}" 2>/dev/null || true
+    # 与 node.service 的 ExecStartPre 共用同一实现。每次都重装：只在缺失时装
+    # 会让升级后的机器一直跑旧版本，"缺失判断"并不等于"内容是最新的"。
+    local _prep_outlets
+    _prep_outlets="$(_afs_prepare_outlets_path)"
+    _afs_install_prepare_outlets
+    bash "${_prep_outlets}" "${AFS_OWNERFS_MOUNT}" "${AFS_OUTLET_IMPORT_ROOT}" "${AFS_EGRESS_ROOT}" \
+        || error "afs-prepare-outlets.sh failed (egress tmpfs / ownerfs mount point not ready)"
 
     # nfs-server 存活保证（workspace-storage down 可能停过它；AFS 导出依赖 nfsd）
     _afs_ensure_nfs_server
@@ -1337,7 +1374,7 @@ _afs_create_workspace() {
                 || warning "chown ${fuse_dir} to agentos failed"
         fi
         local i ready=0
-        for i in $(seq 1 10); do
+        for i in $(seq 1 "${AFS_EGRESS_PUBLISH_WAIT}"); do
             if [ -L "${_AFS_CREATE_ACCESS_PATH%/}" ] && [ -e "${_AFS_CREATE_ACCESS_PATH%/}" ]; then
                 ready=1
                 break
@@ -1345,7 +1382,7 @@ _afs_create_workspace() {
             sleep 1
         done
         [ "${ready}" -eq 1 ] \
-            || warning "egress name for '${owner}' not published after 10s (${_AFS_CREATE_ACCESS_PATH}); outlet mirror publishes asynchronously — write data to the FUSE path, not the egress path"
+            || warning "egress name for '${owner}' not published after ${AFS_EGRESS_PUBLISH_WAIT}s (${_AFS_CREATE_ACCESS_PATH}); outlet mirror publishes asynchronously — write data to the FUSE path, not the egress path"
         _AFS_CREATE_NODE_OK="yes"
         # 两行输出: dst_dir + access_path（M-16: 全局变量在命令替换子 shell 里传不回父 shell）
         printf '%s\n%s\n' "${fuse_dir}" "${_AFS_CREATE_ACCESS_PATH%/}"
@@ -1366,8 +1403,20 @@ _afs_create_workspace() {
     _AFS_CREATE_NODE_OK="yes"
     [ -n "${node_id}" ] && [ "${node_id}" != "${AFS_NODE_ID}" ] \
         && warning "workspace '${owner}' homed on ${node_id} (this node: ${AFS_NODE_ID}); access via egress path only"
-    # 两行输出: api 模式下 dst_dir = access_path（创建返回时已可读写）
-    printf '%s\n%s\n' "${access_path}" "${access_path}"
+    # dst_dir 只取已发布为 symlink 的 egress 名：写入会穿透到真实位置（本机数据
+    # 目录或对端 NFS import）。未发布时返回空，交由调用方失败 —— 直接对它 mkdir
+    # 会在 tmpfs 上建出真目录并遮蔽后续 symlink。
+    local data_dir="" i
+    for i in $(seq 1 "${AFS_EGRESS_PUBLISH_WAIT}"); do
+        if [ -L "${access_path%/}" ] && [ -e "${access_path%/}" ]; then
+            data_dir="${access_path%/}"
+            break
+        fi
+        sleep 1
+    done
+    [ -n "${data_dir}" ] \
+        || warning "egress name for '${owner}' not published after ${AFS_EGRESS_PUBLISH_WAIT}s (${access_path}); refusing to write there"
+    printf '%s\n%s\n' "${data_dir}" "${access_path}"
     return 0
 }
 
@@ -1384,11 +1433,18 @@ afs_do_user_init() {
         esac
     done
     [ -n "${owner}" ] || error "user-init requires <owner>"
+    _afs_require_create_mode_ready
     _afs_resolve_node_id
     local dst_dir access_path _crt
     _crt=$(_afs_create_workspace "${owner}")
     dst_dir="${_crt%%$'\n'*}"
     access_path="${_crt##*$'\n'}"
+    if [ -z "${dst_dir}" ]; then
+        # egress 名在超时内仍未发布为 symlink。此时不能退化成写 egress 名 ——
+        # 那会在 tmpfs 上建出真目录并遮蔽后续 symlink。
+        error "egress name for '${owner}' not published within ${AFS_EGRESS_PUBLISH_WAIT}s (${access_path}); refusing to write into the egress tmpfs.
+  排查：systemctl status agentos-afs-node；确认 outlet mirror 正常收敛（node.toml: outlet_mirror_interval_ms）。"
+    fi
     [ -d "${dst_dir}" ] || error "workspace dir not ready after create: ${dst_dir}"
     if [ -n "${home_dir}" ]; then
         if [ "${AFS_CREATE_MODE}" = "api" ]; then
@@ -1413,20 +1469,60 @@ afs_do_user_init() {
     fi
     if [ "${print_data_dir}" -eq 1 ]; then
         printf 'AFS_DATA_DIR=%s\n' "${dst_dir}"
+        printf 'AFS_CREATE_MODE=%s\n' "${AFS_CREATE_MODE}"
     fi
 }
 
 # ===== user-exists（create-user 判存在性）=====
+# 退出码：0 = 存在，1 = 不存在，2 = 判不出来（前置条件不满足/API 异常/挂载不可用）。
+# 调用方主要按 stdout 的 AFS_WORKSPACE= 判定；2 用于区分"不确定"，避免与
+# "不存在"混淆（error() 是 exit 1，故这里一律走 error_exit）。
 afs_do_user_exists() {
     local owner="${1:-}"
-    [ -n "${owner}" ] || error "user-exists requires <owner>"
+    [ -n "${owner}" ] || error_exit 2 "user-exists requires <owner>"
+    if ! _afs_create_mode_ready; then
+        error_exit 2 "$_AFS_CREATE_MODE_READY_ERR"
+    fi
+    if [ "${AFS_CREATE_MODE}" = "api" ]; then
+        # 归属对端的 root 不在本机 FUSE 里，须问 meta。
+        local api_url="http://${AFS_WORKSPACE_API_LISTEN}/v1/workspaces/${owner}" code body
+        command -v curl >/dev/null 2>&1 \
+            || error "AFS_CREATE_MODE=api requires curl (GET ${api_url})"
+        body=$(curl -sS -w '\n%{http_code}' --max-time 10 "${api_url}" 2>/dev/null) || body=$'\n000'
+        code="${body##*$'\n'}"
+        case "${code}" in
+            200)
+                printf 'AFS_WORKSPACE=present\n'
+                # 附带 access_path，供调用方在破坏性操作（--force 删除）之前
+                # 校验 home_dir == access_path 契约。
+                printf 'AFS_ACCESS_PATH=%s\n' \
+                    "$(printf '%s' "${body%$'\n'*}" \
+                        | sed -n 's/.*"access_path" *: *"\([^"]*\)".*/\1/p')"
+                return 0
+                ;;
+            404)
+                printf 'AFS_WORKSPACE=absent\n'
+                _AFS_ERROR_EMITTED="yes"
+                return 1
+                ;;
+            *)
+                # 不猜：当成"不存在"会重复创建或覆盖既有 workspace。
+                error_exit 2 "workspace API lookup failed for '${owner}' (GET ${api_url} -> HTTP ${code}); refusing to guess whether it exists (is agentos-afs-node running?)"
+                ;;
+        esac
+    fi
     _afs_ownerfs_mount_ok \
-        || error "OwnerFs FUSE not mounted at $(_afs_fuse_mount); cannot determine whether workspace '${owner}' exists (run 'up' first)"
+        || error_exit 2 "OwnerFs FUSE not mounted at $(_afs_fuse_mount); cannot determine whether workspace '${owner}' exists (run 'up' first)"
     if [ -d "$(_afs_fuse_mount)/${owner}" ]; then
         printf 'AFS_WORKSPACE=present\n'
+        # 与 api 分支对齐：fuse 模式下 egress 名同样是按固定规则得到的，
+        # 供调用方在 --force 删除前校验 home_dir 契约。
+        printf 'AFS_ACCESS_PATH=%s\n' "${AFS_EGRESS_ROOT%/}/${owner}"
         return 0
     fi
     printf 'AFS_WORKSPACE=absent\n'
+    # "不存在"是正常语义，压掉 ERR trap 以免调用方看到假故障堆栈。
+    _AFS_ERROR_EMITTED="yes"
     return 1
 }
 
@@ -1434,6 +1530,7 @@ afs_do_user_exists() {
 afs_do_user_delete() {
     local owner="${1:-}"
     [ -n "${owner}" ] || error "user-delete requires <owner>"
+    _afs_require_create_mode_ready
     if [ "${AFS_CREATE_MODE}" = "fuse" ]; then
         local fuse_dir
         fuse_dir="$(_afs_fuse_mount)/${owner}"
@@ -1501,20 +1598,24 @@ Commands:
   status     `afs|<svc>|<state>|<detail>` lines for agentos.sh status
   clean      purge data/tls (interactive confirm; AFS_FORCE=yes skips)
   user-init <owner> [--home <dir>] [--print-data-dir]
-             create-user hook: FUSE mkdir via ownerfs mount (full Meta create chain);
-             chmod 0700 on the FUSE data dir; probes egress name visibility (published
-             asynchronously by the outlet mirror, 250ms rounds — not a mount).
-             --print-data-dir: emit a single machine-readable line
-             `AFS_DATA_DIR=<fuse dir>` on stdout, so the caller writes data to the FUSE
-             path rather than to a not-yet-published egress name.
+             create-user hook: create the workspace through AFS_CREATE_MODE.
+             api mode POSTs /v1/workspaces (synchronous egress + node_id check);
+             fuse mode mkdirs via the ownerfs mount. Either way chmod 0700 the
+             data dir, and in api mode verify home_dir == access_path.
+             --print-data-dir: emit machine-readable lines on stdout —
+             `AFS_DATA_DIR=<dir>` and `AFS_CREATE_MODE=<api|fuse>` — so the
+             caller writes data to the data path rather than to a
+             not-yet-published egress name, and reports the mode actually used.
   user-exists <owner>
              create-user probe (read-only): exit 0 = workspace present, 1 = absent;
-             stdout AFS_WORKSPACE=present|absent. Judged on the FUSE data dir, not the
-             egress name (that symlink is published asynchronously by the outlet mirror,
-             so an egress-based check reports "absent" inside the publish window).
+             stdout AFS_WORKSPACE=present|absent, plus AFS_ACCESS_PATH=<path> in
+             api mode. api mode asks Meta (cluster-wide), so a root homed on a
+             peer is still reported present; fuse mode judges the local FUSE dir
+             and therefore cannot see peer-owned roots.
   user-delete <owner>
-             create-user --force hook: FUSE purge contents + top-level rmdir
-             (full delete chain incl. catalog; physical delete, no trash)
+             create-user --force hook: delete through AFS_CREATE_MODE.
+             api mode DELETE /v1/workspaces (data archived to .ownerfs-trash);
+             fuse mode purges contents then rmdir (full delete chain incl. catalog).
 
 Options:
   --ip IP    bind IP for multi-NIC hosts (BIND_IP)

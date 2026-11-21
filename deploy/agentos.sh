@@ -392,6 +392,19 @@ _copy_jiuwenswarm_template() {
         || error "Failed to initialize application workspace: $1"
 }
 
+# egress 名挂载前 confirm 它是 outlet mirror 已发布的 symlink；未发布时写它会在
+# tmpfs 上建出真目录并遮蔽后续 symlink（重启即丢）。
+# 等待秒数用 afs_deploy.sh 的 AFS_EGRESS_PUBLISH_WAIT，未设时与它同默认 10。
+_afs_egress_published() {
+    local path="$1" wait="${2:-${AFS_EGRESS_PUBLISH_WAIT:-10}}" i=0
+    while [ "${i}" -lt "${wait}" ]; do
+        if [ -L "${path}" ] && [ -e "${path}" ]; then return 0; fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
 deploy_create_user() {
     local username=""
     local force=0
@@ -429,6 +442,80 @@ deploy_create_user() {
     ensure_agentos_user
 
     local home_dir="${AGENTOS_HOME_BASE}/${username}"
+
+    if [ "${AGENTOS_STORAGE_BACKEND:-autofs-nfs}" = "afs" ]; then
+        local afs_deploy="${SCRIPT_DIR}/afs/afs_deploy.sh"
+        [ -f "${afs_deploy}" ] \
+            || error "AFS backend selected but ${afs_deploy} missing; cannot provision workspace for ${username}"
+
+        local afs_ws_state afs_access_path afs_ws_output
+        afs_ws_output=$( { bash "${afs_deploy}" user-exists "${username}" || true; } )
+        afs_ws_state=$(printf '%s\n' "${afs_ws_output}" \
+            | sed -n 's/^AFS_WORKSPACE=//p' | tail -1)
+        afs_access_path=$(printf '%s\n' "${afs_ws_output}" \
+            | sed -n 's/^AFS_ACCESS_PATH=//p' | tail -1)
+        case "${afs_ws_state}" in
+            present)
+                if [ "${force}" -ne 1 ]; then
+                    info "用户 ${username} 已存在，仅补齐缺失的应用配置"
+                    # 同样只能写已发布的 symlink：未发布时写 home_dir 会落在 tmpfs 上。
+                    local afs_wait="${AFS_EGRESS_PUBLISH_WAIT:-10}"
+                    _afs_egress_published "${home_dir}" "${afs_wait}" \
+                        || error "egress 名 ${home_dir} 未在 ${afs_wait}s 内发布（outlet mirror 未收敛），拒绝写入。
+  排查：systemctl status agentos-afs-node；确认 mirror 正常（node.toml: outlet_mirror_interval_ms）。"
+                    _copy_jiuwenswarm_template "${home_dir}"
+                    return 0
+                fi
+                # 先验契约再删：顺序反了时契约不成立的数据已进 .ownerfs-trash。
+                # access_path 拿不到同样拒绝（是"无法校验"，不是"校验通过"）。
+                if [ -z "${afs_access_path}" ]; then
+                    error "无法取得 AFS 认定的 access_path（owner=${username}），拒绝 --force 删除。
+  删除是不可逆的破坏性操作，必须先能校验 home_dir 契约。
+  排查：systemctl status agentos-afs-node；确认 'up' 已执行、workspace API 可达。
+  如需强制重建，请先修复上述问题，或手工执行：
+    afs/afs_deploy.sh user-delete ${username} && afs/afs_deploy.sh user-init ${username} --home ${home_dir}"
+                fi
+                if [ "${home_dir%/}" != "${afs_access_path%/}" ]; then
+                    error "AGENTOS_HOME_BASE/egress 契约不成立，拒绝 --force 删除：
+  home_dir    = ${home_dir}
+  access_path = ${afs_access_path}
+  请先修正 AGENTOS_HOME_BASE（当前 ${AGENTOS_HOME_BASE}）再重试。"
+                fi
+                warning "用户 ${username} 已存在，--force 经 AFS 删除后重建（数据入 .ownerfs-trash）"
+                bash "${afs_deploy}" user-delete "${username}" \
+                    || error "AFS user-delete failed for ${username}"
+                ;;
+            absent) ;;
+            *) error "无法判定 AFS workspace '${username}' 状态（user-exists 无输出）。
+  排查：systemctl status agentos-afs-node；确认 'up' 已执行、workspace API 可达。" ;;
+        esac
+
+        # 落点用 user-init 返回的数据目录，不用 egress 名：后者是 outlet mirror
+        # 异步发布的 symlink，未发布时对它 mkdir 会在 tmpfs 上建出真目录。
+        local afs_init_out afs_data_dir afs_mode
+        afs_init_out=$(bash "${afs_deploy}" user-init "${username}" \
+            --home "${home_dir}" --print-data-dir) \
+            || error "AFS user-init failed for ${username}（不会降级为裸 mkdir）"
+        afs_data_dir=$(printf '%s\n' "${afs_init_out}" \
+            | sed -n 's/^AFS_DATA_DIR=//p' | tail -1)
+        afs_mode=$(printf '%s\n' "${afs_init_out}" \
+            | sed -n 's/^AFS_CREATE_MODE=//p' | tail -1)
+        [ -n "${afs_data_dir}" ] && [ -d "${afs_data_dir}" ] \
+            || error "AFS user-init 未返回可用的数据目录（owner=${username}）；不会写 egress 名以免落进 tmpfs"
+
+        local afs_workspace_dir="${afs_data_dir%/}/workspace"
+        mkdir -p "${afs_workspace_dir}" \
+            || error "mkdir ${afs_workspace_dir} failed（不会在失败后报成功）"
+        chmod 0700 "${afs_workspace_dir}" 2>/dev/null || true
+        _copy_jiuwenswarm_template "${afs_data_dir}"
+        _chown_user_home "${afs_workspace_dir}"
+        _chown_user_home "${afs_data_dir%/}/.jiuwenswarm"
+
+        success "用户 ${username} 创建成功: ${home_dir}（AFS 后端，创建通道 mode=${afs_mode:-unknown}）"
+        info "API key 需用户自行配置: 编辑 ${home_dir}/.jiuwenswarm/config/config.yaml 或 config/.env"
+        return 0
+    fi
+
     local managed_home_created
     # An autofs access root cannot create unregistered owner directories.
     managed_home_created=$("${ADX_BUSINESS_PYTHON:-python3.11}" "${SCRIPT_DIR}/jiuwenswarm/workspace_init.py" \

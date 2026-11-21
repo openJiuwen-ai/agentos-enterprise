@@ -22,7 +22,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_SH = ROOT / "deploy/afs/afs_deploy.sh"
+PREPARE_OUTLETS = ROOT / "deploy/afs/afs-prepare-outlets.sh"
 CONF_SRC = ROOT / "deploy/afs/afs.conf"
+# prepare-outlets 的三个路径参数。保持与生产一致的路径形态（挂载表桩按路径做 key），
+# 实际的 mkdir/umount/mount 都由桩接管，因此不需要写权限。
+DEFAULT_OUTLET_ARGS = ["/run/afs/ownerfs", "/run/afs/imports", "/home/agentos/users"]
 MODULE_SH = ROOT / "deploy/afs/module.sh"
 
 # 受控最小 afs.conf：FSID 故意用与脚本默认（11）不同的 42，
@@ -94,6 +98,11 @@ class AfsDeployHelpersTest(unittest.TestCase):
         cls.afs_dir.mkdir()
         cls.script = cls.afs_dir / "afs_deploy.sh"
         cls.script.write_text(_strip_set_eu(DEPLOY_SH.read_text(encoding="utf-8")), encoding="utf-8")
+        # afs-prepare-outlets.sh 是 afs_deploy.sh 的 install 产物来源，
+        # 缺失会让 _afs_render_units 直接按"打包遗漏"硬失败
+        (cls.afs_dir / "afs-prepare-outlets.sh").write_text(
+            PREPARE_OUTLETS.read_text(encoding="utf-8"), encoding="utf-8"
+        )
         (cls.afs_dir / "afs.conf").write_text(TEST_CONF, encoding="utf-8")
         scripts_dir = root / "scripts"
         scripts_dir.mkdir()
@@ -206,17 +215,117 @@ class AfsDeployHelpersTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "api")
 
-    def test_create_mode_api_rejected_when_api_disabled(self):
-        # api 模式要求 API 监听已渲染（AFS_WORKSPACE_API_ENABLED=yes），
-        # 否则 fail-fast 引导开启
-        result = self._run("_afs_load_config", AFS_CREATE_MODE="api", AFS_WORKSPACE_API_ENABLED="no")
+    def test_create_mode_api_load_config_succeeds_when_api_disabled(self):
+        """配置加载不因 API 关闭而失败：status/down/clean 必须先能跑。
+
+        api 依赖 workspace API 监听，但那只在 user-init/user-exists/user-delete
+        时才需要。若在加载阶段就 fail-fast，出问题时连 down 都执行不了。
+        """
+        result = self._run('_afs_load_config; echo "${AFS_CREATE_MODE}"',
+                           AFS_CREATE_MODE="api", AFS_WORKSPACE_API_ENABLED="no")
+        self.assertEqual(result.returncode, 0,
+                         f"加载阶段不应因 API 关闭而失败: {result.stderr}")
+        self.assertEqual(result.stdout.strip(), "api")
+
+    def test_create_mode_api_ready_check_rejects_when_api_disabled(self):
+        """真正走 API 的子命令才校验 API 前提。"""
+        result = self._run(
+            '_afs_load_config; _afs_require_create_mode_ready',
+            AFS_CREATE_MODE="api", AFS_WORKSPACE_API_ENABLED="no")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("AFS_WORKSPACE_API_ENABLED", result.stderr)
+
+    def test_create_mode_ready_check_passes_when_api_enabled(self):
+        result = self._run(
+            '_afs_load_config; _afs_require_create_mode_ready; echo READY',
+            AFS_CREATE_MODE="api", AFS_WORKSPACE_API_ENABLED="yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("READY", result.stdout)
+
+    def test_create_mode_ready_check_ignores_fuse_mode(self):
+        """fuse 通道不要求 API 监听。"""
+        result = self._run(
+            '_afs_load_config; _afs_require_create_mode_ready; echo READY',
+            AFS_CREATE_MODE="fuse", AFS_WORKSPACE_API_ENABLED="no")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("READY", result.stdout)
 
     def test_invalid_enabled_rejected(self):
         result = self._run("_afs_load_config", AFS_ENABLED="maybe")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("AFS_ENABLED", result.stderr)
+
+    # ===== outlet mirror 收敛周期 =====
+    def test_outlet_interval_default_is_50(self):
+        # afs.conf 里显式写了 50；脚本默认值也是 50，两处应一致
+        conf = CONF_SRC.read_text(encoding="utf-8")
+        self.assertIn('AFS_OUTLET_MIRROR_INTERVAL_MS="50"', conf)
+        self.assertIn('AFS_OUTLET_MIRROR_INTERVAL_MS:="50"',
+                      DEPLOY_SH.read_text(encoding="utf-8"))
+
+    def test_outlet_interval_env_overrides_conf(self):
+        result = self._run('_afs_load_config; echo "${AFS_OUTLET_MIRROR_INTERVAL_MS}"',
+                           AFS_OUTLET_MIRROR_INTERVAL_MS="120")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "120")
+
+    def test_outlet_interval_bounds(self):
+        # AFS 侧校验 10..=60000，越界必须在部署阶段就拦住
+        for bad in ("9", "60001", "0", "-1", "abc"):
+            result = self._run("_afs_load_config", AFS_OUTLET_MIRROR_INTERVAL_MS=bad)
+            self.assertNotEqual(result.returncode, 0, f"{bad} 应被拒绝")
+            self.assertIn("AFS_OUTLET_MIRROR_INTERVAL_MS", result.stderr)
+
+    def test_outlet_interval_boundaries_accepted(self):
+        for ok in ("10", "60000"):
+            result = self._run('_afs_load_config; echo "${AFS_OUTLET_MIRROR_INTERVAL_MS}"',
+                               AFS_OUTLET_MIRROR_INTERVAL_MS=ok)
+            self.assertEqual(result.returncode, 0, f"{ok} 应被接受: {result.stderr}")
+            self.assertEqual(result.stdout.strip(), ok)
+
+    def test_node_toml_renders_outlet_interval(self):
+        """周期必须渲染进 node.toml，否则 afs-node 拿不到值。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            etc = Path(tmp) / "etc"
+            etc.mkdir()
+            tpl_dir = Path(tmp) / "tpl"
+            tpl_dir.mkdir()
+            (tpl_dir / "node.toml").write_text('id = "x"\n', encoding="utf-8")
+            result = self._run(
+                "_afs_load_config\n"
+                f'AFS_TEMPLATE_DIR="{_posix(tpl_dir)}"\n'
+                f'AFS_ETC_DIR="{_posix(etc)}"\n'
+                "AFS_OUTLET_MIRROR_INTERVAL_MS=120\n"
+                "_afs_render_node_toml\n",
+                AFS_NODE_ID=NODE_SELF,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = (etc / "node.toml").read_text(encoding="utf-8")
+            self.assertIn("outlet_mirror_interval_ms = 120", text)
+
+    def test_egress_publish_wait_defaults_to_10s(self):
+        """egress 发布等待默认 10s，三处等待共用同一取值。"""
+        result = self._run('_afs_load_config; echo "${AFS_EGRESS_PUBLISH_WAIT}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "10")
+
+    def test_egress_publish_wait_is_overridable(self):
+        result = self._run('_afs_load_config; echo "${AFS_EGRESS_PUBLISH_WAIT}"',
+                           AFS_EGRESS_PUBLISH_WAIT="3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "3")
+
+    def test_egress_publish_wait_rejects_non_integer(self):
+        """非整数会让 seq 报错，必须在加载期拦住。"""
+        result = self._run("_afs_load_config", AFS_EGRESS_PUBLISH_WAIT="abc")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("positive integer", result.stderr)
+
+    def test_egress_publish_wait_rejects_zero(self):
+        """0 会让等待循环一次都不跑，等同"不等待"，属于误配置。"""
+        result = self._run("_afs_load_config", AFS_EGRESS_PUBLISH_WAIT="0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be > 0", result.stderr)
 
     def test_fsid_zero_rejected(self):
         result = self._run("_afs_load_config", AFS_NFS_EXPORT_FSID="0")
@@ -379,6 +488,117 @@ class AfsDeployHelpersTest(unittest.TestCase):
             "sleep() { :; }\n"
         )
 
+    def _api_common(self, api_json: str, egress: str, publish: bool) -> str:
+        """api 模式的公共桩：curl 返回固定响应，真实 python 解析 JSON。
+
+        publish=True 时在 egress 下造出 symlink（模拟 mirror 已发布）。
+        """
+        parts = [
+            "_afs_load_config\n",
+            f'export AFS_CREATE_MODE=api\n',
+            f'export AFS_EGRESS_ROOT="{egress}"\n',
+            "AFS_PYTHON_BIN=$(command -v python3)\n",
+            "sleep() { :; }\n",
+            "curl() { printf '%s' '" + api_json + "'; }\n",
+            f'mkdir -p "{egress}"\n',
+        ]
+        if publish:
+            parts.append(f'mkdir -p "$(dirname "{egress}")/real/alice"\n')
+            parts.append(f'ln -sfn "$(dirname "{egress}")/real/alice" "{egress}/alice"\n')
+        return "".join(parts)
+
+    def test_create_workspace_api_returns_published_egress_as_data_dir(self):
+        """api 模式：egress 已发布为 symlink 时，dst_dir 取该名（写入穿透到真实位置）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            egress = _posix(Path(tmp) / "egress")
+            result = self._run(
+                self._api_common('{"access_path":"' + egress + '/alice","node_id":"n-self"}',
+                                 egress, publish=True)
+                + '_afs_create_workspace alice\n',
+                AFS_NODE_ID="n-self",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.splitlines()
+            self.assertEqual(len(lines), 2, result.stdout)
+            self.assertEqual(lines[0], f"{egress}/alice",
+                             "已发布时 dst_dir 为该 egress 名")
+            self.assertEqual(lines[1], f"{egress}/alice")
+
+    def test_create_workspace_api_refuses_unpublished_egress(self):
+        """api 模式：egress 未发布时 dst_dir 为空，绝不返回裸 egress 名。
+
+        返回裸路径会让调用方对它 mkdir，在 tmpfs 上建出真目录并遮蔽后续 symlink。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            egress = _posix(Path(tmp) / "egress")
+            result = self._run(
+                self._api_common('{"access_path":"' + egress + '/bob","node_id":"n-self"}',
+                                 egress, publish=False)
+                + 'out=$(_afs_create_workspace bob)\n'
+                + 'echo "first=[${out%%$\'\\n\'*}]"\n',
+                AFS_NODE_ID="n-self",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("first=[]", result.stdout,
+                          f"未发布时首行必须为空: {result.stdout}")
+            self.assertIn("not published", result.stderr)
+            # 不得在 tmpfs 上建出真目录
+            self.assertFalse((Path(tmp) / "egress" / "bob").is_dir(),
+                             "未发布时不得在 egress 上创建目录")
+
+    def test_create_workspace_api_unparseable_response_fails(self):
+        """API 返回无法解析时硬失败，不猜路径。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            egress = _posix(Path(tmp) / "egress")
+            result = self._run(
+                self._api_common("not-json", egress, publish=False)
+                + '_afs_create_workspace carol\n',
+                AFS_NODE_ID="n-self",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("access_path", result.stderr)
+
+    def test_user_exists_api_present_reports_access_path(self):
+        """user-exists api 分支：200 → present + access_path（供 --force 前置校验）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            egress = _posix(Path(tmp) / "egress")
+            result = self._run(
+                "_afs_load_config\n"
+                "export AFS_CREATE_MODE=api\n"
+                "AFS_PYTHON_BIN=$(command -v python3)\n"
+                "curl() { printf '%s\\n200' '" + '{"access_path":"' + egress + '/alice"}'
+                + "';\n}\n"
+                "afs_do_user_exists alice; echo rc=$?\n",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.splitlines()
+            self.assertIn("AFS_WORKSPACE=present", lines)
+            self.assertIn(f"AFS_ACCESS_PATH={egress}/alice", lines)
+            self.assertIn("rc=0", lines)
+
+    def test_user_exists_api_absent_reports_absent(self):
+        """user-exists api 分支：404 → absent，退出码 1。"""
+        result = self._run(
+            "_afs_load_config\n"
+            "export AFS_CREATE_MODE=api\n"
+            "curl() { printf '\\n404'; }\n"
+            "afs_do_user_exists ghost; echo rc=$?\n",
+        )
+        lines = result.stdout.splitlines()
+        self.assertIn("AFS_WORKSPACE=absent", lines)
+        self.assertIn("rc=1", lines)
+
+    def test_user_exists_api_error_is_undeterminable(self):
+        """user-exists api 分支：非 200/404 → exit 2（判不出来），不猜不存在。"""
+        result = self._run(
+            "_afs_load_config\n"
+            "export AFS_CREATE_MODE=api\n"
+            "curl() { printf '\\n503'; }\n"
+            "afs_do_user_exists alice\n",
+        )
+        self.assertEqual(result.returncode, 2,
+                         f"API 异常应为 exit 2，实际 {result.returncode}")
+
     def test_create_workspace_fuse_outputs_two_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
             fuse = _posix(Path(tmp) / "fuse")
@@ -422,18 +642,39 @@ class AfsDeployHelpersTest(unittest.TestCase):
                 + "afs_do_user_exists bob; echo rc=$?\n",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("AFS_WORKSPACE=present\nrc=0", result.stdout)
-            self.assertIn("AFS_WORKSPACE=absent\nrc=1", result.stdout)
+            lines = result.stdout.splitlines()
+            # present: 带 AFS_ACCESS_PATH（供 --force 前置校验契约）
+            self.assertIn("AFS_WORKSPACE=present", lines)
+            self.assertTrue(any(l.startswith("AFS_ACCESS_PATH=") for l in lines),
+                            f"present 应附带 access_path: {lines}")
+            self.assertIn("rc=0", lines)
+            # absent: 只报状态
+            self.assertIn("AFS_WORKSPACE=absent", lines)
+            self.assertIn("rc=1", lines)
 
-    def test_user_exists_unmounted_fails(self):
+    def test_user_exists_undeterminable_exits_2(self):
+        """判不出来必须是 2，不能与"不存在"(1) 同码。"""
         result = self._run(
             "_afs_load_config\n"
             "mountpoint() { return 1; }\n"
             "findmnt() { echo ext4; }\n"
             "afs_do_user_exists alice\n",
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("FUSE", result.stderr)
+        self.assertEqual(result.returncode, 2,
+                         f"判不出来应为 exit 2，实际 {result.returncode}")
+
+    def test_user_exists_absent_exits_1(self):
+        """不存在是 1，与"判不出来"区分。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            fuse = _posix(Path(tmp) / "fuse")
+            result = self._run(
+                "_afs_load_config\n"
+                + self._fuse_mocks(_posix(tmp))
+                + f'AFS_OWNERFS_MOUNT="{fuse}"\n'
+                + 'mkdir -p "${AFS_OWNERFS_MOUNT}"\n'
+                + "afs_do_user_exists ghost; echo rc=$?\n",
+            )
+            self.assertIn("rc=1", result.stdout, result.stdout)
 
     def test_user_delete_purges_contents_and_rmdir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -497,6 +738,55 @@ class AfsDeployHelpersTest(unittest.TestCase):
             wait_ready = Path(tmp) / "afs-root" / "bin" / "afs-wait-ready.sh"
             self.assertTrue(wait_ready.is_file())
             self.assertTrue(os.access(wait_ready, os.X_OK))
+            # prepare-outlets 脚本落盘且可执行（node unit 的第一条 ExecStartPre）
+            prepare = Path(tmp) / "afs-root" / "bin" / "afs-prepare-outlets.sh"
+            self.assertTrue(prepare.is_file())
+            self.assertTrue(os.access(prepare, os.X_OK))
+
+    def test_render_units_prepare_outlets_runs_before_meta_gate(self):
+        """顺序是 ISSUE-01 的核心契约：本地挂载面必须在 meta 门禁之前。
+
+        反过来的话 meta 不可达时 mount 会被整段跳过，egress 退化成裸 ext4 目录。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            node_unit = unit_dir / "agentos-afs-node.service"
+            meta_unit = unit_dir / "agentos-afs-meta.service"
+            result = self._run(
+                "_afs_load_config\n"
+                f'AFS_ROOT="{_posix(Path(tmp) / "afs-root")}"\n'
+                '_AFS_WAIT_READY="${AFS_ROOT}/bin/afs-wait-ready.sh"\n'
+                f'_AFS_UNIT_NODE="{_posix(node_unit)}"\n'
+                f'_AFS_UNIT_META="{_posix(meta_unit)}"\n'
+                "_afs_resolve_node_id\n"
+                "systemctl() { return 0; }\n"
+                "_afs_render_units\n",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            node_text = node_unit.read_text(encoding="utf-8")
+            pre_lines = [ln for ln in node_text.splitlines() if ln.startswith("ExecStartPre=")]
+            self.assertGreaterEqual(len(pre_lines), 2)
+            self.assertIn("afs-prepare-outlets.sh", pre_lines[0],
+                          "prepare-outlets 必须是第一条 ExecStartPre")
+            self.assertIn("afs-wait-ready.sh", pre_lines[1],
+                          "meta 门禁必须排在挂载面之后")
+            # 两条都必须是硬失败（无 "-" 前缀）：任一被跳过都会造成静默降级
+            for line in pre_lines:
+                self.assertNotIn("ExecStartPre=-", line,
+                                 f"ExecStartPre 不得用 '-' 前缀（会静默跳过）: {line}")
+
+    def test_prepare_outlets_is_packaged_as_separate_file(self):
+        """脚本必须随 deploy/afs 交付，而不是内联进 afs_deploy.sh 的 heredoc。
+
+        内联后无法 shell 单测覆盖，且 mount/fusermount 逻辑会有两份实现。
+        """
+        self.assertTrue(PREPARE_OUTLETS.is_file())
+        text = DEPLOY_SH.read_text(encoding="utf-8")
+        self.assertIn("_afs_install_prepare_outlets", text)
+        self.assertIn("${SCRIPT_DIR}/afs-prepare-outlets.sh", text)
+        # 不得再有内联的 tmpfs 挂载 heredoc
+        self.assertNotIn("grep -qx tmpfs || /bin/mount -t tmpfs", text)
 
     def test_render_units_worker_skips_meta_unit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1059,11 +1349,10 @@ class AfsDeployHelpersTest(unittest.TestCase):
 
         卸载是必需的（AFS 要独占 egress 作 tmpfs），但必须说清：
         卸完 workspace 立刻不可访问、且 agentos-workspace 仍可能显示 active。
+        这段处置逻辑现在单一实现在 deploy/afs/afs-prepare-outlets.sh（up 与
+        node.service 的 ExecStartPre 共用），因此断言落在该脚本上。
         """
-        text = DEPLOY_SH.read_text(encoding="utf-8")
-        start = text.index("afs_do_up() {")
-        end = text.index("\n}", start)
-        body = text[start:end]
+        body = PREPARE_OUTLETS.read_text(encoding="utf-8")
 
         # 必须对 autofs 单独分支，而不是笼统归为 residual
         self.assertIn("autofs|autofs4)", body,
@@ -1079,10 +1368,7 @@ class AfsDeployHelpersTest(unittest.TestCase):
 
     def test_up_other_fstype_keeps_residual_wording(self):
         """非 autofs 的其他占用（真残留）仍用原措辞，避免噪音。"""
-        text = DEPLOY_SH.read_text(encoding="utf-8")
-        start = text.index("afs_do_up() {")
-        end = text.index("\n}", start)
-        body = text[start:end]
+        body = PREPARE_OUTLETS.read_text(encoding="utf-8")
         self.assertIn("umounting residual layer(s)", body,
                       "真残留分支应保留原措辞")
 
@@ -1091,11 +1377,7 @@ class AfsDeployHelpersTest(unittest.TestCase):
 
         autofs 接管是正常切后端的必经路径，硬阻断会破坏合法自动化流程。
         """
-        text = DEPLOY_SH.read_text(encoding="utf-8")
-        start = text.index("afs_do_up() {")
-        end = text.index("\n}", start)
-        body = text[start:end]
-        # 分支内不得出现退出
+        body = PREPARE_OUTLETS.read_text(encoding="utf-8")
         case_start = body.index("autofs|autofs4)")
         case_end = body.index(";;", case_start)
         autofs_branch = body[case_start:case_end]
@@ -1103,7 +1385,19 @@ class AfsDeployHelpersTest(unittest.TestCase):
             self.assertNotIn(blocker, autofs_branch,
                              f"autofs 分支不得阻断执行: {blocker}")
         # 循环里的 umount 仍在
-        self.assertIn('umount -l "${AFS_EGRESS_ROOT}"', body)
+        self.assertIn('umount -l "${EGRESS_ROOT}"', body)
+
+    def test_up_reuses_prepare_outlets_script(self):
+        """up 不得再维护第二套挂载逻辑。
+
+        历史上 up 会清残留、重启路径不会，两条路径漂移后 kill -9 就永久 failed。
+        现在 up 直接调用同一个脚本，断言它确实被调用且没有重复的 mount 逻辑。
+        """
+        body = self._fn_body("afs_do_up")
+        self.assertIn("_afs_prepare_outlets_path", body,
+                      "up 必须复用 afs-prepare-outlets.sh")
+        self.assertNotIn('mount -t tmpfs', body,
+                         "up 不应再自己挂 tmpfs（会与脚本漂移）")
 
     # ===== down 必须卸掉被 autofs 遮蔽的 tmpfs 叠层 =====
     def test_down_unmount_uses_stack_top_not_head(self):
@@ -1203,6 +1497,7 @@ class AfsDeployHelpersTest(unittest.TestCase):
                    "afs_status()", "afs-migrate()"):
             self.assertIn(fn, text)
 
+
     # ===== up 内联迁移窗口收尾（finalize-on-up）=====
     def _finalize_on_up_snippet(self, tmp, meta_toml_lb, **kw):
         """构造 _afs_up_finalize_pending 的运行时桩：meta.toml 写在 tmp 下。"""
@@ -1227,4 +1522,339 @@ class AfsDeployHelpersTest(unittest.TestCase):
 
 
 
+
+class PrepareOutletsTest(unittest.TestCase):
+    """deploy/afs/afs-prepare-outlets.sh 的行为测试。
+
+    这个脚本决定 node 能否启动、也决定 egress 会不会退化成裸磁盘目录，
+    必须用真实 shell 跑起来验证，而不是断言源码里出现某段字面量。
+
+    桩的模型：用 $STUB_STATE/mounts 当挂载表（每行 "fstype target"），
+    用 $STUB_STATE/dead 标记该挂载是否 ENOTCONN。这样"层层卸载""已是 tmpfs
+    不再挂""死挂载清理"这些语义都能被真实覆核，而不是靠 findmnt 返回值猜。
+    """
+
+    def _run(self, mounts=None, dead=True, node_running=False, args=None,
+             mkdir_fails=False, mount_noop=False, unmount_fails=False,
+             node_state=None, probe_timeout=False, probe_ioerr=False):
+        """跑一次 prepare-outlets，返回 (proc, calls, 挂载表)。
+
+        mounts: [(fstype, target), ...] 初始挂载表；None = 空表
+        dead:   ownerfs 挂载是否不可访问（ENOTCONN）
+        mkdir_fails: mkdir 一律失败（模拟权限/只读）
+        mount_noop:  mount 返回 0 但不写挂载表（模拟"没生效"）
+        unmount_fails: umount/fusermount3 一律失败
+        node_state: systemctl 回报的服务状态（active/activating/inactive）；
+                    给定时优先于 node_running
+        probe_timeout: 可访问性探测超时（timeout 返回 124），区别于 ENOTCONN
+        probe_ioerr:   探测返回 EIO（非 ENOTCONN，不得据此清理挂载）
+
+        所有外部命令都打桩（含 mkdir）：脚本会对路径做 mkdir，用真实主机
+        路径（/run/afs、/home/agentos）在非 root CI 上会 Permission denied，
+        测的就变成运行者权限而非脚本逻辑了。
+        """
+        mounts = mounts or []
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            sb = tmp_p / "stubbin"
+            sb.mkdir()
+            state = tmp_p / "state"
+            state.mkdir()
+            (state / "mounts").write_text(
+                "".join(f"{fs} {tgt}\n" for fs, tgt in mounts), encoding="utf-8"
+            )
+            log = state / "calls.log"
+            log.write_text("", encoding="utf-8")
+            if dead:
+                (state / "dead").write_text("1", encoding="utf-8")
+            if node_running:
+                (state / "node_running").write_text("1", encoding="utf-8")
+
+            def stub(name, body):
+                f = sb / name
+                f.write_text("#!/usr/bin/env bash\nSTATE=${STUB_STATE:?}\n" + body, encoding="utf-8")
+                f.chmod(0o755)
+
+            stub("sleep", "exit 0\n")
+            # timeout: 默认直通；probe_timeout 标记存在时返回 124（模拟超时，
+            # 与 ENOTCONN 必须可区分 —— 超时不能当成死挂载）
+            stub("timeout", r'''
+log="$STATE/calls.log"
+echo "timeout $*" >> "$log"
+if [ -f "$STATE/probe_timeout" ]; then exit 124; fi
+shift
+exec "$@"
+''')
+            # mkdir -p: 记录调用并登记目录，避免碰真实主机路径（非 root CI 会 Permission denied）
+            stub("mkdir", r'''
+log="$STATE/calls.log"
+echo "mkdir $*" >> "$log"
+if [ -f "$STATE/mkdir_fails" ]; then
+    echo "mkdir: simulated failure" >&2
+    exit 1
+fi
+for a in "$@"; do
+    case "$a" in -*) continue ;; esac
+    echo "$a" >> "$STATE/dirs"
+done
+exit 0
+''')
+            if mkdir_fails:
+                (state / "mkdir_fails").write_text("1", encoding="utf-8")
+            # systemctl: 服务状态以文本形式回报（脚本按 active/activating 判定，
+            # 不只看退出码 —— activating 在 is-active --quiet 下也是非零）
+            stub("systemctl", r'''
+log="$STATE/calls.log"
+echo "systemctl $*" >> "$log"
+if [ -f "$STATE/node_state" ]; then
+    cat "$STATE/node_state"
+    case "$(cat "$STATE/node_state")" in
+        active|activating|reloading) exit 0 ;;
+    esac
+    exit 3
+fi
+if [ -f "$STATE/node_running" ]; then echo active; exit 0; fi
+echo inactive
+exit 3
+''')
+            if node_state:
+                (state / "node_state").write_text(node_state, encoding="utf-8")
+            if probe_timeout:
+                (state / "probe_timeout").write_text("1", encoding="utf-8")
+            if probe_ioerr:
+                (state / "probe_ioerr").write_text("1", encoding="utf-8")
+            # findmnt: -no FSTYPE --mountpoint X → 查表；--mountpoint X → 存在性
+            stub("findmnt", r'''
+log="$STATE/calls.log"
+echo "findmnt $*" >> "$log"
+target=""
+case "$*" in
+    *--mountpoint*) target="${!#}" ;;
+    *) exit 1 ;;
+esac
+# 同一路径可能有多层（层叠挂载）：按表顺序全部输出，模拟 findmnt 从外到内。
+lines=$(awk -v t="$target" '$2 == t { print $1 }' "$STATE/mounts")
+if [ -z "$lines" ]; then exit 1; fi
+case "$*" in
+    *"-no FSTYPE"*) printf '%s\n' "$lines" ;;
+esac
+exit 0
+''')
+            # ls: 模拟各类探测失败的 errno 文本（脚本按文本区分 ENOTCONN 与其他）
+            #   dead      → ENOTCONN（真死挂载，应清理）
+            #   probe_ioerr → EIO（挂载可能仍活着，不得清理）
+            stub("ls", r'''
+log="$STATE/calls.log"
+echo "ls $*" >> "$log"
+target="${!#}"
+if [ -f "$STATE/probe_ioerr" ]; then
+    echo "ls: cannot access '${target}': Input/output error" >&2
+    exit 2
+fi
+if [ -f "$STATE/dead" ]; then
+    line=$(awk -v t="$target" '$2 == t { print $1; exit }' "$STATE/mounts")
+    case "$line" in
+        fuse*)
+            echo "ls: cannot access '${target}': Transport endpoint is not connected" >&2
+            exit 2
+            ;;
+    esac
+fi
+exit 0
+''')
+            # mount: 成功则把 tmpfs 写进挂载表（模拟真实生效）；mount_noop 时只返回 0 不写
+            stub("mount", r'''
+log="$STATE/calls.log"
+echo "mount $*" >> "$log"
+target="${!#}"
+if [ -f "$STATE/mount_noop" ]; then exit 0; fi
+echo "tmpfs $target" >> "$STATE/mounts"
+exit 0
+''')
+            if mount_noop:
+                (state / "mount_noop").write_text("1", encoding="utf-8")
+            if unmount_fails:
+                (state / "unmount_fails").write_text("1", encoding="utf-8")
+            # umount/fusermount3: 从挂载表移除
+            for name in ("umount", "fusermount3"):
+                stub(name, r'''
+log="$STATE/calls.log"
+echo "NAME $*" >> "$log"
+target="${!#}"
+if [ -f "$STATE/unmount_fails" ]; then exit 1; fi
+grep -v " $target$" "$STATE/mounts" > "$STATE/mounts.new" || true
+mv "$STATE/mounts.new" "$STATE/mounts"
+exit 0
+'''.replace("NAME", name))
+
+            env = {
+                "PATH": f"{sb}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "STUB_STATE": str(state),
+            }
+            proc = subprocess.run(
+                ["bash", _posix(PREPARE_OUTLETS)] + (args or DEFAULT_OUTLET_ARGS),
+                capture_output=True, encoding="utf-8", errors="replace", env=env,
+            )
+            return proc, log.read_text(encoding="utf-8").splitlines(), \
+                (state / "mounts").read_text(encoding="utf-8")
+
+    def test_mounts_tmpfs_when_egress_bare(self):
+        proc, calls, _ = self._run(mounts=[])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(any(c.startswith("mount -t tmpfs") for c in calls), calls)
+
+    def test_skips_mount_when_already_tmpfs(self):
+        proc, calls, _ = self._run(mounts=[("tmpfs", "/home/agentos/users")])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(any(c.startswith("mount -t tmpfs") for c in calls), calls)
+
+    def test_cleans_dead_fuse(self):
+        """ENOTCONN 死挂载 → fusermount3 -uz，且脚本继续往下走。"""
+        proc, calls, mounts = self._run(mounts=[("fuse.afs-ownerfs", "/run/afs/ownerfs")])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(any("fusermount3 -uz" in c for c in calls), calls)
+        self.assertNotIn("fuse.afs-ownerfs /run/afs/ownerfs", mounts)
+
+    def test_live_fuse_untouched_when_node_running(self):
+        """服务在跑 → 现役挂载不得动。"""
+        proc, calls, mounts = self._run(
+            mounts=[("fuse.afs-ownerfs", "/run/afs/ownerfs")],
+            dead=False, node_running=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(any(c.startswith("fusermount3") for c in calls), calls)
+        self.assertIn("fuse.afs-ownerfs /run/afs/ownerfs", mounts)
+
+    def test_live_fuse_untouched_while_node_activating(self):
+        """unit 处于 activating（正是 ExecStartPre 执行期）也不得摘挂载。
+
+        `is-active --quiet` 对 activating 返回 3，只看退出码会把"服务正在
+        启动"当成"服务没跑"，从而摘掉它即将接管的现役挂载。
+        """
+        proc, calls, mounts = self._run(
+            mounts=[("fuse.afs-ownerfs", "/run/afs/ownerfs")],
+            dead=False, node_state="activating",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(any(c.startswith("fusermount3") for c in calls),
+                         f"activating 期间不得摘挂载: {calls}")
+        self.assertIn("fuse.afs-ownerfs /run/afs/ownerfs", mounts)
+
+    def test_dead_fuse_cleaned_even_if_service_reports_active(self):
+        """不可达优先于服务状态：ENOTCONN 就是死的，service 报什么都得清。"""
+        proc, calls, mounts = self._run(
+            mounts=[("fuse.afs-ownerfs", "/run/afs/ownerfs")],
+            dead=True, node_state="active",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(any(c.startswith("fusermount3") for c in calls), calls)
+        self.assertNotIn("fuse.afs-ownerfs /run/afs/ownerfs", mounts)
+
+    def test_probe_timeout_keeps_mount_untouched(self):
+        """探测超时 ≠ ENOTCONN：判不出来就不动，绝不摘可能活着的挂载。"""
+        proc, calls, mounts = self._run(
+            mounts=[("fuse.afs-ownerfs", "/run/afs/ownerfs")],
+            dead=False, probe_timeout=True, node_state="inactive",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(any(c.startswith("fusermount3") for c in calls),
+                         f"探测超时时不得摘挂载: {calls}")
+        self.assertIn("fuse.afs-ownerfs /run/afs/ownerfs", mounts)
+
+    def test_probe_io_error_keeps_mount_untouched(self):
+        """EIO 等非 ENOTCONN 错误不得当成死挂载：挂载可能仍活着。
+
+        只有 ENOTCONN 才说明 FUSE daemon 真的没了；EIO/ESTALE/EACCES 是
+        瞬时或权限问题，据其摘挂载会打断正在服务的 node。
+        """
+        proc, calls, mounts = self._run(
+            mounts=[("fuse.afs-ownerfs", "/run/afs/ownerfs")],
+            dead=False, probe_ioerr=True, node_state="inactive",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(any(c.startswith("fusermount3") for c in calls),
+                         f"非 ENOTCONN 错误不得摘挂载: {calls}")
+        self.assertIn("fuse.afs-ownerfs /run/afs/ownerfs", mounts)
+
+    def test_probe_timeout_keeps_mount_even_when_service_stopped(self):
+        """即使服务没跑，探测超时也不摘：宁可留残留（可恢复）也不误摘。"""
+        proc, calls, mounts = self._run(
+            mounts=[("fuse.afs-ownerfs", "/run/afs/ownerfs")],
+            dead=False, probe_timeout=True, node_state="inactive",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(any(c.startswith("fusermount3") for c in calls), calls)
+        self.assertIn("fuse.afs-ownerfs /run/afs/ownerfs", mounts)
+
+    def test_egress_residue_cleaned_before_mkdir(self):
+        """egress 残留必须先清再 mkdir：反过来 mkdir 的 stat 会被死挂载挡住。"""
+        proc, calls, _ = self._run(mounts=[("autofs", "/home/agentos/users")])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        first_umount = next((i for i, c in enumerate(calls) if c.startswith("umount")), None)
+        first_mkdir = next((i for i, c in enumerate(calls) if c.startswith("mkdir")), None)
+        self.assertIsNotNone(first_umount, calls)
+        self.assertIsNotNone(first_mkdir, calls)
+        self.assertLess(first_umount, first_mkdir,
+                        f"egress 残留应在 mkdir 之前清理: {calls}")
+
+    def test_rejects_relative_path(self):
+        proc, _, _ = self._run(args=["relative/path", "/run/afs/imports", "/home/agentos/users"])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("absolute", proc.stderr)
+
+    def test_rejects_root_path(self):
+        """根路径会被 umount -l / mount 直接作用，必须拒绝。"""
+        proc, _, _ = self._run(args=["/", "/run/afs/imports", "/home/agentos/users"])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unsafe", proc.stderr)
+
+    def test_unmounts_autofs_then_mounts_tmpfs(self):
+        """autofs 现役挂载（另一个后端）→ 卸掉再挂 tmpfs，且提示后果。"""
+        proc, calls, mounts = self._run(mounts=[("autofs", "/home/agentos/users")])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 必须说清这是另一个后端的现役挂载，不是垃圾残留
+        self.assertIn("autofs", proc.stderr)
+        self.assertIn("必要步骤", proc.stderr)
+        self.assertTrue(any(c.startswith("mount -t tmpfs") for c in calls), calls)
+        self.assertTrue(any("umount" in c for c in calls), calls)
+
+    def test_uses_innermost_layer_when_egress_stacked(self):
+        """egress 层叠时取最内层 fstype，与 down 侧 --target|tail -1 一致。
+
+        取外层会把"外层 tmpfs 已就位"误判成完成，跳过本该做的内层处理。
+        """
+        proc, calls, mounts = self._run(
+            mounts=[("autofs", "/home/agentos/users"), ("tmpfs", "/home/agentos/users")],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 最内层已是 tmpfs → 不该再 mount
+        self.assertFalse(any(c.startswith("mount -t tmpfs") for c in calls),
+                         f"最内层已是 tmpfs 时不应再挂: {calls}")
+
+    def test_fails_when_mount_ineffective(self):
+        """mount 返回成功但挂载表没变 → 必须硬失败。"""
+        # mount 桩不写挂载表，模拟"返回 0 但没生效"
+        proc, _, _ = self._run(mount_noop=True)
+        self.assertNotEqual(proc.returncode, 0, "挂载未生效时必须失败")
+        self.assertIn("tmpfs", proc.stderr)
+
+    def test_rejects_wrong_arg_count(self):
+        proc, _, _ = self._run(args=["/only-one"])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("usage", proc.stderr)
+
+    def test_fails_when_mkdir_fails(self):
+        """挂载点建不出来（权限/只读）→ 必须硬失败并说明是哪个路径。"""
+        proc, _, _ = self._run(mkdir_fails=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("cannot create", proc.stderr)
+
+    def test_fails_when_unmount_persistently_fails(self):
+        """死挂载清不掉时硬失败，而不是带着残留下沉（否则 node 起来后写进假目录）。"""
+        proc, _, _ = self._run(
+            mounts=[("fuse.afs-ownerfs", "/run/afs/ownerfs")],
+            unmount_fails=True,
+        )
+        self.assertNotEqual(proc.returncode, 0, "清不掉死挂载时必须失败")
+        self.assertIn("/run/afs/ownerfs", proc.stderr)
 
