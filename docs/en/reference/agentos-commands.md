@@ -35,8 +35,10 @@ bash deploy/agentos.sh <COMMAND> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ip IP` | Local IP to use (required on multi-NIC machines). All sub-components (agent-runtime / jiuwenbox / gateway / jiuwenswarm / etcd) use this IP uniformly for local-ip detection; it must be an IP actually held by this host. May be placed before or after the command |
+| `--ip IP` | Non-loopback local IPv4 address used by all sub-components. When `cluster.cluster_nodes` is configured, the address must also belong to that list. Otherwise it only needs to be a locally owned, non-loopback, non-unspecified address. May be placed before or after the command |
 | `-h`, `--help` | Show help |
+
+`cluster.cluster_nodes` is optional. When it is omitted and `--ip` is unset, query IPv4 routes to `master_nodes` followed by `etcd_nodes` and select the first locally owned, non-loopback, non-unspecified `src` address. These control-node lists provide route destinations; a worker's source address need not appear in them. If no suitable route source exists, check the peer routes or specify `--ip`. With `cluster_nodes` configured, automatic selection remains restricted to the intersection of that list and local interface addresses.
 
 ## Common environment variables
 

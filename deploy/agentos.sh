@@ -111,7 +111,7 @@ export PYTHON_VERSION="$(_agentos_python_version)"
 # ===== 指定本机 IP（多网卡环境）=====
 # agentos.sh --ip 1.2.3.4 up  →  export BIND_IP 后所有子脚本都能读到
 # 子脚本各自实现 get_local_ip / is_local_host 的 BIND_IP 优先逻辑
-# --ip 与自动选址共用 config.yaml 节点列表校验
+# cluster_nodes 存在时校验节点名单；缺省时自动选址使用 master/etcd 路由源地址。
 BIND_IP="${BIND_IP:-}"
 
 # AgentServer 生命周期和工具执行使用 ADX HTTP/Relay；业务 SSH 独立配置。
@@ -144,7 +144,7 @@ _get_local_ips() {
     fi
 }
 
-# ===== 所有选址输入统一交给 config.yaml 白名单校验 =====
+# ===== 所有选址输入统一交给 config.yaml 节点选址逻辑 =====
 _select_configured_node_ip() {
     local config="${1:-${HOME:-/root}/.agentos/deploy/config.yaml}"
     [ -f "${config}" ] || config="${SCRIPT_DIR}/config.yaml"
@@ -988,10 +988,10 @@ Commands (Required):
               - 不创建 API key，用户需自行编辑 config/config.yaml 或 config/.env 配置
 
 Options:
-  --ip IP          从 config.yaml 节点列表选择本机持有的 IP（多个匹配时使用）。
+  --ip IP          指定本机持有的非回环 IP；配置 cluster_nodes 时须属于该名单。
                    指定后所有子组件（agent-runtime/moosefs/conch/jiuwenbox/gateway/jiuwenswarm/etcd）
                    的 local-ip 探测统一使用该 IP，避免自动探测不准导致 down/up 的 IP 对不上。
-                   不指定时各组件各自自动探测（hostname -I / UDP socket）。
+                   不指定时统一选址；缺少 cluster_nodes 时使用到 master/etcd 的路由源 IP。
   -h, --help      显示帮助信息
 
 etcd / redis 数据清理（独立操作，需交互确认；-y 跳过确认）:

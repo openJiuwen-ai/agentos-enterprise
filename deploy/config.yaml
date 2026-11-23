@@ -1,6 +1,7 @@
 # AgentOS 集群配置文件（单机模板）
 # up 前请将下面的 127.0.0.1 替换为本机实际部署 IP；ADX 不从网卡列表猜测节点地址。
-# --ip / BIND_IP 只能选择 cluster_nodes 中由本机持有的非回环、非通配地址。
+# cluster_nodes 可选：存在时按名单选择本机地址；缺省时取到 master/etcd 的路由源 IP。
+# --ip / BIND_IP 必须是本机非回环、非通配地址；有 cluster_nodes 时还须属于该名单。
 #
 # 此配置随 deploy 目录一起持久化到 ~/.agentos/deploy/config.yaml
 # ansible 部署时会修改此文件后再执行 install
@@ -10,7 +11,7 @@
 # 配置格式说明：
 #   etcd_nodes: etcd 集群节点列表（单机 1 节点 / 4 机 HA 3 节点）
 #   master_nodes: master 节点列表（单机 1 节点 / 4 机 HA 2 节点）
-#   cluster_nodes: 整个集群的全部节点列表（workspace 亲和 HRW 候选集 / 数据迁移节点来源）
+#   cluster_nodes: 可选，整个集群的全部节点列表（workspace 亲和 HRW 候选集 / 数据迁移节点来源）
 #   ingress_virtual_ip: 统一入口虚拟 IP，抢占到 VIP 的节点部署 gateway/registry/web-server
 #   trace_otlp_endpoints: AgentGateway、AgentRuntime、JiuwenSwarm 统一 tracing 配置
 #     （host:port 形式，不要带 http:// 前缀；支持多项主备）。空列表/缺省关闭各组件配置开关。

@@ -237,22 +237,57 @@ def get_local_ip() -> str:
     return "127.0.0.1"
 
 
+def _routed_node_ip(cluster: dict, candidates: set[str]) -> str:
+    """Find a local source address on a route to a configured control node."""
+    peers = dict.fromkeys([*cluster["master_nodes"], *cluster["etcd_nodes"]])
+    for peer in peers:
+        try:
+            route = subprocess.run(["ip", "-4", "route", "get", str(peer)],
+                                   capture_output=True, text=True, check=False)
+            fields = route.stdout.split() if route.returncode == 0 else []
+            source = fields[fields.index("src") + 1] if "src" in fields else ""
+        except (OSError, IndexError):
+            continue
+        if source in candidates:
+            return source
+    return ""
+
+
 def select_adx_node_ip(cluster: dict, local_ips: str, requested_ip: str = "") -> str:
-    """Select only a configured, locally owned, non-loopback node address."""
-    nodes = cluster.get("cluster_nodes")
-    if nodes is None:
-        nodes = list(dict.fromkeys([*cluster["master_nodes"], *cluster["etcd_nodes"]]))
-    configured = set()
-    for value in nodes:
-        if value == "localhost":
-            value = "127.0.0.1"
-        configured.add(str(ipaddress.IPv4Address(value)))
+    """Select a local node address, using control-node routes for legacy inventories."""
     local = set()
     for value in local_ips.split():
         try:
             local.add(str(ipaddress.IPv4Address(value)))
         except ipaddress.AddressValueError:
             continue
+    nodes = cluster.get("cluster_nodes")
+    if nodes is None:
+        # Master/etcd lists identify route destinations, not all worker addresses.
+        usable = {value for value in local
+                  if not ipaddress.IPv4Address(value).is_loopback
+                  and not ipaddress.IPv4Address(value).is_unspecified}
+        if requested_ip:
+            requested = str(ipaddress.IPv4Address(requested_ip))
+            if requested not in usable:
+                raise ValueError(f"Requested node IP {requested} is not a local non-loopback interface address")
+            return requested
+        control_matches = usable.intersection([*cluster["master_nodes"], *cluster["etcd_nodes"]])
+        if len(control_matches) == 1:
+            return next(iter(control_matches))
+        source = _routed_node_ip(cluster, control_matches or usable)
+        if source:
+            return source
+        if control_matches:
+            raise ValueError("Multiple configured node IPs are local: " + ", ".join(sorted(control_matches))
+                             + "; specify --ip to select this node")
+        raise ValueError("No Master/etcd route selects a local non-loopback node IP; "
+                         "check peer routes or specify --ip")
+    configured = set()
+    for value in nodes:
+        if value == "localhost":
+            value = "127.0.0.1"
+        configured.add(str(ipaddress.IPv4Address(value)))
     candidates = {value for value in configured
                   if not ipaddress.IPv4Address(value).is_loopback
                   and not ipaddress.IPv4Address(value).is_unspecified}
@@ -271,14 +306,8 @@ def select_adx_node_ip(cluster: dict, local_ips: str, requested_ip: str = "") ->
         return matches[0]
     if len(matches) > 1:
         # Routing only chooses among configured, locally owned addresses.
-        try:
-            route = subprocess.run(["ip", "-4", "route", "get", cluster.get("master_nodes", [])[0]],
-                                   capture_output=True, text=True, check=False)
-            fields = route.stdout.split() if route.returncode == 0 else []
-            source = fields[fields.index("src") + 1] if "src" in fields else ""
-        except (OSError, IndexError):
-            source = ""
-        if source in matches:
+        source = _routed_node_ip(cluster, set(matches))
+        if source:
             return source
         raise ValueError("Multiple configured node IPs are local: " + ", ".join(matches)
                          + "; specify --ip to select this node")
