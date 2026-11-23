@@ -1,6 +1,7 @@
 """Prepared Local sources cross deployment boundaries without a Gateway catalog."""
 import copy
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,40 @@ def settings(tmp_path):
         "runtime": {"agent_runtime": "supervisor", "tool_runtime": "runsc", "python_mounts": [],
                     "node_ingress_url": "http://node-ingress.test:8080"},
     }
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("AGENTOS_BUILTIN_AGENT_CPU", "unknown"),
+    ("AGENTOS_BUILTIN_AGENT_MEMORY", "0"),
+    ("AGENTOS_AUTH_TIMEOUT", "NaN"),
+])
+def test_invalid_deployment_number_names_its_input(settings, monkeypatch, key, value):
+    monkeypatch.setattr(deploy, "business_environment", lambda _: {key: value})
+    settings["gateway"]["agentos"] = {"registry": {"endpoint": "http://registry.example:4003"}}
+    function = deploy.normalize_tool_inputs if key.startswith("AGENTOS_BUILTIN_") else deploy.retain_gateway_environment
+    with pytest.raises(ValueError, match=key):
+        function(settings)
+
+
+@pytest.mark.parametrize(("listener_port", "legacy_port", "expected"), [
+    ("4503", "4003", 4503),
+    (None, "4503", 4003),
+    ("", "4503", 4003),
+])
+def test_gateway_registry_keeps_deployment_listener_port(settings, monkeypatch, listener_port, legacy_port, expected):
+    variables = {"ADX_INGRESS_VIP": "registry.example"}
+    if listener_port is not None:
+        variables["A2X_REGISTRY_PORT"] = listener_port
+    settings = deploy.deployment_context(settings, variables)
+    monkeypatch.setattr(deploy, "business_environment", lambda _: {"REGISTRY_PORT": legacy_port})
+    deploy.retain_gateway_environment(settings)
+    assert settings["gateway"]["agentos"]["registry"]["endpoint"] == f"http://registry.example:{expected}"
+
+
+@pytest.mark.parametrize("port", ["unknown", "0", "65536"])
+def test_invalid_registry_listener_port_names_its_input(settings, port):
+    with pytest.raises(ValueError, match="A2X_REGISTRY_PORT"):
+        deploy.deployment_context(settings, {"A2X_REGISTRY_PORT": port})
 
 
 def test_custom_image_catalog_stays_in_deployment(settings):
@@ -212,8 +247,8 @@ def test_disabled_conch_warns_and_configures_runsc(settings, tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(("conch_module", "dotenv_selector"), [("0", False), ("0", True), ("1", False)])
-def test_workspace_migration_skips_unavailable_conch(
-    settings, tmp_path, monkeypatch, caplog, conch_module, dotenv_selector,
+def test_workspace_migration_uses_default_runsc_when_conch_disabled(
+    settings, tmp_path, monkeypatch, conch_module, dotenv_selector,
 ):
     from jiuwenswarm.extensions.agentos.agentos_router.adx.workspace import MIGRATION_ERROR_FILE
 
@@ -226,6 +261,9 @@ def test_workspace_migration_skips_unavailable_conch(
     token = tmp_path / "token"
     token.write_text("test-token")
     settings.update(business_env_file=str(tmp_path / "operator.env"), token_file=str(token))
+    settings["runtime"].update(tool_image="deployment:tools", local_image_bindings={"images": {
+        "deployment:tools": {"path": "/objects/default-tools/rootfs", "env": {"DEFAULT_IMAGE": "current-default"}},
+    }})
 
     users = Path(settings["workspace_root"])
     conch_config = users / "alice/.jiuwenswarm/config/config.yaml"
@@ -233,27 +271,52 @@ def test_workspace_migration_skips_unavailable_conch(
     for path in (conch_config, runsc_config):
         path.parent.mkdir(parents=True)
         path.with_name(".env").write_text("KEEP_USER_SETTING=yes\n")
-    legacy_sandbox = {"type": "yuanrong", "executor": "conch", "image": "legacy-conch:v1"}
+    legacy_sandbox = {"type": "yuanrong", "executor": "conch", "image": "legacy-conch:v1",
+                      "cpu": 500, "memory": 768, "conch": {"vcpu_num": 2}}
     if dotenv_selector:
         legacy_sandbox.pop("executor")
-        conch_config.with_name(".env").write_text("TOOL_SANDBOX_EXECUTOR=conch\n")
-    conch_config.write_text(yaml.safe_dump({"sandbox": legacy_sandbox}))
+        conch_config.with_name(".env").write_text(
+            "KEEP_USER_SETTING=yes\nTOOL_SANDBOX_EXECUTOR=conch\nTOOL_SANDBOX_IMAGE=legacy-conch:v1\n")
+    business = {"models": {"defaults": []}, "preferred_language": "zh"}
+    conch_config.write_text(yaml.safe_dump({**business, "sandbox": legacy_sandbox}))
+    conch_config.with_name('adx-sandbox-defaults.json').write_text(json.dumps({
+        'version': 1, 'defaults': {'runtime': 'conch', 'cpu': 500, 'memory': 768}}))
     runsc_config.write_text("sandbox: {type: yuanrong, executor: docker, cpu: 700}\n")
+    runsc_config.with_name(".env").write_text("TOOL_SANDBOX_EXECUTOR\n")
     original = conch_config.read_bytes(), conch_config.with_name(".env").read_bytes()
     migration = deploy.migration_module()
     monkeypatch.setattr(migration, "configuration_paths", lambda _: [conch_config, runsc_config])
     monkeypatch.setattr(deploy, "migration_module", lambda: migration)
 
     deploy.preflight(copy.deepcopy(settings))
+    assert (conch_config.read_bytes(), conch_config.with_name(".env").read_bytes()) == original
     deploy.configure(copy.deepcopy(settings))
 
     assert deploy.read_yaml(runsc_config)["sandbox"]["runtime"] == "runsc"
     assert deploy.read_yaml(runsc_config)["sandbox"]["cpu"] == 700
     assert not conch_config.with_name(MIGRATION_ERROR_FILE).exists()
     if conch_module == "0":
-        assert (conch_config.read_bytes(), conch_config.with_name(".env").read_bytes()) == original
-        assert not conch_config.with_name("adx-sandbox-defaults.json").exists()
-        assert "Skipping workspace migration because Conch is unavailable" in caplog.text
+        from dotenv import dotenv_values
+        configured = deploy.read_yaml(conch_config)
+        sandbox = configured["sandbox"]
+        assert sandbox["runtime"] == "runsc"
+        assert sandbox["image"] == "deployment:tools"
+        assert sandbox["rootfs"] == {"type": "local", "path": "/objects/default-tools/rootfs"}
+        assert sandbox["image_env"] == {"DEFAULT_IMAGE": "current-default"}
+        assert sandbox["cpu"] == 500 and sandbox["memory"] == 768
+        assert "conch" not in sandbox and "template_name" not in sandbox
+        assert all(configured[key] == value for key, value in business.items())
+        environment = dotenv_values(conch_config.with_name(".env"))
+        assert environment["KEEP_USER_SETTING"] == "yes"
+        assert "TOOL_SANDBOX_EXECUTOR" not in environment
+        assert "TOOL_SANDBOX_IMAGE" not in environment
+        deploy.configure(copy.deepcopy(settings))
+        assert deploy.read_yaml(conch_config)["sandbox"] == sandbox
+        Path(settings["business_env_file"]).write_text("TOOL_SANDBOX_IMAGE=deployment:next\n")
+        settings["runtime"]["local_image_bindings"]["images"]["deployment:next"] = {
+            "path": "/objects/next-tools/rootfs", "env": {"DEFAULT_IMAGE": "next-default"}}
+        deploy.configure(copy.deepcopy(settings))
+        assert deploy.read_yaml(conch_config)["sandbox"]["image"] == "deployment:next"
     else:
         assert deploy.read_yaml(conch_config)["sandbox"]["runtime"] == "conch"
 
@@ -314,18 +377,14 @@ def test_image_change_requires_reconfiguration_and_refreshes_persisted_source(se
 
 
 def test_runtime_load_uses_same_operator_image_selection_as_application(settings, tmp_path, monkeypatch):
-    import yaml
     spec = importlib.util.spec_from_file_location("review_runtime", ROOT / "deploy/agent-runtime/adx_integration.py")
     runtime = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runtime)
     custom = tmp_path / "operator.env"
     custom.write_text("TOOL_SANDBOX_IMAGE=custom:v2\nTOOL_SANDBOX_EXECUTOR=conch\nTOOL_SANDBOX_MEMORY=2048\n")
-    settings["business_env_file"] = str(custom)
-    defaults = tmp_path / "defaults"
-    defaults.mkdir()
-    (defaults / "settings.yaml").write_text(yaml.safe_dump(settings))
-    monkeypatch.setattr(runtime, "DEFAULTS", defaults)
-    monkeypatch.setattr(runtime, "read_environment", lambda path: {})
+    variables = {"ADX_BUSINESS_ENV_FILE": str(custom), "ADX_CONFIG_DIR": str(tmp_path),
+                 "ADX_GATEWAY_HOME": settings["gateway"]["home"]}
+    monkeypatch.setattr(runtime, "read_environment", lambda path: variables)
     monkeypatch.setattr(runtime, "network_settings", lambda prepared, values: prepared)
     loaded = runtime.load_settings(tmp_path / "deployment.env")
     assert loaded["runtime"]["tool_image"] == "custom:v2"

@@ -5,6 +5,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import importlib.util
 import hashlib
 import os
@@ -102,18 +103,110 @@ _TOOL_ENV_SETTINGS = (
 )
 
 
+def network_defaults():
+    """Deployment policy defaults; node addresses are derived separately."""
+    return {
+        "agent_profile": "N2", "tool_profile": "N2",
+        "ingress_policy_peer": "agentos-ingress.node.invalid",
+        "ingress_port": 8080, "runtime_control_port": 19503,
+        "allowed_internal_origins": [], "tool_origins": [],
+    }
+
+
+def deployment_context(document, variables):
+    """Combine installation facts with the existing deployment defaults."""
+    from dotenv import dotenv_values
+
+    settings = copy.deepcopy(document)
+    deploy = Path(__file__).resolve().parents[1]
+    config_dir = Path(variables.get("ADX_CONFIG_DIR", "/opt/adx/config"))
+    workspace_file = deploy / "workspace-storage/workspace_storage.conf"
+    workspace = dotenv_values(workspace_file, interpolate=False) if workspace_file.is_file() else {}
+    agentos = settings.get("profile", "agentos" if "ADX_CONFIG_DIR" in variables else "standalone") == "agentos"
+    for key, value in {
+        "profile": "agentos" if agentos else "standalone",
+        "business_env_file": variables.get("ADX_BUSINESS_ENV_FILE", str(deploy / "jiuwenswarm/.env.custom")),
+        "python": variables.get("ADX_BUSINESS_PYTHON", "python" + variables.get("PYTHON_VERSION", "3.11")),
+        "tenant": "agentos", "namespace": variables.get("ADX_NAMESPACE", "adx"),
+        "token_file": str(config_dir / "secrets/agentos-tenant-key"),
+        "ca_file": variables.get("ADX_CA_BUNDLE_FILE", "/etc/agentos/adx-ca-bundle.pem"),
+        "ingress_url": "http://127.0.0.1:8080",
+        "workspace_root": variables.get("WORKSPACE_ACCESS_ROOT") or workspace.get("WORKSPACE_ACCESS_ROOT") or "/home/agentos/users",
+        "shared_workspace_sqlite": agentos,
+    }.items():
+        settings.setdefault(key, value)
+    options = settings.setdefault("gateway", {})
+    agentos = settings["profile"] == "agentos"
+    for key, value in {
+        "home": variables.get("ADX_GATEWAY_HOME", str(Path.home())),
+        "host": "0.0.0.0" if agentos else "127.0.0.1", "port": 19001,
+        "web_host": "0.0.0.0" if agentos else "127.0.0.1", "web_port": 19000, "static_port": 5173,
+    }.items():
+        options.setdefault(key, value)
+    if agentos:
+        vip = variables.get("ADX_INGRESS_VIP", "127.0.0.1")
+        application = options.setdefault("agentos", {})
+        application.setdefault("auth_enabled", True)
+        application.setdefault("auth_service_url", f"http://{vip}:8090")
+        port = _positive_env_int(
+            {"A2X_REGISTRY_PORT": variables.get("A2X_REGISTRY_PORT") or "4003"},
+            "A2X_REGISTRY_PORT", maximum=65535,
+        )
+        application.setdefault("registry", {}).setdefault("endpoint", f"http://{vip}:{port}")
+    runtime = settings.setdefault("runtime", {})
+    for key, value in {
+        "user": (variables.get("WORKSPACE_USER") or workspace.get("WORKSPACE_USER") or "agentos") if agentos else pwd.getpwuid(os.getuid()).pw_name,
+        "python_mounts": variables.get("ADX_PYTHON_MOUNTS", "[]"),
+        "node_ingress_url": variables.get("ADX_NODE_INGRESS_URL", ""),
+        "agent_runtime": "supervisor", "tool_runtime": "runsc",
+        "tool_runtimes": (["runsc", "conch"] if conch_module_enabled() else ["runsc"]) if agentos else [],
+        "conch_image": "agentos-tools:v1",
+        "local_image_bindings_file": variables.get("ADX_LOCAL_IMAGE_BINDINGS_FILE", str(config_dir / "local-images.json")),
+    }.items():
+        runtime.setdefault(key, value)
+    if agentos:
+        runtime.setdefault("tool_image", "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest")
+        runtime.setdefault("workspace_mount_options", ["rw", "disable_file_handle_sharing"])
+        network = settings.setdefault("network", {})
+        for key, value in network_defaults().items():
+            network.setdefault(key, value)
+    runtime.setdefault("runtime_control", {}).setdefault("key_file", str(config_dir / "secrets/runtime-control-key"))
+    return settings
+
+
+def _business_values(path):
+    """Normalize aliases per source, before custom values overlay installed ones."""
+    from dotenv import dotenv_values
+    values = dotenv_values(path, interpolate=False) if Path(path).is_file() else {}
+    for alias, name in (("FRONTEND_HOST", "WEB_STATIC_HOST"), ("FRONTEND_PORT", "WEB_STATIC_PORT"),
+                        ("YR_PYTHON_VERSION", "PYTHON_VERSION")):
+        if values.get(alias) and not values.get(name):
+            values[name] = values[alias]
+    return values
+
+
 def business_environment(settings):
     """Retain the original nonempty .env.custom overrides over installed .env."""
-    from dotenv import dotenv_values
     custom = settings.get("business_env_file") or Path(__file__).resolve().parents[1] / "jiuwenswarm/.env.custom"
-    values = dotenv_values(custom, interpolate=False) if Path(custom).is_file() else {}
+    values = _business_values(custom)
     options = settings.setdefault("gateway", {})
     if values.get("JIUWENSWARM_INSTANCE_NAME") and "SWARM_INSTANCE_NAME" not in os.environ:
         options["instance_name"] = values["JIUWENSWARM_INSTANCE_NAME"]
     installed = data_directory(settings) / "config/.env"
-    retained = dotenv_values(installed, interpolate=False) if installed.is_file() else {}
+    retained = _business_values(installed)
     retained.update({key: value for key, value in values.items() if value})
     return retained
+
+
+def _positive_env_int(values, name, *, maximum=None):
+    try:
+        value = int(values[name])
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+    if value <= 0 or (maximum is not None and value > maximum):
+        limit = f" from 1 to {maximum}" if maximum is not None else " greater than zero"
+        raise ValueError(f"{name} must be an integer{limit}")
+    return value
 
 
 def normalize_tool_inputs(settings):
@@ -122,6 +215,9 @@ def normalize_tool_inputs(settings):
         return settings
     values = business_environment(settings)
     runtime = settings.setdefault("runtime", {})
+    for name, key in (("AGENTOS_BUILTIN_AGENT_CPU", "cpu"), ("AGENTOS_BUILTIN_AGENT_MEMORY", "memory")):
+        if values.get(name):
+            runtime[key] = _positive_env_int(values, name)
     config = data_directory(settings) / "config/config.yaml"
     sandbox = (read_yaml(config).get("sandbox") or {}) if config.is_file() else {}
     migration = migration_module()
@@ -161,6 +257,43 @@ def retain_gateway_environment(settings):
             options[key] = int(value) if key.endswith("port") else value
     if values.get("GATEWAY_SESSION_MAP_SCOPE"):
         options["session_map_scope"] = values["GATEWAY_SESSION_MAP_SCOPE"]
+    application = options.get("agentos")
+    if isinstance(application, dict) and values.get("AGENTOS_AUTH_SERVICE_URL"):
+        application["auth_service_url"] = values["AGENTOS_AUTH_SERVICE_URL"]
+    if isinstance(application, dict) and values.get("AGENTOS_AUTH_TIMEOUT"):
+        try:
+            timeout = float(values["AGENTOS_AUTH_TIMEOUT"])
+        except ValueError:
+            raise ValueError("AGENTOS_AUTH_TIMEOUT must be a positive number") from None
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("AGENTOS_AUTH_TIMEOUT must be a positive number")
+        application["timeout"] = timeout
+
+
+def retain_network_environment(settings):
+    """Read independent role profiles and extra origins from deployment dotenv."""
+    if settings.get("profile", "standalone") != "agentos":
+        return
+    values = business_environment(settings)
+    network = settings.setdefault("network", {})
+    for name, key in (("AGENTOS_AGENT_NETWORK_PROFILE", "agent_profile"),
+                      ("TOOL_SANDBOX_NETWORK_PROFILE", "tool_profile")):
+        value = values.get(name)
+        if value:
+            if value not in ("N0", "N1", "N2"):
+                raise ValueError(name + " must be N0, N1 or N2")
+            network[key] = value
+    for name, key in (("AGENTOS_ALLOWED_INTERNAL_ORIGINS", "allowed_internal_origins"),
+                      ("TOOL_SANDBOX_ALLOWED_ORIGINS", "tool_origins")):
+        value = values.get(name)
+        if value:
+            try:
+                origins = json.loads(value)
+            except ValueError:
+                raise ValueError(name + " must be a JSON list of URL strings") from None
+            if not isinstance(origins, list) or any(not isinstance(origin, str) for origin in origins):
+                raise ValueError(name + " must be a JSON list of URL strings")
+            network[key] = origins
 
 
 def migrate_python_environment(path):
@@ -228,7 +361,8 @@ def local_image_bindings(runtime):
     return bindings
 
 
-def gateway_config(config, settings, environment=None, *, deployment_owned=False, migration_defaults=None):
+def gateway_config(config, settings, environment=None, *, deployment_owned=False, migration_defaults=None,
+                   source_sandbox=None):
     config = copy.deepcopy(config)
     migration = migration_module()
     values = {}
@@ -240,9 +374,10 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
     config["sandbox"] = migration.tool_image_source(config.get("sandbox") or {}, values)
     runtime = settings["runtime"]
     conch_enabled = conch_module_enabled()
-    if (migration_defaults is not None and not conch_enabled
-            and migration.tool_source_runtime(config["sandbox"], runtime.get("tool_runtime", "runsc")) == "conch"):
-        return None
+    conch_source = (
+        migration.tool_source_runtime(config["sandbox"], runtime.get("tool_runtime", "runsc")) == "conch"
+        or (values.get("TOOL_SANDBOX_EXECUTOR") or "").strip().lower() == "conch"
+    )
     network = settings.get("network", {})
     from jiuwenswarm.extensions.agentos.agentos_router.adx.network import network_profile
     from jiuwenswarm.extensions.agentos.agentos_router.adx.config import DEFAULT_RESTART_POLICY, normalize_restart_policy
@@ -261,11 +396,16 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
             tool_runtimes.append("runsc")
             fallback = True
         tool_runtimes = [value for value in tool_runtimes if value != "conch"]
-        if deployment_owned and fallback:
-            sandbox = config["sandbox"]
-            for key in ("executor", "template_name", "conch", "image", "rootfs", "image_env", "prepared_image"):
-                sandbox.pop(key, None)
-            sandbox.update(type="adx-environment", runtime="runsc")
+        if conch_source or deployment_owned and fallback:
+            if source_sandbox is not None:
+                retained = migration.tool_image_source(source_sandbox, values)
+                for key in ('cpu', 'cpu_limit', 'memory', 'mem_limit'):
+                    if key in retained:
+                        config['sandbox'][key] = retained[key]
+            config["sandbox"] = migration.default_runsc_source(config["sandbox"], runtime.get("tool_image"))
+            if migration_defaults is not None:
+                migration_defaults['_conch_to_runsc'] = True
+            logging.warning("Migrating historical Conch tools to runsc with the deployment default image")
     gateway = config.setdefault("gateway", {})
     gateway["agent_client"] = {"type": "agentos_router", "agent_namespace": settings["namespace"]}
     adx_options = gateway.get("adx") or {}
@@ -556,17 +696,17 @@ def validate_user_configs(settings, *, failures=None):
             paths.append(template)
     for user_config in paths:
         user = user_config.parents[2]
-        if user_config.is_file():
+        if migration_module().configuration_file_available(user_config):
             try:
                 source = user_config.read_bytes()
-                document = migration_module().workspace_overrides(user_config, yaml.safe_load(source))
+                original = yaml.safe_load(source)
+                document = migration_module().workspace_overrides(user_config, original)
                 defaults = {}
                 env_file = user_config.with_name(".env")
-                updated = gateway_config(document, settings, env_file, migration_defaults=defaults)
-                if updated is None:
-                    logging.warning("Skipping workspace migration because Conch is unavailable: %s", user_config)
-                    continue
+                updated = gateway_config(document, settings, env_file, migration_defaults=defaults,
+                                         source_sandbox=original.get('sandbox') or {})
                 updated = migrate_tool_environment(updated, env_file)
+                updated['_adx_conch_to_runsc'] = defaults.pop('_conch_to_runsc', False)
                 seed = {'type': 'adx-environment', 'runtime': updated['sandbox']['runtime']}
                 updated['_adx_deployment_defaults'] = migration_module().workspace_sandbox(
                     migration_module().migrate_adx_sandbox(seed, defaults))
@@ -701,7 +841,8 @@ def configure(settings):
                 owner = user_config.stat()
                 template_dir = os.environ.get('AGENTOS_SWARM_TEMPLATE_DIR') or data_directory(settings)
                 initialize(user_config.parents[2], template_dir, owner.st_uid, owner.st_gid)
-            update_environment(user_config.with_name('.env'), settings, user_config.stat())
+            update_environment(user_config.with_name('.env'), settings, user_config.stat(),
+                               migrated_conch=updated.get('_adx_conch_to_runsc', False))
             user_config.with_name(MIGRATION_ERROR_FILE).unlink(missing_ok=True)
         except (ValueError, OSError, portalocker.exceptions.LockException) as exc:
             failures[user_config] = str(exc) if isinstance(exc, ValueError) else 'cannot update workspace configuration'
@@ -714,7 +855,7 @@ def configure(settings):
     return env_file
 
 
-def update_environment(path, settings, owner=None, *, service=False):
+def update_environment(path, settings, owner=None, *, service=False, migrated_conch=False):
     from dotenv import dotenv_values, set_key, unset_key
     if not path.exists():
         write_private(path, "")
@@ -725,6 +866,10 @@ def update_environment(path, settings, owner=None, *, service=False):
     existing = dotenv_values(path, interpolate=False)
     token = Path(settings["token_file"]).read_text().strip()
     values = {}
+    if migrated_conch:
+        for name in ('TOOL_SANDBOX_TYPE', 'TOOL_SANDBOX_EXECUTOR', 'TOOL_SANDBOX_IMAGE'):
+            if name in existing:
+                unset_key(str(path), name)
     if service and settings.get("profile", "standalone") == "agentos":
         retired = {*_AGENTOS_ENV_CLEANUP, "JIUWENSWARM_ADX_NODE_INGRESS_URL", "ADX_TOKEN"}
         values.update({key: value for key, value in business_environment(settings).items()
@@ -752,8 +897,8 @@ def update_environment(path, settings, owner=None, *, service=False):
             "GATEWAY_PORT": options.get("port", 19001),
             "WEB_HOST": options.get("web_host", "127.0.0.1"),
             "WEB_PORT": options.get("web_port", 19000),
-            "FRONTEND_HOST": values.get("FRONTEND_HOST") or existing.get("FRONTEND_HOST") or options.get("static_host", options.get("host", "127.0.0.1")),
-            "FRONTEND_PORT": values.get("FRONTEND_PORT") or existing.get("FRONTEND_PORT") or options.get("static_port", 5173),
+            "FRONTEND_HOST": options.get("static_host", options.get("host", "127.0.0.1")),
+            "FRONTEND_PORT": options.get("static_port", 5173),
             "AGENTOS_BUILTIN_AGENT_CPU": str(settings["runtime"].get("cpu", 2000)),
             "AGENTOS_BUILTIN_AGENT_MEMORY": str(settings["runtime"].get("memory", 4096)),
         })
@@ -791,31 +936,21 @@ def data_directory(settings):
     return effective_home(settings) / ".jiuwenswarm"
 
 
-def load_identity(path, bindings=None):
+def load_identity(path=None, bindings=None):
     """Resolve service identity without loading startup policy or credentials."""
     from string import Template
 
-    if Path(path).is_file():
-        document = read_yaml(path)
-        gateway = document.get("gateway") or {}
-    elif "SWARM_INSTANCE_NAME" in os.environ:
-        document = {}
-        gateway = {}
-    else:
-        raise ValueError("Cannot determine service identity: settings file is missing")
+    document = read_yaml(path) if path is not None else {}
+    gateway = document.get("gateway") or {}
+    variables = dict(os.environ)
+    if bindings and Path(bindings).is_file():
+        variables.update(read_environment(bindings))
     identity = {
-        "home": os.environ.get("SWARM_HOME", gateway.get("home", str(Path.home()))),
+        "home": os.environ.get("SWARM_HOME", gateway.get("home", variables.get("ADX_GATEWAY_HOME", str(Path.home())))),
         "instance_name": os.environ.get("SWARM_INSTANCE_NAME", gateway.get("instance_name", "")),
         "static_port": gateway.get("static_port", 5173),
     }
-    variables = dict(os.environ)
     variables.setdefault("HOME", str(Path.home()))
-    required = set()
-    for value in identity.values():
-        if isinstance(value, str):
-            required.update(Template(value).get_identifiers())
-    if required - variables.keys() and bindings and Path(bindings).is_file():
-        variables.update(read_environment(bindings))
     try:
         identity = expand_defaults(identity, variables)
     except KeyError as exc:
@@ -824,7 +959,7 @@ def load_identity(path, bindings=None):
     if not isinstance(home, str) or not Path(home).is_absolute():
         raise ValueError("service identity home must be an absolute path")
     settings = {"profile": "agentos", "gateway": identity}
-    custom = document.get("business_env_file")
+    custom = document.get("business_env_file") or variables.get("ADX_BUSINESS_ENV_FILE")
     if custom:
         settings["business_env_file"] = Template(custom).safe_substitute(variables)
     retain_gateway_environment(settings)
@@ -838,19 +973,13 @@ def load_identity(path, bindings=None):
     return settings
 
 
-def load_settings(path, bindings=None):
+def load_settings(path=None, bindings=None):
     variables = dict(os.environ)
     if bindings:
         variables.update(read_environment(bindings))
-    settings = expand_defaults(read_yaml(path), variables)
+        variables.setdefault("ADX_CONFIG_DIR", str(Path(bindings).parent))
+    settings = resolve_settings(read_yaml(path) if path is not None else {}, variables)
     options = settings.setdefault("gateway", {})
-    options.setdefault("home", str(Path.home()))
-    options.setdefault("host", "127.0.0.1")
-    options.setdefault("port", 19001)
-    options.setdefault("web_host", "127.0.0.1")
-    options.setdefault("web_port", 19000)
-    options.setdefault("static_port", 5173)
-    retain_gateway_environment(settings)
     name = options.get("instance_name", "")
     if name and not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise ValueError("invalid instance_name")
@@ -860,6 +989,14 @@ def load_settings(path, bindings=None):
         if options["host"] not in ("127.0.0.1", "::1", "localhost") or options["web_host"] not in ("127.0.0.1", "::1", "localhost"):
             raise ValueError("standalone deployment requires loopback listeners")
     return settings
+
+
+def resolve_settings(document, variables):
+    """Resolve one input set for image preparation, migration and service startup."""
+    settings = expand_defaults(deployment_context(document, variables), variables)
+    retain_gateway_environment(settings)
+    retain_network_environment(settings)
+    return normalize_tool_inputs(settings)
 
 
 def check_business(settings):
@@ -888,7 +1025,6 @@ def shell_identity(settings):
 def main():
     parser = argparse.ArgumentParser(description="Prepare AgentOS application configuration")
     parser.add_argument("action", choices=("configure", "migrate", "preflight", "variables", "identity", "ready", "components"))
-    parser.add_argument("--settings", type=Path, default=Path(__file__).resolve().parents[1] / "agent-runtime/defaults/settings.yaml")
     parser.add_argument("--bindings", type=Path)
     parser.add_argument("--workspace-application-config", type=Path)
     args = parser.parse_args()
@@ -896,9 +1032,9 @@ def main():
         check_components()
         return
     if args.action == "identity":
-        shell_identity(load_identity(args.settings, args.bindings))
+        shell_identity(load_identity(bindings=args.bindings))
         return
-    settings = load_settings(args.settings, args.bindings)
+    settings = load_settings(bindings=args.bindings)
     if args.action in ("configure", "migrate"):
         configure(settings)
         if args.workspace_application_config:

@@ -50,5 +50,5 @@ def test_runtime_migration_prepares_configuration_without_starting_services(tmp_
     assert result.returncode == 0, result.stderr
     calls = trace.read_text().splitlines()
     assert len(calls) == 1
-    assert '/configure.py migrate --settings ' in calls[0]
+    assert '/configure.py migrate --bindings ' in calls[0]
     assert '--bindings ' in calls[0]

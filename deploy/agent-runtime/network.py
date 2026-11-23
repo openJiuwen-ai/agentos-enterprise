@@ -47,10 +47,10 @@ def supervisor_network(configured, previous, sandboxd_cidr):
             return str(pool), legacy
         if requested:
             raise ValueError(f'Supervisor address pool {pool} overlaps {conflict}; configure a different pool')
-    raise ValueError('No available Supervisor address pool; configure network.supervisor_subnet explicitly')
+    raise ValueError('No available Supervisor address pool; check conflicting host routes')
 
 
-def node_context(sandboxd, *, ingress_port=8080, runtime_control_port=19103, node_id=None):
+def node_context(sandboxd, *, ingress_port=8080, runtime_control_port=19503, node_id=None):
     interface = ipaddress.IPv4Interface(sandboxd['plugin']['network']['ip_range'])
     if interface.ip.is_loopback or interface.ip.is_unspecified or interface.ip in (interface.network.network_address, interface.network.broadcast_address):
         raise ValueError('sandboxd must configure an explicit usable bridge IPv4 address')

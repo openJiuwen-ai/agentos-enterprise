@@ -53,7 +53,8 @@ jiuwenswarm_run_deploy() {
     local entry="${JIUWENSWARM_DEPLOY_DIR}/deploy.sh"
     [ -f "${entry}" ] || error "Swarm archive is missing the application deploy.sh entrypoint; rebuild the release with an ADX-capable Swarm artifact"
     export SWARM_PYTHON="${ADX_BUSINESS_PYTHON:-python3.11}"
-    export SWARM_SETTINGS="${SCRIPT_DIR}/agent-runtime/defaults/settings.yaml"
+    # Existing Swarm archives select the AgentOS handlers with this nonempty marker.
+    export SWARM_SETTINGS=agentos
     export SWARM_BINDINGS="${ADX_CONFIG_DIR:-/opt/adx/config}/deployment.env"
     # Enterprise owns the default application service identity, even before up.
     export SWARM_HOME="${HOME:-/root}"
@@ -61,7 +62,7 @@ jiuwenswarm_run_deploy() {
     export SWARM_SERVICE_PREFLIGHT="/usr/local/bin/agentos-check-ingress-master"
     if [ "${action}" = up ]; then
         "${SWARM_PYTHON}" "${SCRIPT_DIR}/agent-runtime/configure.py" configure \
-            --settings "${SWARM_SETTINGS}" --bindings "${SWARM_BINDINGS}" \
+            --bindings "${SWARM_BINDINGS}" \
             --workspace-application-config /etc/agentos/workspace-storage/application.json || return 1
         # Only Enterprise understands Master/VIP placement and external services.
         [ -x "${SWARM_SERVICE_PREFLIGHT}" ] || error "Enterprise ingress preflight is missing; run install first"
@@ -72,7 +73,7 @@ jiuwenswarm_run_deploy() {
         fi
         "${SWARM_PYTHON}" "${SCRIPT_DIR}/agent-runtime/adx_integration.py" gateway-ready --environment-file "${SWARM_BINDINGS}" || return 1
         "${SWARM_PYTHON}" "${SCRIPT_DIR}/agent-runtime/configure.py" ready \
-            --settings "${SWARM_SETTINGS}" --bindings "${SWARM_BINDINGS}" || return 1
+            --bindings "${SWARM_BINDINGS}" || return 1
     fi
     (
         cd "${JIUWENSWARM_DEPLOY_DIR}"

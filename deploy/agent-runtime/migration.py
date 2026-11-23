@@ -80,6 +80,21 @@ def tool_image_source(sandbox: dict, environment: dict | None = None) -> dict:
     return result
 
 
+def default_runsc_source(sandbox: dict, image: str | None) -> dict:
+    """Replace Conch launch inputs with the deployment's prepared runsc image."""
+    result = copy.deepcopy(sandbox)
+    for key in ('executor', 'template_name', 'conch', 'conch_sdk_config',
+                'image', 'rootfs', 'image_env', 'prepared_image'):
+        result.pop(key, None)
+    for key in ('cpu', 'cpu_limit', 'memory', 'mem_limit'):
+        if result.get(key) is None:
+            result.pop(key, None)
+    result.update(type='adx-environment', runtime='runsc')
+    if image:
+        result['image'] = image
+    return result
+
+
 def legacy_tool_image(sandbox: dict, default_conch_images=()) -> str | None:
     """Return a Docker reference or None for the current deployment default.
 
@@ -236,7 +251,9 @@ def configuration_paths(settings: dict) -> list:
     from pathlib import Path
     import urllib.request
     root = Path(settings['workspace_root'])
-    paths = set(root.glob('*/.jiuwenswarm/config/config.yaml'))
+    # Enumerate names without statting each autofs child. A stale NFS handle
+    # belongs to one user and must not abort node-wide configuration discovery.
+    paths = {child / '.jiuwenswarm/config/config.yaml' for child in root.iterdir()} if root.is_dir() else set()
     if settings.get('profile') == 'agentos':
         try:
             with urllib.request.urlopen('http://127.0.0.1:18889/v1/workspaces', timeout=3) as response:
@@ -253,6 +270,14 @@ def configuration_paths(settings: dict) -> list:
             # participate now; the up preflight enumerates the service again.
             logger.warning('Workspace inventory unavailable; migrating visible user configurations only')
     return sorted(paths)
+
+
+def configuration_file_available(path) -> bool:
+    try:
+        return path.is_file()
+    except OSError as exc:
+        logger.warning('Workspace configuration unavailable; retry on next deployment: %s (errno=%s)', path, exc.errno)
+        return False
 
 
 @lru_cache(maxsize=64)

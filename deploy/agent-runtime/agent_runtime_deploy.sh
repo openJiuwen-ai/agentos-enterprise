@@ -61,8 +61,8 @@ ADX_NODE_ID="${ADX_NODE_ID:-}"
 # 可用 ADX_RELEASE_TARBALL 覆盖路径；install 解压该包并执行其 install.sh，不做任何在线拉取。
 ADX_RELEASE_TARBALL="${ADX_RELEASE_TARBALL:-$(cd "${SCRIPT_DIR}/../.." && pwd)/adx-release.tar.gz}"
 
-# ADX 组件端口（coordinator 19100 / adxlet 19101 / relay 19102）：
-# 避开 jiuwenswarm 默认实例端口（web 19000 / gateway 19001，BASE_PORTS 包内硬编码），
+# ADX 组件端口（coordinator 19500 / adxlet 19501 / relay 19502 / runtime-control 19503）：
+# 避开 jiuwenswarm 默认实例端口（web 19000 / gateway 19001）与三方 Agent 预留端口（19101–19200），
 # 同机部署时两套端口不得冲突，否则 jiuwenswarm-gateway 绑定失败且 jiuwenswarm-init
 # 误判默认实例在运行。
 
@@ -723,7 +723,7 @@ deploy_adx_up() {
     [ -f "${config_preflight}" ] || error "AgentOS managed configuration preflight is missing"
     SWARM_HOME="${HOME:-/root}" SWARM_INSTANCE_NAME="" \
         "${ADX_BUSINESS_PYTHON}" "${config_preflight}" preflight \
-        --settings "${SCRIPT_DIR}/defaults/settings.yaml" --bindings "${ADX_ENV_FILE}" \
+        --bindings "${ADX_ENV_FILE}" \
         || error "ADX node configuration preflight failed; runtime unchanged"
     _adx_cleanup_legacy_executor up
     if [ "${NO_SYSTEMD}" != "1" ]; then
@@ -744,7 +744,7 @@ deploy_adx_down() {
 deploy_adx_migrate() {
     SWARM_HOME="${HOME:-/root}" SWARM_INSTANCE_NAME="" \
         "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/configure.py" migrate \
-        --settings "${SCRIPT_DIR}/defaults/settings.yaml" --bindings "${ADX_ENV_FILE}"
+        --bindings "${ADX_ENV_FILE}"
 }
 
 # ===== systemd 模式 =====

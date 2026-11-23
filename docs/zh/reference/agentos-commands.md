@@ -35,8 +35,10 @@ bash deploy/agentos.sh <COMMAND> [OPTIONS]
 
 | 选项 | 说明 |
 |------|------|
-| `--ip IP` | 指定本机使用的 IP（多网卡环境必用）。指定后所有子组件（agent-runtime / jiuwenbox / gateway / jiuwenswarm / etcd）的 local-ip 探测统一使用该 IP，并校验必须是本机真实持有的 IP。可置于命令前或命令后 |
+| `--ip IP` | 指定本机使用的非回环 IPv4，所有子组件统一使用该地址。配置了 `cluster.cluster_nodes` 时须属于该名单；字段缺省时只校验为本机持有的非回环、非通配地址。可置于命令前或命令后 |
 | `-h`, `--help` | 显示帮助信息 |
+
+`cluster.cluster_nodes` 为可选字段。未配置该字段且未指定 `--ip` 时，按 `master_nodes`、`etcd_nodes` 的顺序查询 IPv4 路由，选取其中属于本机接口的非回环、非通配 `src` 地址；先尝试 Master，再尝试 etcd。列表中的控制节点是路由目标，Agent 的源地址无需出现在这些列表中。若均无法选出地址，会提示检查路由或显式指定 `--ip`。配置了 `cluster_nodes` 时，自动选址仍限定在该名单与本机接口地址的交集中。
 
 ## 常用环境变量
 

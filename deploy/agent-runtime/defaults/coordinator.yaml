@@ -10,7 +10,7 @@ services:
 - id: coordinator
   role: coordinator
   config:
-    listen: 0.0.0.0:19100
+    listen: 0.0.0.0:19500
     scheduler_shards: 1
     placement: pack
     rpc_timeout_seconds: 30
@@ -25,7 +25,7 @@ services:
       tenant_id: agentos
       administrator: false
       expires_at_unix_seconds: 0
-    advertised_address: http://${ADX_NODE_IP}:19100
+    advertised_address: http://${ADX_NODE_IP}:19500
     heartbeat_timeout_seconds: 30
     discovery_ttl_seconds: 15
     metrics_listen: 127.0.0.1:19090

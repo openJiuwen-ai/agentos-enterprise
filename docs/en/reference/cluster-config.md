@@ -30,7 +30,7 @@ cluster:
 | Module | Configuration | Key items |
 |--------|---------------|-----------|
 | jiuwenbox | `deploy/jiuwenbox/default-policy.yaml` | policy template (`__JIUWENSWARM_EXTENSIONS_DIR__` replaced at start) |
-| agent-runtime | env vars | `YR_PYTHON_VERSION` (default 3.11), `YR_VERSION` (default 0.9.0), `AGENTOS_SSH_KEY`, `AGENTOS_SSH_BACKEND_PUBLIC_DIR` |
+| agent-runtime | `.env.custom` and `config.yaml` | `PYTHON_VERSION` (default 3.11), tool inputs below, and `trace_otlp_endpoints` for tracing; see the [ADX runtime guide](../../../deploy/agent-runtime/README.adx.zh.md) |
 | etcd | env vars | `YR_ETCD_CLIENT_PORT` (default 32379) |
 | agent-gateway | env vars | `A2X_REGISTRY_PORT` (default 4003), `A2X_REGISTRY_TLS_*` (mTLS enabled when all three are set) |
 | jiuwenswarm | `deploy/jiuwenswarm/.env.custom` | see below |
@@ -44,24 +44,36 @@ cluster:
 | `GATEWAY_HOST` / `GATEWAY_PORT` | gateway listen address / port (default port 19001; binds to the ingress VIP automatically when host is empty) |
 | `WEB_PORT` / `WEB_ENABLED` | web frontend port (default 19000) / whether it starts with `up` |
 | `ETCD_ENDPOINTS` | Cron etcd endpoints; left empty it is derived from `config.yaml` |
+| `TOOL_SANDBOX_ENABLE` / `TOOL_SANDBOX_EXECUTOR` | enable tools / select their runtime; defaults are `true` and `runsc`; historical `docker` selects runsc |
+| `TOOL_SANDBOX_IMAGE` | deployment tool image; prepared by `agentos.sh up` as described below |
+| `TOOL_SANDBOX_CPU` / `TOOL_SANDBOX_MEMORY` / `TOOL_SANDBOX_IDLE_TIMEOUT` | tool CPU (millicores), memory (MiB), and idle timeout (seconds) |
+| `TOOL_SANDBOX_USER` / `TOOL_SANDBOX_GROUP` | tool execution identity |
+| `AGENTOS_AGENT_NETWORK_PROFILE` / `TOOL_SANDBOX_NETWORK_PROFILE` | independent AgentServer and tool network profiles; N0/N1/N2, subject to runtime support |
+| `AGENTOS_ALLOWED_INTERNAL_ORIGINS` / `TOOL_SANDBOX_ALLOWED_ORIGINS` | extra network origins as JSON arrays |
 
-> `SANDBOX_TYPE` / `TOOL_SANDBOX_*` are no longer read from `.env.custom`; ADX owns
-> tool configuration through `deploy/agent-runtime/defaults/settings.yaml` and the
-> `agent-runtime` prepare-env step.
+Deployment inputs come from nonempty `.env.custom` values, then the installed `.env`,
+then deployment defaults. Node addresses, mounts, credentials and Local rootfs metadata
+are derived during deployment. The prepare-env step uses these inputs to prepare images
+and generate the ADX provider configuration for new users and retained workspaces.
+
+The registry listener and the Gateway registry endpoint share the deployment environment
+variable `A2X_REGISTRY_PORT` (default 4003). Apply the same value on the relevant nodes;
+restart the registry and Gateway after changing it so both use the new port.
 
 ### Tool sandbox images are prepared by the deployment
 
-The default tool image is fixed at
-`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`. During `agentos.sh up`,
-prepare-env:
+`TOOL_SANDBOX_IMAGE` selects the deployment tool image; its default is
+`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`.
+During `agentos.sh up`, prepare-env:
 
 1. loads the fixed offline tar `/root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar` when present;
 2. inspects the local Docker image;
 3. always runs `docker pull` when absent;
 4. exports a Local rootfs and registers it for sandboxd/runsc.
 
-The reference is owned by the deployment and is not overridable by environment variables.
-Agent/user images still never pull and must already exist locally.
+After changing the deployment image, run `up` to prepare it and recreate the affected
+tool environments to apply it. Other explicitly selected Agent/user images must already
+exist locally; their preparation does not pull from a registry.
 
 ```bash
 # offline: export on a connected machine -> transfer -> import on the target host
