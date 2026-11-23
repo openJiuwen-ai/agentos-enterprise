@@ -94,7 +94,19 @@ export AGENTOS_CONCH_MODULE
 unset _agentos_module
 
 # ===== 全局环境变量 =====
-export PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
+_agentos_python_version() {
+    [ -z "${PYTHON_VERSION:-}" ] || { printf '%s\n' "${PYTHON_VERSION}"; return; }
+    local file key value
+    for file in "${SCRIPT_DIR}/jiuwenswarm/.env.custom" "${HOME:-/root}/.jiuwenswarm/config/.env"; do
+        [ -f "${file}" ] || continue
+        for key in PYTHON_VERSION YR_PYTHON_VERSION; do
+            value=$(sed -nE "s/^[[:space:]]*${key}=[\"']?([0-9]+\.[0-9]+)[\"']?([[:space:]]*(#.*)?)?$/\1/p" "${file}" | tail -n 1)
+            [ -z "${value}" ] || { printf '%s\n' "${value}"; return; }
+        done
+    done
+    printf '3.11\n'
+}
+export PYTHON_VERSION="$(_agentos_python_version)"
 
 # ===== 指定本机 IP（多网卡环境）=====
 # agentos.sh --ip 1.2.3.4 up  →  export BIND_IP 后所有子脚本都能读到

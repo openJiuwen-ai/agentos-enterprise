@@ -45,6 +45,40 @@ def settings(tmp_path):
     }
 
 
+@pytest.mark.parametrize(("key", "value"), [
+    ("AGENTOS_BUILTIN_AGENT_CPU", "unknown"),
+    ("AGENTOS_BUILTIN_AGENT_MEMORY", "0"),
+    ("AGENTOS_AUTH_TIMEOUT", "NaN"),
+])
+def test_invalid_deployment_number_names_its_input(settings, monkeypatch, key, value):
+    monkeypatch.setattr(deploy, "business_environment", lambda _: {key: value})
+    settings["gateway"]["agentos"] = {"registry": {"endpoint": "http://registry.example:4003"}}
+    function = deploy.normalize_tool_inputs if key.startswith("AGENTOS_BUILTIN_") else deploy.retain_gateway_environment
+    with pytest.raises(ValueError, match=key):
+        function(settings)
+
+
+@pytest.mark.parametrize(("listener_port", "legacy_port", "expected"), [
+    ("4503", "4003", 4503),
+    (None, "4503", 4003),
+    ("", "4503", 4003),
+])
+def test_gateway_registry_keeps_deployment_listener_port(settings, monkeypatch, listener_port, legacy_port, expected):
+    variables = {"ADX_INGRESS_VIP": "registry.example"}
+    if listener_port is not None:
+        variables["A2X_REGISTRY_PORT"] = listener_port
+    settings = deploy.deployment_context(settings, variables)
+    monkeypatch.setattr(deploy, "business_environment", lambda _: {"REGISTRY_PORT": legacy_port})
+    deploy.retain_gateway_environment(settings)
+    assert settings["gateway"]["agentos"]["registry"]["endpoint"] == f"http://registry.example:{expected}"
+
+
+@pytest.mark.parametrize("port", ["unknown", "0", "65536"])
+def test_invalid_registry_listener_port_names_its_input(settings, port):
+    with pytest.raises(ValueError, match="A2X_REGISTRY_PORT"):
+        deploy.deployment_context(settings, {"A2X_REGISTRY_PORT": port})
+
+
 def test_custom_image_catalog_stays_in_deployment(settings):
     settings["runtime"]["local_image_bindings"] = {"images": {"third:v1": {"path": "/objects/third/rootfs"}}}
     previous = {"gateway": {"adx": {"local_images": {"third:v1": "legacy-template"}}}}
@@ -314,18 +348,14 @@ def test_image_change_requires_reconfiguration_and_refreshes_persisted_source(se
 
 
 def test_runtime_load_uses_same_operator_image_selection_as_application(settings, tmp_path, monkeypatch):
-    import yaml
     spec = importlib.util.spec_from_file_location("review_runtime", ROOT / "deploy/agent-runtime/adx_integration.py")
     runtime = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runtime)
     custom = tmp_path / "operator.env"
     custom.write_text("TOOL_SANDBOX_IMAGE=custom:v2\nTOOL_SANDBOX_EXECUTOR=conch\nTOOL_SANDBOX_MEMORY=2048\n")
-    settings["business_env_file"] = str(custom)
-    defaults = tmp_path / "defaults"
-    defaults.mkdir()
-    (defaults / "settings.yaml").write_text(yaml.safe_dump(settings))
-    monkeypatch.setattr(runtime, "DEFAULTS", defaults)
-    monkeypatch.setattr(runtime, "read_environment", lambda path: {})
+    variables = {"ADX_BUSINESS_ENV_FILE": str(custom), "ADX_CONFIG_DIR": str(tmp_path),
+                 "ADX_GATEWAY_HOME": settings["gateway"]["home"]}
+    monkeypatch.setattr(runtime, "read_environment", lambda path: variables)
     monkeypatch.setattr(runtime, "network_settings", lambda prepared, values: prepared)
     loaded = runtime.load_settings(tmp_path / "deployment.env")
     assert loaded["runtime"]["tool_image"] == "custom:v2"

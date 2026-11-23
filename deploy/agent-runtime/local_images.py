@@ -235,27 +235,8 @@ def migration_module():
 
 def configuration_paths(settings):
     """Read visible homes and registered autofs keys without editing users."""
-    import urllib.request
-    workspace = Path(settings["workspace_root"])
     home = Path(settings.get("gateway", {}).get("home", str(Path.home())))
-    paths = {home / ".jiuwenswarm/config/config.yaml", *workspace.glob("*/.jiuwenswarm/config/config.yaml")}
-    if settings.get("profile") == "agentos":
-        # Listing autofs alone misses dormant users. The local Workspace API
-        # supplies registered names; only paths below the configured root are read.
-        try:
-            with urllib.request.urlopen("http://127.0.0.1:18889/v1/workspaces", timeout=3) as response:
-                records = json.load(response)
-            if isinstance(records, dict):
-                records = records.get("items", records.get("workspaces", []))
-            for record in records:
-                owner = record.get("owner")
-                if isinstance(owner, str) and owner not in (".", "..") and re.fullmatch(r"[A-Za-z0-9_.@+-]+", owner):
-                    paths.add(workspace / owner / ".jiuwenswarm/config/config.yaml")
-        except (OSError, ValueError, TypeError):
-            # Install can precede the Workspace API. Existing visible/local
-            # homes still participate; up prepares the registry again.
-            pass
-    return sorted(paths)
+    return sorted({home / ".jiuwenswarm/config/config.yaml", *migration_module().configuration_paths(settings)})
 
 
 def image_sources(settings, *, include_users=True):
@@ -265,9 +246,11 @@ def image_sources(settings, *, include_users=True):
     home = Path(settings.get('gateway', {}).get('home', str(Path.home())))
     gateway = home / '.jiuwenswarm/config/config.yaml'
     for path in configuration_paths(settings) if include_users else [gateway]:
-        if not path.is_file() or path == gateway and settings.get("runtime", {}).get("_tool_inputs_normalized"):
+        if path == gateway and settings.get("runtime", {}).get("_tool_inputs_normalized"):
             continue
         migration = migration_module()
+        if not (path.is_file() if path == gateway else migration.configuration_file_available(path)):
+            continue
         try:
             document = yaml.safe_load(path.read_text())
             if not isinstance(document, dict):

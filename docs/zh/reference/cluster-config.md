@@ -30,7 +30,7 @@ cluster:
 | 模块 | 配置方式 | 关键项 |
 |------|----------|--------|
 | jiuwenbox | `deploy/jiuwenbox/default-policy.yaml` | policy 模板（`__JIUWENSWARM_EXTENSIONS_DIR__` 启动时自动替换） |
-| agent-runtime | 环境变量 + config.yaml | `YR_PYTHON_VERSION`（默认 3.11）、`YR_VERSION`（默认 0.9.0）、`AGENTOS_SSH_KEY`、`AGENTOS_SSH_BACKEND_PUBLIC_DIR`；**tracing 开关**：config.yaml 顶层 `trace_otlp_endpoints`（字符串数组，主备语义，取第一个注入；空列表=关闭，默认）。地址 host:port 形式不带 `http://` 前缀；ADX 只支持 OTLP/HTTP，4317 自动映射为 4318，其余端口原样写入 ADX 部署 YAML；collector 参考栈在 jiuwenswarm 仓 `deploy/observability`，需先拉起 |
+| agent-runtime | `.env.custom` + config.yaml | `PYTHON_VERSION`（默认 3.11）、下表工具参数；tracing 使用 config.yaml 顶层 `trace_otlp_endpoints`，详见 [ADX 运行时部署](../../../deploy/agent-runtime/README.adx.zh.md) |
 | etcd | 环境变量 | `YR_ETCD_CLIENT_PORT`（默认 32379） |
 | agent-gateway | 环境变量 | `A2X_REGISTRY_PORT`（默认 4003）、`A2X_REGISTRY_TLS_*`（三者齐全开启 mTLS） |
 | jiuwenswarm | `deploy/jiuwenswarm/.env.custom` | 见下表 |
@@ -44,22 +44,33 @@ cluster:
 | `GATEWAY_HOST` / `GATEWAY_PORT` | gateway 进程监听地址 / 端口（默认端口 19001；host 留空时自动绑定 ingress VIP） |
 | `WEB_PORT` / `WEB_ENABLED` | web 前端端口（默认 19000）/ 是否随 `up` 启动 |
 | `ETCD_ENDPOINTS` | Cron etcd 地址，留空时自动从 `config.yaml` 拼接 |
+| `TOOL_SANDBOX_ENABLE` / `TOOL_SANDBOX_EXECUTOR` | 工具开关及运行时，默认 `true`、`runsc`；历史 `docker` 映射为 runsc |
+| `TOOL_SANDBOX_IMAGE` | 部署默认工具镜像，由 `agentos.sh up` 准备，见下文 |
+| `TOOL_SANDBOX_CPU` / `TOOL_SANDBOX_MEMORY` / `TOOL_SANDBOX_IDLE_TIMEOUT` | 工具 CPU（毫核）、内存（MiB）及空闲超时（秒） |
+| `TOOL_SANDBOX_USER` / `TOOL_SANDBOX_GROUP` | 工具执行身份 |
+| `AGENTOS_AGENT_NETWORK_PROFILE` / `TOOL_SANDBOX_NETWORK_PROFILE` | AgentServer 与工具分别选择 N0/N1/N2 网络档位，实际支持范围取决于运行时 |
+| `AGENTOS_ALLOWED_INTERNAL_ORIGINS` / `TOOL_SANDBOX_ALLOWED_ORIGINS` | 额外网络白名单，值为 JSON 数组 |
 
-> `SANDBOX_TYPE` / `TOOL_SANDBOX_*` 已不再由 `.env.custom` 提供；ADX 部署由
-> `deploy/agent-runtime/defaults/settings.yaml` 与 `agent-runtime` 的 prepare-env 统一管理。
+部署输入优先使用非空 `.env.custom`，再使用已安装 `.env`，最后使用部署默认值。
+节点地址、挂载、凭据路径及 Local rootfs 元数据由部署上下文推导。
+prepare-env 使用这些输入准备镜像，并为新用户及历史 workspace 生成 ADX provider 配置。
+
+注册中心监听端口与 Gateway 注册中心地址共用部署环境变量 `A2X_REGISTRY_PORT`（默认 4003）。
+相关节点应使用相同值；修改后重启注册中心和 Gateway，使两者使用新的端口。
 
 ### 工具沙箱镜像由部署准备
 
-默认工具镜像固定为
-`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`。`agentos.sh up`
-的 prepare-env 会：
+`TOOL_SANDBOX_IMAGE` 选择部署默认工具镜像，默认值为
+`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`。
+`agentos.sh up` 的 prepare-env 会：
 
 1. 若固定离线 tar `/root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar` 存在，先 `docker load`；
 2. 检查本地 Docker 镜像；
 3. 本地缺失时始终执行 `docker pull`；
 4. 导出为 Local rootfs 并登记给 sandboxd/runsc。
 
-该镜像引用由部署固定，不支持环境变量覆盖。Agent/用户镜像仍只使用本地已有内容，绝不 pull。
+修改部署镜像后，先执行 `up` 准备镜像，再重建受影响的工具环境以应用变更。
+其他显式选择的 Agent/用户镜像仍只使用本地已有内容，准备过程不执行 registry pull。
 
 ```bash
 # 离线环境：有网机器导出 -> 传输 -> 目标主机导入

@@ -723,7 +723,7 @@ deploy_adx_up() {
     [ -f "${config_preflight}" ] || error "AgentOS managed configuration preflight is missing"
     SWARM_HOME="${HOME:-/root}" SWARM_INSTANCE_NAME="" \
         "${ADX_BUSINESS_PYTHON}" "${config_preflight}" preflight \
-        --settings "${SCRIPT_DIR}/defaults/settings.yaml" --bindings "${ADX_ENV_FILE}" \
+        --bindings "${ADX_ENV_FILE}" \
         || error "ADX node configuration preflight failed; runtime unchanged"
     _adx_cleanup_legacy_executor up
     if [ "${NO_SYSTEMD}" != "1" ]; then
@@ -744,7 +744,7 @@ deploy_adx_down() {
 deploy_adx_migrate() {
     SWARM_HOME="${HOME:-/root}" SWARM_INSTANCE_NAME="" \
         "${ADX_BUSINESS_PYTHON}" "${SCRIPT_DIR}/configure.py" migrate \
-        --settings "${SCRIPT_DIR}/defaults/settings.yaml" --bindings "${ADX_ENV_FILE}"
+        --bindings "${ADX_ENV_FILE}"
 }
 
 # ===== systemd 模式 =====

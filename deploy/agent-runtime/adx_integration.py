@@ -196,7 +196,7 @@ def install_sandboxd(release, config_dir, unit_path):
             config = re.sub(r'(?m)^ip_range = .*$', 'ip_range = ' + json.dumps(prior_range), config)
     config = network.enable_network_acl(config)
     parsed = tomllib.loads(config)
-    context = network.node_context(parsed, node_id=os.environ.get("ADX_NODE_ID"), **{k: v for k, v in read_yaml(DEFAULTS / "settings.yaml").get("network", {}).items() if k in ("ingress_port", "runtime_control_port")})
+    context = network.node_context(parsed, node_id=os.environ.get("ADX_NODE_ID"), **{k: v for k, v in application_module().network_defaults().items() if k in ("ingress_port", "runtime_control_port")})
     prior_context = config_dir / "node-context.json"
     if prior_context.is_file() and json.loads(prior_context.read_text()) != context and socket_path.is_socket():
         listing = subprocess.run([str(release / 'runtime/sandboxd/sbox'), '--address', str(socket_path), '--timeout', '10s', 'list'],
@@ -486,6 +486,7 @@ def deployment_variables(config, node_ip, python, config_dir):
         "ADX_RUNTIME_ROOTFS": os.environ.get("ADX_RUNTIME_ROOTFS", package + "/runtime/adx-runtime-rootfs.img"),
         "ADX_CA_BUNDLE_FILE": os.environ.get("ADX_CA_BUNDLE_FILE", "/etc/agentos/adx-ca-bundle.pem"),
         "ADX_GATEWAY_HOME": str(Path.home()),
+        "A2X_REGISTRY_PORT": os.environ.get("A2X_REGISTRY_PORT", "4003"),
         "ADX_TRACE_ENDPOINTS": json.dumps(trace_endpoints(config), separators=(",", ":")),
         "ADX_TOOL_TEMPLATE": os.environ.get("SANDBOX_IMAGE_REGISTRY", "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev").rstrip("/") + "/tool-sandbox-conch:latest-" + architecture,
         "ADX_RELAY_PEERS": ",".join(dict.fromkeys(["127.0.0.1/32", *(str(node) + "/32" for node in nodes), node_ip + "/32"])),
@@ -504,7 +505,7 @@ def expand_defaults(value, variables):
 
 def automatic_settings(config, node_ip, python, config_dir):
     variables = deployment_variables(config, node_ip, python, config_dir)
-    return network_settings(expand_defaults(read_yaml(DEFAULTS / "settings.yaml"), variables), variables)
+    return network_settings(application_settings(variables), variables)
 
 
 def network_settings(settings, variables):
@@ -545,19 +546,26 @@ def read_environment(path):
     return values
 
 
-def normalize_tool_inputs(settings):
+def application_module():
     spec = importlib.util.spec_from_file_location("agentos_application_inputs", Path(__file__).with_name("configure.py"))
     application = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(application)
-    return application.normalize_tool_inputs(settings)
+    return application
+
+
+def normalize_tool_inputs(settings):
+    return application_module().normalize_tool_inputs(settings)
+
+
+def application_settings(variables):
+    return application_module().resolve_settings({}, variables)
 
 
 def load_settings(environment_file=None):
     path = environment_file or Path(os.environ.get("ADX_CONFIG_DIR", "/opt/adx/config")) / "deployment.env"
-    variables = {"ADX_LOCAL_IMAGE_BINDINGS_FILE": str(Path(path).parent / "local-images.json"),
-                 **read_environment(path)}
-    settings = network_settings(expand_defaults(read_yaml(DEFAULTS / "settings.yaml"), variables), variables)
-    return normalize_tool_inputs(settings)
+    variables = read_environment(path)
+    variables.setdefault("ADX_CONFIG_DIR", str(Path(path).parent))
+    return network_settings(application_settings(variables), variables)
 
 
 def write_environment(path, variables):
@@ -673,7 +681,7 @@ def system_ca_file(exclude=None):
 def prepare_environment(config_path, output, node_ip, python, config_dir, *, sandbox_bridge, redis_host=None):
     config = read_yaml(config_path)
     values = deployment_variables(config, node_ip, python, config_dir)
-    settings = normalize_tool_inputs(expand_defaults(read_yaml(DEFAULTS / "settings.yaml"), values))
+    settings = application_settings(values)
     if not Path(settings["token_file"]).is_file():
         raise ValueError("business credential is missing; run Master up and verify the deployment SSH connection")
     context = deployment_node_context(Path(values["ADX_PACKAGE_DIR"]), settings.get("network", {}), node_id=values.get("ADX_NODE_ID"))
@@ -962,7 +970,11 @@ def main():
     if args.action == "backend-enabled":
         if args.backend is None:
             parser.error("backend-enabled requires --backend")
-        print("enabled" if backend_enabled(read_yaml(DEFAULTS / "settings.yaml"), args.backend) else "disabled")
+        variables = dict(os.environ)
+        if args.environment_file.is_file():
+            variables.update(read_environment(args.environment_file))
+        variables.setdefault("ADX_CONFIG_DIR", str(args.config_dir))
+        print("enabled" if backend_enabled(application_settings(variables), args.backend) else "disabled")
         return
     if args.action == "ingress-cert-loaded":
         if not args.node_ip:

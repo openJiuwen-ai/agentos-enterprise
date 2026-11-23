@@ -6,9 +6,9 @@ BUSINESS_PYTHON="${SWARM_PYTHON:-python3.11}"
 SERVICE_SETTINGS="${SCRIPT_DIR}/../agent-runtime/configure.py"
 
 swarm_service() {
-    local -a args=(--settings "${SWARM_SETTINGS}")
+    local -a args=("$@")
     [ -z "${SWARM_BINDINGS:-}" ] || args+=(--bindings "${SWARM_BINDINGS}")
-    "${BUSINESS_PYTHON}" "${SERVICE_SETTINGS}" "$@" "${args[@]}"
+    "${BUSINESS_PYTHON}" "${SERVICE_SETTINGS}" "${args[@]}"
 }
 
 get_local_ip() { echo "${BIND_IP:-127.0.0.1}"; }

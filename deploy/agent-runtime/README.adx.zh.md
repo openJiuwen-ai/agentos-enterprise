@@ -1,13 +1,29 @@
 # AgentOS 的 ADX 运行时部署
 
 AgentOS 默认使用 Python Gateway、Jiuwenbox/Supervisor AgentServer 和 runsc 工具沙箱。
-AgentServer、工具运行时分别由 `defaults/settings.yaml::runtime.agent_runtime/tool_runtime`
-选择；切换后端时需同时选择该后端支持的镜像或已注册绑定。
+AgentServer 默认使用 Supervisor；工具后端沿用
+`deploy/jiuwenswarm/.env.custom` 的 `TOOL_SANDBOX_EXECUTOR`（runsc/conch；历史 docker 映射 runsc）。
+切换后端时需同时选择该后端支持的镜像或已注册绑定。
 ADX 通用组件的旧配置默认行为保持不变，本目录显式生成 AgentOS 所需策略。
 
 Gateway 的 WebChannel 默认监听 `0.0.0.0:19000`，支持远程客户端直连；
 Web 前端默认监听 `0.0.0.0:5173`，同机代理仍连接 `127.0.0.1:19000`。
-监听地址和端口由 `defaults/settings.yaml` 的 gateway 段配置。
+监听地址和端口沿用 `.env.custom` 的 `GATEWAY_HOST/PORT`、`WEB_HOST/PORT`、
+`WEB_STATIC_HOST/PORT`；`FRONTEND_HOST/PORT` 作为静态 Web 的历史别名继续接受。
+
+部署输入由 `deploy/jiuwenswarm/.env.custom` 和已安装的 `.env` 提供。
+Python 继续使用 `PYTHON_VERSION`（兼容旧 `YR_PYTHON_VERSION`）；
+工具开关、镜像、资源及身份分别使用 `TOOL_SANDBOX_ENABLE/IMAGE/CPU/MEMORY/IDLE_TIMEOUT/USER/GROUP`。
+AgentServer 资源使用 `AGENTOS_BUILTIN_AGENT_CPU/MEMORY`。命令行显式指定的解释器仍可用
+`ADX_BUSINESS_PYTHON` 覆盖。节点入口、Python 挂载、凭据路径与镜像目录由部署上下文生成。
+workspace 根目录与运行账号沿用 Workspace 组件的 `WORKSPACE_ACCESS_ROOT/WORKSPACE_USER`。
+
+业务参数优先级为：非空 `.env.custom` > 已安装 `.env` > 部署默认值。
+安装时将本次安装包的 deploy 目录复制到 `~/.agentos/deploy`，替换原部署目录。
+`.env.custom` 中填写的默认值或用户修改值优先，留空项再回退到已安装 `.env`。
+已有用户 workspace 配置仍按原迁移规则处理。
+解析结果由镜像准备和应用配置生成共同使用；修改这些部署输入后需要重新部署，
+已经运行的服务和 Environment 不会因文件修改自动改变参数。
 
 ## 发布包与安装
 
@@ -25,11 +41,11 @@ A4P 及其依赖由服务端包 `wheels/a4p/` 交付，其他依赖按发布包�
 版本目录。宿主 `agentos` UID/GID 写入 OCI 配置，需与 workspace 属主相符。
 默认 Supervisor AgentServer 使用节点上登记的 `agentos-supervisor:v1` 启动绑定，
 由目标节点提供启动器和本节点工具入口；该名称不触发 OCI 镜像拉取。
-默认工具沙箱镜像固定为
-`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`。
+默认工具沙箱镜像为
+`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`，可通过 `.env.custom` 的
+`TOOL_SANDBOX_IMAGE` 选择部署镜像。
 `up` 先加载固定离线 tar，再检查本地镜像，缺失时始终执行 `docker pull`，
 最后导出为 sandboxd 可用的 Local rootfs；因此默认部署需要 Docker。
-显式选择 `runtime.agent_runtime: runsc` 时，仍生成内置 AgentServer 的 Python 挂载和显式启动命令。
 Docker 缓存不等于 sandboxd 镜像缓存。
 
 各节点使用安装后的 `~/.agentos/deploy/config.yaml`，填写现有集群节点/VIP 字段。
@@ -77,8 +93,8 @@ sandboxd 主日志写入 `${ADX_LOG_DIR_PREFIX}/sandboxd.log`，默认是 `/var/
 
 ## 地址、监听与网络策略
 
-运行策略以包内 `agent-runtime/defaults/` 为源：`coordinator.yaml`、`node.yaml`、
-`ingress.yaml` 和 `settings.yaml`。部署产生 `/opt/adx/config/deployment.env`（0600），
+ADX 原生模板位于包内 `agent-runtime/defaults/`：`coordinator.yaml`、`node.yaml`、
+`ingress.yaml`。节点地址、运行目录、挂载和策略默认值由部署上下文生成。部署产生 `/opt/adx/config/deployment.env`（0600），
 由 ADX 展开为组件配置；这些绑定不属于另一套用户配置。无需在集群 YAML 增加 adx 段。
 
 | 入口 | 默认监听 | 调用者 |
@@ -89,7 +105,7 @@ sandboxd 主日志写入 `${ADX_LOG_DIR_PREFIX}/sandboxd.log`，默认是 `/var/
 | sandboxd | AgentOS 专用 Unix socket；健康端口仅回环 | adxlet |
 | RPC/Relay | 集群配置中的物理节点 IP | 集群组件 |
 
-`settings.yaml::network` 配置端口。网桥地址、网段和 Relay 的沙箱目标 CIDR 由现有 sandboxd TOML 的
+网桥服务沿用上表默认端口。网桥地址、网段和 Relay 的沙箱目标 CIDR 由现有 sandboxd TOML 的
 `plugin.network.ip_range` 派生，不另维护节点沙箱地址表。
 首次安装沿用 ADX 发布包 `etc/examples/sandboxd/sandboxd.toml` 中的地址池；已有安装保留
 `/etc/agentos/sandboxd/sandboxd.toml` 的 `plugin.network.ip_range`。自定义网段在该配置文件中设置，
@@ -101,31 +117,33 @@ AgentOS 启用 sandboxd iptables ACL、关闭 local OUTPUT DNAT，不下发宿�
 保留出站 SNAT。网络过滤由 sandboxd 管理，部署需要 root、iptables/ip6tables、
 ipset、桥接过滤及可用 runsc。
 
-在 `/root/.agentos/deploy/agent-runtime/defaults/settings.yaml` 分别配置托管 runsc 的
-AgentServer 与工具出网档位，两个字段未指定时均为 N2：
+在 `/root/.agentos/deploy/jiuwenswarm/.env.custom` 分别配置托管 runsc 的
+AgentServer 与工具出网档位，未指定时均为 N2。额外白名单是 HTTP(S) URL 的 JSON 数组：
 
-```yaml
-network:
-  agent_profile: N2
-  tool_profile: N2
-  allowed_internal_origins: []
-  tool_origins: []
+```bash
+AGENTOS_AGENT_NETWORK_PROFILE="N2"
+TOOL_SANDBOX_NETWORK_PROFILE="N2"
+AGENTOS_ALLOWED_INTERNAL_ORIGINS='[]'
+TOOL_SANDBOX_ALLOWED_ORIGINS='[]'
 ```
+
+例如内网模型额外授权可填写 `AGENTOS_ALLOWED_INTERNAL_ORIGINS='["https://model.example.invalid:8443"]'`。
+模型地址仍从当前用户 workspace 自动发现；列表授权其内网访问，不保存模型凭据。
 
 | 档位 | 业务出网 | DNS |
 |---|---|---|
 | N0 | 禁止；AgentServer 保留同节点 ADX 入口 | 默认拒绝 |
-| N1 | AgentServer 允许当前 workspace 的模型；工具允许 tool_origins | 只允许相应域名 |
+| N1 | AgentServer 允许当前 workspace 的模型；工具允许 TOOL_SANDBOX_ALLOWED_ORIGINS | 只允许相应域名 |
 | N2 | 允许公网 IPv4；非公网地址、集群节点及入口 VIP 默认拒绝 | 默认允许 |
 
 三个档位均保留 ADX 必需控制通道，业务入站默认拒绝。N1/N2 的内网模型仍须显式列入
-`network.allowed_internal_origins`；`network.tool_origins` 可授权工具访问确切目标及端口。
-集群地址从 config.yaml 派生，包含使用公网 IP 的节点；可用 `network.blocked_cidrs` 追加 IPv4 CIDR。
+`AGENTOS_ALLOWED_INTERNAL_ORIGINS`；`TOOL_SANDBOX_ALLOWED_ORIGINS` 可授权工具访问确切目标及端口。
+集群阻断地址从 config.yaml 派生，包含使用公网 IP 的节点。
 现有 IPv4 ACL 后端不提供公网 IPv6 档位，IPv6 应保持后端的拒绝策略。
 
 重复 up 会重新生成 Gateway 的部署配置，AgentServer 的网络策略在后续连接时刷新。
 工具默认值在创建 AgentServer 时注入，变更工具档位后应重建对应 AgentServer；workspace 和会话保留。
-历史 workspace 中显式的 sandbox.network 和部署 runtime.tool_network 继续优先于工具默认档位，
+历史 workspace 中显式的 sandbox.network 继续优先于工具默认档位，
 不会将已有拒绝规则自动放宽。档位是策略预设，不替代 API 调用者授权。
 
 默认 Supervisor AgentServer 沿用 Jiuwenbox 原生网络策略；上述 N0/N1/N2 预设仅应用于
@@ -134,21 +152,21 @@ runsc 路径，不将 Supervisor 原生策略标记为等价 N2。Supervisor 的
 
 ### 工具运行时与历史镜像
 
-`runtime.tool_runtime` 选择新用户默认运行时，默认 runsc。
+`TOOL_SANDBOX_EXECUTOR` 选择新用户默认运行时，默认 runsc；可用后端从部署模块推导。
 
-默认工具镜像固定为 `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`。
+`TOOL_SANDBOX_IMAGE` 选择部署默认工具镜像，默认值为
+`swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`。
 离线 tar 固定为 `/root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar`。
 `up` 时如果 tar 存在会先 `docker load`（失败仅告警并继续），随后检查本地镜像；
 本地没有时执行 `docker pull`，pull 失败则中止部署。
 
-Docker executor 使用 runsc。发布包安装时可在 `runtime.local_images` 按镜像引用配置
-`archive: /absolute/path/image.tar`；准备过程先检查本地 Docker store，缺失时执行 `docker image load`，
-随后用 `docker create --pull=never --network none` 和 export 构建 Local rootfs。
+Docker executor 使用 runsc。离线用户镜像先通过 `docker load -i <archive.tar>` 导入本节点 Docker store；
+准备过程用 `docker create --pull=never --network none` 和 export 构建 Local rootfs。
 准备结果包含实际 Local 路径、镜像环境和启动信息，由 Gateway/Core 直接构造创建参数。
 缺失本地镜像/归档时明确报错，不执行 registry pull。已准备的 rootfs 可在 Docker 不可用时复用。
 部署准备会读取 Workspace API 的运维列表，包含未激活的 autofs 用户键；用户 YAML 和原模板不重写。
 
-`network.ingress_policy_peer` 是流量策略中的逻辑 peer，Enterprise 将其映射到各节点
+`agentos-ingress.node.invalid` 是流量策略中的逻辑 peer，Enterprise 将其映射到各节点
 当前网桥 CIDR。恢复仍保留逻辑 peer，由目标节点解析；实际 SDK 地址从只读
 `/run/agentos/node.json` 读取。Core 获取工具环境时重新读取 `ingress_url/node_id`，
 节点变化会建立新的连接作用域。缺失或不一致的节点上下文明确报错。
@@ -204,23 +222,26 @@ workspace 在宿主挂载 NFS/autofs，再通过 ADX Local bind 挂入；
 假设。工具沙箱默认空闲 600 秒后回收，后续调用可重建。Team 的共享 SQLite 参数继续保留。
 
 runsc 的 Execd 检查点控制 socket 使用可写的 `/tmp/adx`。默认保留节点本地 checkpoint
-目录；跨节点恢复需另准备所有执行节点可访问的共享 checkpoint store，放在用户挂载之外：
+目录；跨节点恢复需另准备所有执行节点可访问的共享 checkpoint store，放在用户挂载之外。
+共享存储使用 ADX 原生配置：在 `defaults/node.yaml` 的 adxlet 配置中设置
+`checkpoint_dir: null` 和 `checkpoint_storage`，例如：
 
 ```yaml
-runtime:
-  checkpoint_storage:
-    kind: distributed_fs
-    alias: shared-checkpoints
-    mount_root: /mnt/agentos-checkpoints
-    prefix: agentos
+checkpoint_dir: null
+checkpoint_storage:
+  kind: distributed_fs
+  alias: shared-checkpoints
+  mount_root: /mnt/agentos-checkpoints
+  prefix: agentos
 ```
 
-该字段直接传递 ADX 原生存储配置，并替换互斥的本地 checkpoint_dir；Coordinator 同时配置相同共享存储的回收器。安装器不会将
-普通目录当成共享挂载。restore 重新准备挂载，AgentServer 的节点上下文也来自目标节点。
-workspace 的 autofs 配置保留所属节点本地 bind、远端节点 NFS 的访问方式。
-`runtime.workspace_mount_options: [rw, disable_file_handle_sharing]` 显式传给内置
-runsc AgentServer 的 workspace 挂载。ADXlet 在目标节点临时归一化该选项，避免
-runsc 对 NFS/FUSE 自动追加后与本地选项不一致；未声明选项的挂载和其他运行时不变。
+同时在 `defaults/coordinator.yaml` 的 Coordinator 配置中为同一存储设置
+`checkpoint_reclaimers`。安装器不会将普通目录当成共享挂载。restore 重新准备挂载，
+AgentServer 的节点上下文也来自目标节点。workspace 的 autofs 配置保留所属节点本地 bind、
+远端节点 NFS 的访问方式。
+部署默认将 `[rw, disable_file_handle_sharing]` 传给内置 runsc AgentServer 的 workspace 挂载。
+ADXlet 在目标节点临时归一化该选项，避免 runsc 对 NFS/FUSE 自动追加后与本地选项不一致；
+未声明选项的挂载和其他运行时不变。
 此功能需要配套支持该选项的 ADX 和 Swarm 发布件。共享存储的可用性仍由部署方保障。
 
 配置更新不会自动替换正在使用的旧 autofs 叶子挂载。切换旧 NFS 视图前须停止引用该
@@ -231,37 +252,25 @@ runsc 对 NFS/FUSE 自动追加后与本地选项不一致；未声明选项的�
 
 ## 离线 Docker 镜像与 Local rootfs
 
-`runtime.agent_image` 默认为空；`runtime.tool_image` 默认按架构指向部署自有工具镜像，并会在
+`TOOL_SANDBOX_IMAGE` 选择部署工具镜像，并会在
 `up` 时执行 load → inspect → pull → export。Agent/用户镜像仍只使用本地已有内容，绝不 pull。
 历史用户的 `sandbox.image` 保留。`agentos.sh up` 会读取 Gateway 和用户 YAML 中的镜像引用，
 并在部署节点将本地 Docker 镜像转换成独立的 Local rootfs 制品；转换时只创建未启动的临时
 容器（`docker create --pull=never`），导出后回收临时容器及其匿名卷，不启动镜像中的程序。
-默认部署需要 Docker 来完成工具镜像准备；仅当显式清空 `runtime.tool_image` 且不配置
-`local_images` 时才不需要 Docker。
+默认部署需要 Docker 来完成工具镜像准备。默认工具离线包位于
+`/root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar`；其他离线镜像请先在各节点
+执行 `docker load -i <archive.tar>`。
 
-如镜像尚未 `docker load`，在 `deploy/agent-runtime/defaults/settings.yaml` 的 runtime 下指定离线包：
-
-```yaml
-runtime:
-  agent_runtime: supervisor
-  tool_runtime: runsc
-  local_images:
-    ubuntu:24.04:
-      archive: /root/resources/images/ubuntu-24.04.tar
-```
-
-未指定 archive 时，优先使用本节点 Docker 镜像库中的对应引用；Agent/用户镜像缺失时明确报错、
+优先使用本节点 Docker 镜像库中的对应引用；Agent/用户镜像缺失时明确报错，
 不执行 pull，部署自有的工具镜像缺失时始终允许 `docker pull`。
 请在各部署节点准备同一架构、同一内容的镜像或离线包。镜像通过不可变 image ID 存放于
 `/var/lib/agentos/local-images/objects/local-<digest>`，
 保存文件系统及 Env、Entrypoint、Cmd、WorkingDir、User。每份制品内容固定；
 同名 tag 指向新的本地镜像时，会生成新制品并更新引用映射，保留旧制品及登记。
 已登记的制品在 Docker 镜像被清理或 Docker 不可用后仍可复用，供运行中沙箱及 checkpoint 使用。
-若需指定存储根目录，使用
-`runtime.local_image_root`，各节点路径须一致。重复 up 复用已完成的制品，不覆盖现存根目录。
-启用 runsc 时，部署默认将 `<local_image_root>/objects` 写入 ADX API Server 的父目录白名单。
-可用 `runtime.allowed_local_rootfs_dirs` 指定受部署方控制的绝对目录列表，填 `[]` 则关闭显式
-Local rootfs 创建。三方制品也需准备到白名单目录下。
+各节点使用相同的制品路径。重复 up 复用已完成的制品，不覆盖现存根目录。
+启用 runsc 时，部署从制品根目录推导 ADX API Server 的父目录白名单，默认为
+`/var/lib/agentos/local-images/objects`。三方制品也需准备到该受控目录下。
 
 部署将准备结果写入私有 `local-images.json`；`ADX_LOCAL_IMAGE_BINDINGS_FILE` 仅保存该文件路径。
 工作区工具配置保存 Local 路径及环境变量，由 Core 的原有 provider 传给 SDK `LocalRootfs`。

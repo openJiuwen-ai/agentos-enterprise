@@ -117,12 +117,17 @@ class InstallTests(unittest.TestCase):
 
 
     def install_from_module(self, package, python):
+        # The fallback checks the release's exact Core version, independent of
+        # the checkout's evolving requirements and the wheels built above.
+        deploy = self.root / "deploy"
+        deploy.mkdir(exist_ok=True)
+        (deploy / "requirements.txt").write_text("openjiuwen==0.1.20.dev1\n")
         runner = self.root / "install-python"
         runner.write_text('#!/bin/sh\nif [ "$2" = components ]; then exit 0; fi\nexec ' + shlex.quote(str(python)) + ' "$@"\n')
         runner.chmod(0o755)
         script = INSTALL_ENTRY + '\nerror() { echo "$*" >&2; exit 1; }; jiuwenswarm_install'
         subprocess.run(["bash", "-c", script], check=True,
-                       env=dict(os.environ, SCRIPT_DIR=str(ROOT / "deploy"), AGENTOS_ROOT=str(package),
+                       env=dict(os.environ, SCRIPT_DIR=str(deploy), AGENTOS_ROOT=str(package),
                                 ADX_BUSINESS_PYTHON=str(runner)))
 
 
