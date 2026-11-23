@@ -2,6 +2,7 @@
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -253,6 +254,17 @@ class LocalImageTests(unittest.TestCase):
                 self.assertEqual(result["images"], {})
                 self.assertIn(reference, result["legacy_conch_default_images"])
                 self.assertEqual(config.read_bytes(), original)
+
+    def test_disabled_conch_prepares_only_the_deployment_default_image(self):
+        sources = ({"type": "yuanrong", "executor": "conch", "image": "custom:old"},
+                   {"type": "jiuwenbox-conch", "template_name": "custom:old"},
+                   {"type": "adx-environment", "runtime": "conch", "image": "custom:old"})
+        for sandbox in sources:
+            with self.subTest(sandbox=sandbox), patch.dict(os.environ, {"AGENTOS_CONCH_MODULE": "0"}):
+                _, settings = self.historical_settings(sandbox)
+                settings["runtime"]["tool_image"] = "deployment:tools"
+                self.assertEqual(images.requested_images(settings), {"deployment:tools": {}})
+                self.assertEqual(images.requested_conch_images(settings), {})
 
     def test_same_reference_with_docker_or_legacy_missing_executor_is_not_replaced(self):
         reference = images.LEGACY_CONCH_DEFAULT_IMAGES[0]

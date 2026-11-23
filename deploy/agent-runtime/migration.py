@@ -80,6 +80,21 @@ def tool_image_source(sandbox: dict, environment: dict | None = None) -> dict:
     return result
 
 
+def default_runsc_source(sandbox: dict, image: str | None) -> dict:
+    """Replace Conch launch inputs with the deployment's prepared runsc image."""
+    result = copy.deepcopy(sandbox)
+    for key in ('executor', 'template_name', 'conch', 'conch_sdk_config',
+                'image', 'rootfs', 'image_env', 'prepared_image'):
+        result.pop(key, None)
+    for key in ('cpu', 'cpu_limit', 'memory', 'mem_limit'):
+        if result.get(key) is None:
+            result.pop(key, None)
+    result.update(type='adx-environment', runtime='runsc')
+    if image:
+        result['image'] = image
+    return result
+
+
 def legacy_tool_image(sandbox: dict, default_conch_images=()) -> str | None:
     """Return a Docker reference or None for the current deployment default.
 

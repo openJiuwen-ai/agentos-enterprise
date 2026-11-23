@@ -361,7 +361,8 @@ def local_image_bindings(runtime):
     return bindings
 
 
-def gateway_config(config, settings, environment=None, *, deployment_owned=False, migration_defaults=None):
+def gateway_config(config, settings, environment=None, *, deployment_owned=False, migration_defaults=None,
+                   source_sandbox=None):
     config = copy.deepcopy(config)
     migration = migration_module()
     values = {}
@@ -373,9 +374,10 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
     config["sandbox"] = migration.tool_image_source(config.get("sandbox") or {}, values)
     runtime = settings["runtime"]
     conch_enabled = conch_module_enabled()
-    if (migration_defaults is not None and not conch_enabled
-            and migration.tool_source_runtime(config["sandbox"], runtime.get("tool_runtime", "runsc")) == "conch"):
-        return None
+    conch_source = (
+        migration.tool_source_runtime(config["sandbox"], runtime.get("tool_runtime", "runsc")) == "conch"
+        or (values.get("TOOL_SANDBOX_EXECUTOR") or "").strip().lower() == "conch"
+    )
     network = settings.get("network", {})
     from jiuwenswarm.extensions.agentos.agentos_router.adx.network import network_profile
     from jiuwenswarm.extensions.agentos.agentos_router.adx.config import DEFAULT_RESTART_POLICY, normalize_restart_policy
@@ -394,11 +396,16 @@ def gateway_config(config, settings, environment=None, *, deployment_owned=False
             tool_runtimes.append("runsc")
             fallback = True
         tool_runtimes = [value for value in tool_runtimes if value != "conch"]
-        if deployment_owned and fallback:
-            sandbox = config["sandbox"]
-            for key in ("executor", "template_name", "conch", "image", "rootfs", "image_env", "prepared_image"):
-                sandbox.pop(key, None)
-            sandbox.update(type="adx-environment", runtime="runsc")
+        if conch_source or deployment_owned and fallback:
+            if source_sandbox is not None:
+                retained = migration.tool_image_source(source_sandbox, values)
+                for key in ('cpu', 'cpu_limit', 'memory', 'mem_limit'):
+                    if key in retained:
+                        config['sandbox'][key] = retained[key]
+            config["sandbox"] = migration.default_runsc_source(config["sandbox"], runtime.get("tool_image"))
+            if migration_defaults is not None:
+                migration_defaults['_conch_to_runsc'] = True
+            logging.warning("Migrating historical Conch tools to runsc with the deployment default image")
     gateway = config.setdefault("gateway", {})
     gateway["agent_client"] = {"type": "agentos_router", "agent_namespace": settings["namespace"]}
     adx_options = gateway.get("adx") or {}
@@ -692,14 +699,14 @@ def validate_user_configs(settings, *, failures=None):
         if migration_module().configuration_file_available(user_config):
             try:
                 source = user_config.read_bytes()
-                document = migration_module().workspace_overrides(user_config, yaml.safe_load(source))
+                original = yaml.safe_load(source)
+                document = migration_module().workspace_overrides(user_config, original)
                 defaults = {}
                 env_file = user_config.with_name(".env")
-                updated = gateway_config(document, settings, env_file, migration_defaults=defaults)
-                if updated is None:
-                    logging.warning("Skipping workspace migration because Conch is unavailable: %s", user_config)
-                    continue
+                updated = gateway_config(document, settings, env_file, migration_defaults=defaults,
+                                         source_sandbox=original.get('sandbox') or {})
                 updated = migrate_tool_environment(updated, env_file)
+                updated['_adx_conch_to_runsc'] = defaults.pop('_conch_to_runsc', False)
                 seed = {'type': 'adx-environment', 'runtime': updated['sandbox']['runtime']}
                 updated['_adx_deployment_defaults'] = migration_module().workspace_sandbox(
                     migration_module().migrate_adx_sandbox(seed, defaults))
@@ -834,7 +841,8 @@ def configure(settings):
                 owner = user_config.stat()
                 template_dir = os.environ.get('AGENTOS_SWARM_TEMPLATE_DIR') or data_directory(settings)
                 initialize(user_config.parents[2], template_dir, owner.st_uid, owner.st_gid)
-            update_environment(user_config.with_name('.env'), settings, user_config.stat())
+            update_environment(user_config.with_name('.env'), settings, user_config.stat(),
+                               migrated_conch=updated.get('_adx_conch_to_runsc', False))
             user_config.with_name(MIGRATION_ERROR_FILE).unlink(missing_ok=True)
         except (ValueError, OSError, portalocker.exceptions.LockException) as exc:
             failures[user_config] = str(exc) if isinstance(exc, ValueError) else 'cannot update workspace configuration'
@@ -847,7 +855,7 @@ def configure(settings):
     return env_file
 
 
-def update_environment(path, settings, owner=None, *, service=False):
+def update_environment(path, settings, owner=None, *, service=False, migrated_conch=False):
     from dotenv import dotenv_values, set_key, unset_key
     if not path.exists():
         write_private(path, "")
@@ -858,6 +866,10 @@ def update_environment(path, settings, owner=None, *, service=False):
     existing = dotenv_values(path, interpolate=False)
     token = Path(settings["token_file"]).read_text().strip()
     values = {}
+    if migrated_conch:
+        for name in ('TOOL_SANDBOX_TYPE', 'TOOL_SANDBOX_EXECUTOR', 'TOOL_SANDBOX_IMAGE'):
+            if name in existing:
+                unset_key(str(path), name)
     if service and settings.get("profile", "standalone") == "agentos":
         retired = {*_AGENTOS_ENV_CLEANUP, "JIUWENSWARM_ADX_NODE_INGRESS_URL", "ADX_TOKEN"}
         values.update({key: value for key, value in business_environment(settings).items()

@@ -259,6 +259,10 @@ def image_sources(settings, *, include_users=True):
             values = dotenv_values(environment, interpolate=False) if environment.is_file() else {}
             source = migration.tool_image_source(document.get('sandbox') or {}, values)
             backend = migration.tool_source_runtime(source, settings.get('runtime', {}).get('tool_runtime', 'runsc'))
+            conch_source = backend == 'conch' or (values.get('TOOL_SANDBOX_EXECUTOR') or '').strip().lower() == 'conch'
+            if not conch_module_enabled() and conch_source:
+                source = migration.default_runsc_source(source, settings.get('runtime', {}).get('tool_image'))
+                backend = 'runsc'
             image = (source.get('template_name') if source.get('type') == 'jiuwenbox-conch' else source.get('image')) if backend == 'conch' else migration.legacy_tool_image(source, LEGACY_CONCH_DEFAULT_IMAGES)
         except (ValueError, TypeError, OSError, yaml.YAMLError) as exc:
             if path == gateway:
