@@ -92,4 +92,4 @@ bash deploy/agentos.sh deinit      # on every etcd node
 bash deploy/agentos.sh uninstall   # on every node; must use the same python3.11 env as install
 ```
 
-For field descriptions, MooseFS shared storage, and per-module configuration, see the [Deployment Guide](../../../deploy/README.zh.md).
+For field descriptions and per-module configuration, see the [Deployment Guide](../../../deploy/README.zh.md).

@@ -16,7 +16,7 @@
 | Python | 3.11（`python3.11 --version` 可用） |
 | 磁盘 | ≥ 20 GB |
 
-> 完整环境要求（含 Docker、MooseFS 等可选项）见[仓库 README](../../../README.zh.md)。
+> 完整环境要求（含 Docker 等可选项）见[仓库 README](../../../README.zh.md)。
 
 ## 第 1 步：获取安装包
 
@@ -35,7 +35,7 @@ tar -xzf AgentOS-Server.tgz && cd AgentOS-Server
 bash deploy/install_deps.sh
 ```
 
-`install_deps.sh` 安装 python3.11、iproute、iptables、curl、fuse3、bwrap、jq、MooseFS RPM 及 Python 依赖。已预装部分依赖时，可用 `--skip-system` / `--skip-moosefs` / `--skip-python` 跳过对应部分。
+`install_deps.sh` 安装 python3.11、iproute、iptables、curl、fuse3、bwrap、jq 及 Python 依赖。已预装部分依赖时，可用 `--skip-system` / `--skip-python` 跳过对应部分。
 
 ## 第 3 步：配置集群拓扑（单机）
 
@@ -71,7 +71,7 @@ bash deploy/agentos.sh init       # 启动 etcd（保留已有数据，平滑升
 bash deploy/agentos.sh up         # 按顺序部署全部应用组件
 ```
 
-`up` 按声明顺序拉起 moosefs（单机自动跳过）、jiuwenbox、agent-runtime、agent-gateway、jiuwenswarm，首次启动耗时数分钟。
+`up` 按声明顺序拉起 jiuwenbox、agent-runtime、agent-gateway、jiuwenswarm，首次启动耗时数分钟。
 
 ## 第 6 步：验证
 

@@ -1,6 +1,6 @@
 # agentos Command Reference
 
-`deploy/agentos.sh` is the unified deployment entry point; it orchestrates components in the order declared by the `MODULES` array. Currently registered modules: `moosefs`, `jiuwenbox`, `yuanrong`, `agent-gateway`, `jiuwenswarm` (`deploy/conch/` also provides the Conch sandbox module hooks; when not listed in `MODULES` it does not participate in scheduling).
+`deploy/agentos.sh` is the unified deployment entry point; it orchestrates components in the order declared by the `MODULES` array. Currently registered modules: `etcd`, `workspace-storage` / `afs` (one storage backend), `jiuwenbox`, `agent-runtime`, `redis`, `agent-gateway`, `jiuwenswarm`.
 
 ## Lifecycle
 
@@ -35,7 +35,7 @@ bash deploy/agentos.sh <COMMAND> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ip IP` | Local IP to use (required on multi-NIC machines). All sub-components (yuanrong / moosefs / conch / jiuwenbox / gateway / jiuwenswarm / etcd) use this IP uniformly for local-ip detection; it must be an IP actually held by this host. May be placed before or after the command |
+| `--ip IP` | Local IP to use (required on multi-NIC machines). All sub-components (agent-runtime / jiuwenbox / gateway / jiuwenswarm / etcd) use this IP uniformly for local-ip detection; it must be an IP actually held by this host. May be placed before or after the command |
 | `-h`, `--help` | Show help |
 
 ## Common environment variables

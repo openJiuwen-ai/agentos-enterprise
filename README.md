@@ -2,13 +2,13 @@
 
 English | [简体中文](README.zh.md)
 
-AgentOS is a one-stop integration and delivery repository for the openJiuwen agent infrastructure: it aggregates the agent-runtime distributed runtime, the jiuwenswarm gateway and clients, the gVisor (runsc) tool sandbox and the A2X registry (Conch source is retained; runtime artifacts are excluded from the server package and it is not deployed by default) via Git submodules, and provides unified build and one-command cluster deployment.
+AgentOS is a one-stop integration and delivery repository for the openJiuwen agent infrastructure: it aggregates the agent-runtime distributed runtime, the jiuwenswarm gateway and clients, the gVisor (runsc) tool sandbox and the A2X registry via Git submodules, and provides unified build and one-command cluster deployment.
 
 ## Core Features
 
-- **Layered & Decoupled Architecture**: AgentOS consists of four major components — agent-runtime (Distributed Agent Runtime), [jiuwenswarm] (Work/Coding Agents), gVisor/runsc (Agent Sandbox; Conch source retained, runtime artifacts excluded from the server package, not deployed by default), and agent-protocol (Agent Access Gateway).
+- **Layered & Decoupled Architecture**: AgentOS consists of four major components — agent-runtime (Distributed Agent Runtime), [jiuwenswarm] (Work/Coding Agents), gVisor/runsc (Agent Sandbox), and agent-protocol (Agent Access Gateway).
 - **One-command build**: `build/build.sh` supports `daily` / `release` modes and produces the distributable `AgentOS-Client.tgz` (all-platform TUI client) and `AgentOS-Server-<arch>.tgz` (server) packages.
-- **Modular deployment**: `deploy/agentos.sh` orchestrates five modules — moosefs, jiuwenbox, agent-runtime, agent-gateway, and jiuwenswarm — via pluggable hooks; adding a module only requires implementing its hook functions, with no changes to the scheduling engine.
+- **Modular deployment**: `deploy/agentos.sh` orchestrates the etcd, workspace-storage (or afs), jiuwenbox, agent-runtime, redis, agent-gateway, and jiuwenswarm modules via pluggable hooks; adding a module only requires implementing its hook functions, with no changes to the scheduling engine.
 - **Single-machine and cluster modes**: single-machine deployment works out of the box; multi-machine clusters declare etcd nodes, master nodes, and an ingress VIP in `deploy/config.yaml` with high availability.
 - **Full lifecycle management**: `install → init → up → down → deinit → uninstall` covers the whole install / start-stop / teardown flow, and `status` probes the running state of every component read-only.
 
@@ -30,7 +30,6 @@ AgentOS is a one-stop integration and delivery repository for the openJiuwen age
 | Download tools | `curl` or `wget` (with access to Huawei Cloud OBS and gitcode.com) |
 | System commands | `bwrap`, `ip`, `iptables`, `jq`, `fuse3` (installable via `deploy/install_deps.sh`) |
 | Docker (optional) | Docker Engine ≥ 26.0 (Docker-type sandboxes require API v1.45) |
-| MooseFS (multi-machine) | 4.59.2 (master / chunkserver / client RPMs plus fuse3, pre-installed upstream) |
 
 ## Installation
 

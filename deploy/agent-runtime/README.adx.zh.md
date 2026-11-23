@@ -30,7 +30,7 @@ A4P 及其依赖由服务端包 `wheels/a4p/` 交付，其他依赖按发布包�
 `up` 先加载固定离线 tar，再检查本地镜像，缺失时始终执行 `docker pull`，
 最后导出为 sandboxd 可用的 Local rootfs；因此默认部署需要 Docker。
 显式选择 `runtime.agent_runtime: runsc` 时，仍生成内置 AgentServer 的 Python 挂载和显式启动命令。
-Docker/Conch 缓存不等于 sandboxd 镜像缓存。
+Docker 缓存不等于 sandboxd 镜像缓存。
 
 各节点使用安装后的 `~/.agentos/deploy/config.yaml`，填写现有集群节点/VIP 字段。
 本机物理地址必须与节点列表匹配。唯一节点同时承担控制面和执行面；多节点中 Master
@@ -127,8 +127,6 @@ network:
 工具默认值在创建 AgentServer 时注入，变更工具档位后应重建对应 AgentServer；workspace 和会话保留。
 历史 workspace 中显式的 sandbox.network 和部署 runtime.tool_network 继续优先于工具默认档位，
 不会将已有拒绝规则自动放宽。档位是策略预设，不替代 API 调用者授权。
-Conch 继续沿用原生策略，不将其标为等价的 N0/N1/N2。当前 Conch 仅有 IP/CIDR ACL，
-ADX 适配器不能表达 DNS 策略、入站控制端口例外及 runtime-control 精确出站例外，因而不能完整实现上述 N2。
 
 默认 Supervisor AgentServer 沿用 Jiuwenbox 原生网络策略；上述 N0/N1/N2 预设仅应用于
 runsc 路径，不将 Supervisor 原生策略标记为等价 N2。Supervisor 的出站 NAT 支持集群网卡
@@ -136,12 +134,7 @@ runsc 路径，不将 Supervisor 原生策略标记为等价 N2。Supervisor 的
 
 ### 工具运行时与历史镜像
 
-`runtime.tool_runtime` 选择新用户默认运行时，默认 runsc；`runtime.tool_runtimes: [runsc, conch]`。
-Conch 代码/配置保留，但默认 `MODULES` 不调度 conch，因此默认部署不安装/启动 conchd；
-AgentOS-Server 不包含 conch/stratovirt/virtiofsd/erofs-utils RPM 与根级 `oe2203*/erofs.ko`。
-需要部署 Conch 时，用 `AGENTOS_MODULES` 显式加入 `conch`。`agentos.sh` 由最终模块列表派生
-`AGENTOS_CONCH_MODULE`（内部变量，不是用户开关），ADX 配置据此自动裁剪/保留 conch class/socket；
-不含 conch 时启动路径不会连接 conchd。
+`runtime.tool_runtime` 选择新用户默认运行时，默认 runsc。
 
 默认工具镜像固定为 `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/tool-sandbox:latest`。
 离线 tar 固定为 `/root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar`。
@@ -196,8 +189,8 @@ Gateway 服务环境保存 `ADX_TOKEN`，AgentServer 创建时使用应用专用
 迁移只更新已有用户的工具配置段及相关环境变量，保留模型、IAM、会话、属主、权限和原始备份。
 不兼容配置只拦截对应用户沙箱，不阻断其他用户或整个节点。
 节点地址、协议、凭据、部署运行时以当前部署为准；保留业务、资源、工作目录及可转换挂载。
-旧 `agentos-tools:v1` Conch 绑定在 runsc 下跟随部署镜像；其他显式 OCI 镜像保留。
-不兼容身份、Conch 专属策略或不可转换安全规则在切换预检中报出，不静默删除。
+旧 `agentos-tools:v1` 引用在 runsc 下跟随部署镜像；其他显式 OCI 镜像保留。
+不兼容身份或不可转换安全规则在切换预检中报出，不静默删除。
 用户共享 `.env` 清理部署凭据和节点地址；旧资源环境覆盖值迁入 YAML，保留模型及业务变量。
 具体转换规则见本仓库 `deploy/jiuwenswarm/README.zh.md`。
 
@@ -206,7 +199,7 @@ Gateway 服务环境保存 `ADX_TOKEN`，AgentServer 创建时使用应用专用
 
 ## 持久数据与恢复
 
-workspace 在宿主挂载 NFS/autofs 或 MooseFS，再通过 ADX Local bind 挂入；
+workspace 在宿主挂载 NFS/autofs，再通过 ADX Local bind 挂入；
 挂载不可用时明确失败。会话、文件和数据库不随工具空闲回收删除；不增加独占 workspace
 假设。工具沙箱默认空闲 600 秒后回收，后续调用可重建。Team 的共享 SQLite 参数继续保留。
 
@@ -292,8 +285,8 @@ adx-environment 0.1.0rc10 或更新 SDK，重新打包后部署。
 仍可通过部署 `.env.custom` 或用户 `.env` 输入，部署不会删除这些运维输入。
 用户 `.env` 的显式值优先于该用户 YAML；用户 YAML 优先于部署默认值。
 部署 `.env.custom` 的非空值覆盖已安装服务 `.env` 的同名全局默认输入。
-TYPE/EXECUTOR 会转换为 ADX provider 与 runsc/Conch 选择；runsc 的 USER/GROUP
-必须符合部署运行身份，Conch 保留其原有身份约定。
+TYPE/EXECUTOR 会转换为 ADX provider 与 runsc 选择；runsc 的 USER/GROUP
+必须符合部署运行身份。
 
 镜像选择是部署期输入。`agentos.sh up` 的准备阶段使用同一次规范化输入，先准备镜像
 并发布 `path/env/process` 元数据，再生成应用配置。仅编辑 IMAGE 或重启 Gateway

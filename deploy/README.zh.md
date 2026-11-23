@@ -10,7 +10,6 @@ Python Gateway + Supervisor AgentServer + gVisor（runsc）工具沙箱接线、
 
 | 模块 | 说明 | 部署/安装内容 |
 | --- | --- | --- |
-| `moosefs` | 分布式共享存储 | MooseFS 集群（master + chunkserver + client），单机自动跳过 |
 | `jiuwenbox` | 沙箱服务 | 每台机器同构启动 jiuwenbox-server（随 jiuwenswarm whl 安装） |
 | `etcd` | etcd 独立二进制安装 | 从发布包内置压缩包安装 etcd 3.5.24，校验 SHA256、ELF 架构及版本；无需安装元戎 wheel |
 | `workspace-storage` | workspace 存储（autofs-nfs 后端） | NFS + autofs 共享挂载 + 每节点 agentos-workspace 服务（HTTP API / watchdog / autofs 缓存） |
@@ -30,11 +29,6 @@ deploy/
 ├── check-ingress-master.sh   # ingress VIP 持有检查（agent-gateway systemd ExecStartPre）
 ├── config.yaml               # 集群拓扑配置（cluster_nodes/etcd_nodes/master_nodes/ingress_virtual_ip）
 ├── README.zh.md                 # 本文档
-├── moosefs/
-│   ├── module.sh             # moosefs 钩子函数
-│   ├── moosefs_deploy.sh     # moosefs 部署脚本（install/up/down/uninstall）
-│   ├── moosefs.conf          # moosefs 配置文件
-│   └── README.zh.md             # moosefs RPM 依赖说明
 ├── jiuwenbox/
 │   ├── module.sh             # jiuwenbox 钩子
 │   ├── jiuwenbox_deploy.sh   # up/down/restart
@@ -72,7 +66,7 @@ deploy/
 
 核心机制：**模块注册 + 钩子函数 + 调度引擎**。
 
-1. **模块注册**：`agentos.sh` 按存储后端（`AGENTOS_STORAGE_BACKEND`，默认 `autofs-nfs`）动态选择模块数组及其部署顺序（两后端默认均不含可选的 `conch`，需要时经 `AGENTOS_MODULES` 显式加入）：
+1. **模块注册**：`agentos.sh` 按存储后端（`AGENTOS_STORAGE_BACKEND`，默认 `autofs-nfs`）动态选择模块数组及其部署顺序：
    - `autofs-nfs`（默认）：`MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")`
    - `afs`（须显式指定）：`MODULES=("etcd" "afs" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm")`（`afs` 顶替 `workspace-storage`；两后端互斥，切换流程见下文「afs」）
    其中 `etcd`、`redis` 为**仅安装型模块**（`INSTALL_ONLY_MODULES`）：只参与 `install`/`uninstall`，`up`/`down`/`restart`/`status` 不调度（服务生命周期由 `etcd.sh` / `redis.sh` 的 `init`/`deinit` 管理）。
@@ -104,11 +98,10 @@ install  ↔  uninstall     装/卸 whl（最外层）
 
 - **操作系统**：基于 openEuler 22.03-LTS-SP1/SP4 或 24.03-LTS-SP1/SP4（x86_64 和 aarch64），需支持 systemd
 - **Python**：目标主机需预装指定版本的 Python（默认 3.11）
-- **systemd**：etcd 和 agent-gateway 强依赖 systemd（`systemctl` 可用且 `/run/systemd/system` 存在）；moosefs 和 jiuwenswarm 自动检测
+- **systemd**：etcd 和 agent-gateway 强依赖 systemd（`systemctl` 可用且 `/run/systemd/system` 存在）；jiuwenswarm 自动检测
 - **多网卡环境**：多网卡服务器需通过 `--ip` 显式指定本机使用的 IP 地址，避免自动探测不准导致 down/up 的 IP 对不上
 - **系统命令**：目标主机需预装 jiuwenbox 所需的命令：`bwrap`、`ip`、`iptables`（或 `iptables-nft` / `iptables-legacy`）；agent-gateway 需 `curl`
 - **集群配置**：`deploy/config.yaml` 需按实际拓扑配置 `cluster_nodes`、`etcd_nodes`、`master_nodes`、`ingress_virtual_ip`。各字段均须为可达的真实 IP（单机也填本机局域网 IP），`cluster_nodes` 为集群全部节点列表（workspace 归属 HRW 候选集），`ingress_virtual_ip` 作为统一外部入口，**不要用 `127.0.0.1`**（会导致 web/gateway 只能本机访问），详见下文「集群配置」
-- **MooseFS RPM**：MooseFS RPM 包（moosefs-master、moosefs-chunkserver、moosefs-client）和 fuse3 依赖需由上游预装，详见 [moosefs/README.zh.md](moosefs/README.zh.md)
 - **Docker API**：运行 Docker 类型沙箱要求 Docker API 支持 `v1.45`。API 1.45 由 Docker Engine 26.0 引入，因此目标主机 Docker Engine 需 **≥ 26.0**；建议直装 **27.x ~ 28.x 稳定版**（如 27.5.1），最新 29.x 仍兼容（其最低支持 API 为 1.44），但 1.45 已处兼容窗口下沿。版本对照见 [Docker Engine API 文档](https://docs.docker.com/reference/api/engine/)
 
 ### runsc 网络配置
@@ -277,7 +270,7 @@ bash agentos.sh uninstall
 
 #### 数据迁移（migrate）
 
-> 升级工作流：`migrate`（数据迁移）→ `down`（含旧 MooseFS 拆旧）→ `uninstall` → `install` → `init` → `up`。
+> 升级工作流：`migrate`（数据迁移）→ `down` → `uninstall` → `install` → `init` → `up`。
 > `migrate` 必须在旧集群仍在运行、旧存储可读、etcd 可用时执行，且**先于 `down`**。
 
 数据迁移完成后，`agent-runtime` 使用已准备的 ADX 部署参数迁移应用配置。
@@ -340,28 +333,6 @@ bash etcd.sh clean-yr-data
 #### config.yaml（集群拓扑）
 
 配置文件：`deploy/config.yaml`。角色推导由 `scripts/config.py` 解析，支持 `local-ip`、`is-etcd-node`、`is-master-node`、`etcd-name`、`initial-cluster`、`etcd-advertise-ip`、`cluster-nodes`、`etcd-nodes`、`ingress-vip`、`all` 等子命令。
-
-#### moosefs
-
-配置文件：`deploy/moosefs/moosefs.conf`。主要配置项：
-
-| 变量 | 说明 | 默认值 |
-| --- | --- | --- |
-| `MOOSEFS_MASTER_HOST` | Master 节点地址（systemd 模式下区分 master/agent 角色） | 空（systemd 模式自动取 `config.yaml` 的 `master_nodes` 第一个 IP） |
-| `MOOSEFS_ENABLED` | 是否启用 MooseFS（`auto`/`yes`/`no`） | `auto`（多机自动启用，单机自动跳过） |
-| `MOOSEFS_USE_SYSTEMD` | 是否使用 systemd（`auto`/`yes`/`no`） | `auto`（自动检测） |
-| `MFS_MASTER_PORT` | Master 服务端口 | `9420` |
-| `MFS_CHUNK_PORT` | Chunkserver 端口 | `9422` |
-| `MFS_CLIENT_PORT` | Client (mfsmount) 端口 | `9421` |
-| `MFS_CHUNK_DIR` | Chunkserver 数据目录 | `/data/mfschunks` |
-| `MFS_MOUNT_POINT` | 共享挂载点路径 | `/home/agentos/users` |
-| `MFS_GOAL` | 数据副本数 | `2`（单机自动设为 1） |
-
-两种部署模式：
-1. **systemd 模式**：各节点独立 `install` + `systemctl start`，通过 `MOOSEFS_MASTER_HOST`（或 `config.yaml` 的 `master_nodes` 第一个 IP）区分 master/agent 角色
-2. **单机跳过**：其他场景（使用本地文件系统，不部署 MooseFS）
-
-MooseFS RPM 包（moosefs-master、moosefs-chunkserver、moosefs-client）和 fuse3 依赖需由上游预装，详见 [moosefs/README.zh.md](moosefs/README.zh.md)。支持 openEuler 22.03-LTS-SP1/SP4 和 24.03-LTS-SP1/SP4（x86_64 和 aarch64）。
 
 #### workspace-storage
 
@@ -516,14 +487,6 @@ whl 包来源：`install` 时从 agentos 根目录匹配 `a2x_registry-*-py3-non
 `deploy/jiuwenswarm/.env.custom` 仅保留可选的模型业务参数：
 `MODEL_PROVIDER`、`MODEL_NAME`、`API_BASE`、`API_KEY`，以及 `EMBED_MODEL`、
 `EMBED_API_BASE`、`EMBED_API_KEY`。已有模型、IAM、会话与 workspace 数据保留。
-Conch 代码/配置保留，但默认 `MODULES` 不调度 conch；AgentOS-Server 不包含
-conch/stratovirt/virtiofsd/erofs-utils RPM 与根级 `oe2203*/erofs.ko`。需要时用
-`AGENTOS_MODULES` 显式加入 `conch`（需旧包或独立 conch 子包提供运行时产物）。
-`agentos.sh` 会由最终模块列表派生
-`AGENTOS_CONCH_MODULE`（内部变量，不是用户开关），ADX 配置据此自动裁剪/保留
-conch class/socket；不含 conch 时启动不连接 conchd。
-默认 `down/uninstall` 也不会停止/卸载已存在的 conch；如需处理，用
-`AGENTOS_MODULES="... conch ..."` 显式调度，或使用旧包。
 
 #### whl 包来源
 
@@ -531,7 +494,6 @@ conch class/socket；不含 conch 时启动不连接 conchd。
 
 - **jiuwenswarm**：匹配 `jiuwenswarm-*-py3-none-any.whl`（如 `jiuwenswarm-0.2.3-py3-none-any.whl`，已包含 gateway）
 - **a2x-registry**：匹配 `a2x_registry-*-py3-none-any.whl`（agent-gateway 模块）
-- **moosefs**：从 agentos 根目录获取 RPM 包（moosefs-master/chunkserver/client）
 
 ADX SDK 从包内 `adx-release.tar.gz` 校验 manifest 后安装。
 
@@ -590,7 +552,7 @@ mymodule_status() {
 编辑 `agentos.sh` 顶部的 `MODULES` 数组，按部署顺序添加模块名：
 
 ```bash
-MODULES=("moosefs" "jiuwenbox" "agent-runtime" "agent-gateway" "jiuwenswarm" "mymodule")
+MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm" "mymodule")
 ```
 
 ### 完成

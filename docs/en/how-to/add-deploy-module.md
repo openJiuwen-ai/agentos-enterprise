@@ -44,7 +44,7 @@ mymodule_status() {
 Edit the array at the top of `deploy/agentos.sh` and append the module name in deployment order:
 
 ```bash
-MODULES=("moosefs" "jiuwenbox" "yuanrong" "agent-gateway" "jiuwenswarm" "mymodule")
+MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm" "mymodule")
 ```
 
 From then on, `up` / `install` run in declaration order and `down` / `uninstall` automatically run in reverse.

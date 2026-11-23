@@ -1,6 +1,6 @@
 # agentos 命令参考
 
-`deploy/agentos.sh` 是统一部署入口，按 `MODULES` 数组声明的顺序编排各组件。当前注册模块：`moosefs`、`jiuwenbox`、`yuanrong`、`agent-gateway`、`jiuwenswarm`（`deploy/conch/` 亦提供 Conch 沙箱模块钩子，未列入 `MODULES` 时不参与调度）。
+`deploy/agentos.sh` 是统一部署入口，按 `MODULES` 数组声明的顺序编排各组件。当前注册模块：`etcd`、`workspace-storage` / `afs`（按存储后端二选一）、`jiuwenbox`、`agent-runtime`、`redis`、`agent-gateway`、`jiuwenswarm`。
 
 ## 生命周期
 
@@ -35,7 +35,7 @@ bash deploy/agentos.sh <COMMAND> [OPTIONS]
 
 | 选项 | 说明 |
 |------|------|
-| `--ip IP` | 指定本机使用的 IP（多网卡环境必用）。指定后所有子组件（yuanrong / moosefs / conch / jiuwenbox / gateway / jiuwenswarm / etcd）的 local-ip 探测统一使用该 IP，并校验必须是本机真实持有的 IP。可置于命令前或命令后 |
+| `--ip IP` | 指定本机使用的 IP（多网卡环境必用）。指定后所有子组件（agent-runtime / jiuwenbox / gateway / jiuwenswarm / etcd）的 local-ip 探测统一使用该 IP，并校验必须是本机真实持有的 IP。可置于命令前或命令后 |
 | `-h`, `--help` | 显示帮助信息 |
 
 ## 常用环境变量

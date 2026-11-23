@@ -16,7 +16,7 @@ When you finish, you will have:
 | Python | 3.11 (`python3.11 --version` works) |
 | Disk | ≥ 20 GB |
 
-> For the full environment requirements (Docker, MooseFS, etc.), see the [repository README](../../../README.md).
+> For the full environment requirements (Docker, etc.), see the [repository README](../../../README.md).
 
 ## Step 1: Get the package
 
@@ -35,7 +35,7 @@ tar -xzf AgentOS-Server.tgz && cd AgentOS-Server
 bash deploy/install_deps.sh
 ```
 
-`install_deps.sh` installs python3.11, iproute, iptables, curl, fuse3, bwrap, jq, the MooseFS RPMs, and Python dependencies. If some dependencies are already present, use `--skip-system` / `--skip-moosefs` / `--skip-python` to skip the corresponding parts.
+`install_deps.sh` installs python3.11, iproute, iptables, curl, fuse3, bwrap, jq, and Python dependencies. If some dependencies are already present, use `--skip-system` / `--skip-python` to skip the corresponding parts.
 
 ## Step 3: Configure the cluster topology (single node)
 
@@ -71,7 +71,7 @@ bash deploy/agentos.sh init       # start etcd (keeps existing data for smooth u
 bash deploy/agentos.sh up         # deploy all application components in order
 ```
 
-`up` starts moosefs (skipped automatically on a single node), jiuwenbox, agent-runtime, agent-gateway, and jiuwenswarm in declaration order; the first start takes a few minutes.
+`up` starts jiuwenbox, agent-runtime, agent-gateway, and jiuwenswarm in declaration order; the first start takes a few minutes.
 
 ## Step 6: Verify
 

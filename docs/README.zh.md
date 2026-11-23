@@ -3,8 +3,8 @@
 本目录是 AgentOS 的用户文档，按 Diátaxis 四类框架组织：Tutorial（教程）、How-to（操作指南）、Reference（参考）、Explanation（解释）。
 
 - 中文文档位于 [zh/](zh/)（权威源），英文文档位于 [en/](en/)（跟随，目录结构对称）。
-- 目录级深度文档仍保留在原处：[构建说明](../build/README.zh.md)、[构建说明 v2](../build/README-v2.zh.md)、[部署指南](../deploy/README.zh.md)、[MooseFS 依赖说明](../deploy/moosefs/README.zh.md)。
-- 各组件（agent-runtime、jiuwenswarm、Conch、agent-protocol）的专属文档见对应 submodule 仓库。
+- 目录级深度文档仍保留在原处：[构建说明](../build/README.zh.md)、[构建说明 v2](../build/README-v2.zh.md)、[部署指南](../deploy/README.zh.md)。
+- 各组件（agent-runtime、jiuwenswarm、agent-protocol）的专属文档见对应 submodule 仓库。
 
 ## 阅读建议
 

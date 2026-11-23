@@ -29,7 +29,6 @@ cluster:
 
 | Module | Configuration | Key items |
 |--------|---------------|-----------|
-| moosefs | `deploy/moosefs/moosefs.conf` | `MOOSEFS_ENABLED` (auto/yes/no, auto-skipped single-node), `MFS_MOUNT_POINT` (default `/home/agentos/users`) |
 | jiuwenbox | `deploy/jiuwenbox/default-policy.yaml` | policy template (`__JIUWENSWARM_EXTENSIONS_DIR__` replaced at start) |
 | agent-runtime | env vars | `YR_PYTHON_VERSION` (default 3.11), `YR_VERSION` (default 0.9.0), `AGENTOS_SSH_KEY`, `AGENTOS_SSH_BACKEND_PUBLIC_DIR` |
 | etcd | env vars | `YR_ETCD_CLIENT_PORT` (default 32379) |

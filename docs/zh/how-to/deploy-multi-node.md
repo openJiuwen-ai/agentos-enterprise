@@ -92,4 +92,4 @@ bash deploy/agentos.sh deinit      # 各 etcd 节点执行
 bash deploy/agentos.sh uninstall   # 各节点执行；须与 install 同一 python3.11 环境
 ```
 
-字段说明、MooseFS 多机共享存储与各模块配置详见[部署指南](../../../deploy/README.zh.md)。
+字段说明与各模块配置详见[部署指南](../../../deploy/README.zh.md)。

@@ -2,13 +2,13 @@
 
 [English](README.md) | 简体中文
 
-AgentOS Enterprise是 openJiuwen 体系的一站式 Agent 基础设施集成交付仓：通过 Git Submodule 聚合 agent-runtime 分布式运行时、jiuwenswarm 网关与客户端、gVisor（runsc）工具沙箱和 A2X 注册中心（Conch 代码保留，运行时产物不进入 server 包，默认不部署），提供统一构建与一键集群部署能力。
+AgentOS Enterprise是 openJiuwen 体系的一站式 Agent 基础设施集成交付仓：通过 Git Submodule 聚合 agent-runtime 分布式运行时、jiuwenswarm 网关与客户端、gVisor（runsc）工具沙箱和 A2X 注册中心，提供统一构建与一键集群部署能力。
 
 ## 核心特性
 
-- **分层解耦架构**：AgentOS由四大组件——agent-runtime（`分布式Agent运行时`）、[jiuwenswarm]（`办公/Coding类Agent`）、gVisor/runsc（`Agent沙箱`；[Conch](Conch/) 代码保留、运行时产物不进入 server 包、默认不部署）、[agent-protocol](agent-protocol/)(`Agent接入网关`)构成。
+- **分层解耦架构**：AgentOS由四大组件——agent-runtime（`分布式Agent运行时`）、[jiuwenswarm]（`办公/Coding类Agent`）、gVisor/runsc（`Agent沙箱`）、[agent-protocol](agent-protocol/)(`Agent接入网关`)构成。
 - **一键构建**：`build/build.sh` 支持 `daily` / `release` 两种模式，产出 `AgentOS-Client.tgz`（全平台 TUI 客户端）与 `AgentOS-Server-<arch>.tgz`（服务端）可分发包。
-- **模块化部署**：`deploy/agentos.sh` 以可插拔钩子编排 moosefs、jiuwenbox、agent-runtime、agent-gateway、jiuwenswarm 五大模块，新增模块只需实现钩子函数，无需改动调度引擎。
+- **模块化部署**：`deploy/agentos.sh` 以可插拔钩子编排 etcd、workspace-storage/afs、jiuwenbox、agent-runtime、redis、agent-gateway、jiuwenswarm 各模块，新增模块只需实现钩子函数，无需改动调度引擎。
 - **单机 / 集群双模式**：默认单机开箱即用；多机通过 `deploy/config.yaml` 声明 etcd 集群、master 节点与 ingress VIP，支持高可用部署。
 - **全生命周期管理**：`install → init → up → down → deinit → uninstall` 覆盖安装、启停、拆除全流程，`status` 一键只读探测各组件运行状态。
 
@@ -30,7 +30,6 @@ AgentOS Enterprise是 openJiuwen 体系的一站式 Agent 基础设施集成交�
 | 下载工具 | `curl` 或 `wget`（需可访问华为云 OBS 与 gitcode.com） |
 | 系统命令 | `bwrap`、`ip`、`iptables`、`jq`、`fuse3`（可通过 `deploy/install_deps.sh` 安装） |
 | Docker（可选） | Docker Engine ≥ 26.0（Docker 类型沙箱要求 API v1.45） |
-| MooseFS（多机部署） | 4.59.2（master / chunkserver / client RPM 及 fuse3，需上游预装） |
 
 ## 安装指南
 

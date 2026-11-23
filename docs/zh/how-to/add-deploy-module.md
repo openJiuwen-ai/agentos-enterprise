@@ -44,7 +44,7 @@ mymodule_status() {
 编辑 `deploy/agentos.sh` 顶部的数组，按部署顺序追加模块名：
 
 ```bash
-MODULES=("moosefs" "jiuwenbox" "yuanrong" "agent-gateway" "jiuwenswarm" "mymodule")
+MODULES=("etcd" "workspace-storage" "jiuwenbox" "agent-runtime" "redis" "agent-gateway" "jiuwenswarm" "mymodule")
 ```
 
 此后 `up` / `install` 按声明顺序执行，`down` / `uninstall` 自动逆序。
