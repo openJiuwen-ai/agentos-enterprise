@@ -108,7 +108,7 @@ def network_defaults():
     return {
         "agent_profile": "N2", "tool_profile": "N2",
         "ingress_policy_peer": "agentos-ingress.node.invalid",
-        "ingress_port": 8080, "runtime_control_port": 19103,
+        "ingress_port": 8080, "runtime_control_port": 19503,
         "allowed_internal_origins": [], "tool_origins": [],
     }
 

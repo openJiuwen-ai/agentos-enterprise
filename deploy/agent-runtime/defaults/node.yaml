@@ -12,9 +12,9 @@ service_overrides:
   adxlet:
     config:
       node_id: ${ADX_NODE_ID}
-      listen: 0.0.0.0:19101
-      advertised_address: ${ADX_NODE_IP}:19101
-      proxy_address: ${ADX_NODE_IP}:19102
+      listen: 0.0.0.0:19501
+      advertised_address: ${ADX_NODE_IP}:19501
+      proxy_address: ${ADX_NODE_IP}:19502
       runtime_logs:
         directory: ${ADX_LOG_DIR_PREFIX}/runtime
       proxy_socket: ${ADX_NODE_RUN_DIR}/route.sock
@@ -29,8 +29,8 @@ service_overrides:
         valid_for_seconds: 30
       metrics_listen: 127.0.0.1:19091
       runtime_control:
-        listen: 0.0.0.0:19103
-        advertised_address: http://${ADX_NODE_IP}:19103
+        listen: 0.0.0.0:19503
+        advertised_address: http://${ADX_NODE_IP}:19503
         key_file: ${ADX_CONFIG_DIR}/secrets/runtime-control-key
       degradation_journal: ${ADX_NODE_RUN_DIR}/degraded/results.sqlite
       sandboxd_socket: null
@@ -77,8 +77,8 @@ service_overrides:
                   user: 0:0
     env:
       ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR: ${ADX_NODE_RUN_DIR}
-      ADX_DATA_PLANE_RELAY_BIND: 0.0.0.0:19102
-      ADX_DATA_PLANE_RELAY_ADVERTISE_ADDRESS: ${ADX_NODE_IP}:19102
+      ADX_DATA_PLANE_RELAY_BIND: 0.0.0.0:19502
+      ADX_DATA_PLANE_RELAY_ADVERTISE_ADDRESS: ${ADX_NODE_IP}:19502
       ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS: ${ADX_SANDBOX_CIDR},${ADX_RELAY_PEERS}
       ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS: ${ADX_RELAY_PEERS}
 runtime_profile:

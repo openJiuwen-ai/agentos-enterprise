@@ -101,9 +101,13 @@ ADX 原生模板位于包内 `agent-runtime/defaults/`：`coordinator.yaml`、`n
 |---|---|---|
 | HTTP ingress | `127.0.0.1:8080` | 同机 Python Gateway |
 | HTTP ingress | sandboxd 网桥 IP 的 `8080` | 同节点 AgentServer |
-| runtime-control | sandboxd 网桥 IP 的 `19103` | Execd，使用独立执行实例凭据 |
+| runtime-control | sandboxd 网桥 IP 的 `19503` | Execd，使用独立执行实例凭据 |
 | sandboxd | AgentOS 专用 Unix socket；健康端口仅回环 | adxlet |
-| RPC/Relay | 集群配置中的物理节点 IP | 集群组件 |
+| Coordinator | `19500`，通告集群配置中的物理节点 IP | 集群组件 |
+| adxlet RPC | `19501`，通告集群配置中的物理节点 IP | 集群组件 |
+| Relay | `19502`，通告集群配置中的物理节点 IP | 集群组件 |
+
+ADX 内部服务默认使用 `19500–19503`，避开 AgentOS Gateway 为三方 Agent 预留的 `19101–19200`。
 
 网桥服务沿用上表默认端口。网桥地址、网段和 Relay 的沙箱目标 CIDR 由现有 sandboxd TOML 的
 `plugin.network.ip_range` 派生，不另维护节点沙箱地址表。

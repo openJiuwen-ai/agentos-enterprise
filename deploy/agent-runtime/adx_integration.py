@@ -403,7 +403,7 @@ def deployment_node_context(release, options, *, node_id=None):
         path = release / 'etc/examples/sandboxd/sandboxd.toml'
     configuration = tomllib.loads(path.read_text())
     return _network_module().node_context(configuration, node_id=node_id, ingress_port=options.get('ingress_port', 8080),
-                                        runtime_control_port=options.get('runtime_control_port', 19103))
+                                        runtime_control_port=options.get('runtime_control_port', 19503))
 
 
 def ingress_listeners(context, *, sandbox_bridge):
