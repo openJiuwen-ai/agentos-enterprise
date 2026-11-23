@@ -10,7 +10,7 @@ AgentOS 是**集成交付仓**，不实现具体功能组件，而是把 openJiu
 |------|------|------|
 | agent-runtime | Git submodule | 分布式 Agent 运行时（faas / sdk / runtime / datasystem / functionsystem） |
 | jiuwenswarm | submodule [jiuwenswarm/](../../../jiuwenswarm/) | Agent 网关 + Web 前端 + TUI 客户端 |
-| Conch | submodule [Conch/](../../../Conch/) | 可选沙箱引擎（代码/发布件保留，默认不部署） |
+| Conch | submodule [Conch/](../../../Conch/) | 可选沙箱引擎（代码保留；运行时产物不进入 server 包；默认不部署） |
 | agent-protocol | submodule [agent-protocol/](../../../agent-protocol/) | A2X 协议与注册中心（a2x-registry） |
 
 用 submodule 而非直接引用发布包，是为了让"源码可追溯"与"交付可复现"共存：主仓库记录每个组件的精确 commit，构建脚本再从 OBS 拉取对应的预编译产物。

@@ -69,8 +69,10 @@ archive/agent-dx_buildinfo                    -> AgentOS-Buildinfo 包（collect
 archive/a2x_registry-*-py3-none-any.whl   -> server 包（平台无关 wheel，在 archive 根目录）
 ```
 
-**Conch 代码与发布件保留**：构建仍下载 Conch archive，server 包包含 conch RPM/wheel 与
-`deploy/conch`；但默认 `MODULES` 不调度 conch，需要时用 `AGENTOS_MODULES` 显式启用。
+**Conch 代码保留、运行时产物不进入 server 包**：构建仍下载 Conch archive 供依赖解析/EROFS
+离线来源使用，但 AgentOS-Server 会删除 `conch-*.rpm`、`conch-*.whl`、`stratovirt-*.rpm`、
+`virtiofsd-*.rpm`、`erofs-utils-*.rpm` 和根级 `oe2203*/erofs.ko`；`deploy/conch`
+代码/脚本保留。默认 `MODULES` 不调度 conch。
 EROFS 产物由独立的 `build_erofs` 从 Agent-DX OBS 获取，放入 `erofs/<variant>/erofs.ko`。
 
 **注意**：OBS 按 CPU 架构族归类，jiuwenswarm archive 的 `x86_64/` 目录还含 `win_amd64`、`aarch64/` 还含 `macosx_arm64`。client 包按用户要求不区分架构，两个目录下所有 `jiuwenswarm_tui-*.whl` 一并打入 `AgentOS-Client.tgz`（与 build.sh 一致，含 macosx/win/linux_aarch64/linux_x86_64 四平台）。
@@ -124,7 +126,7 @@ EROFS 产物由独立的 `build_erofs` 从 Agent-DX OBS 获取，放入 `erofs/<
 - archive 解压后删 `archive.tar.gz` 省磁盘空间
 - tar 加 `--atime-preserve`、wheel cp 加 `-p` 保留原始 mtime 可回溯
 - 随远端 client 迁移删除 `tui-launcher` 本地构建逻辑（`TUI_LAUNCHER_VERSION`/`TUI_LAUNCHER_PACKAGES`/`build_tui_launcher`），client 包不再包含 `agentos_tui_launcher`
-- Conch 代码/发布件保留：server 包仍包含 deploy/conch 与 conch RPM；默认 MODULES 不调度 conch。EROFS 另生成独立产物 `erofs/<variant>/erofs.ko`，加载逻辑由 `deploy/erofs.sh` 负责
+- Conch 代码保留：server 包保留 `deploy/conch`，但不包含 conch/stratovirt/virtiofsd/erofs-utils RPM 与根级 `oe2203*/erofs.ko`；默认 MODULES 不调度 conch。EROFS 另生成独立产物 `erofs/<variant>/erofs.ko`，加载逻辑由 `deploy/erofs.sh` 负责
 - 新增 credential_router：daily/release 都从 OBS archive 获取平台相关 `credential-router*.tar.gz`（按 `${ARCH}` 取 + 平台无关 none），打入 server 包根目录与各 whl/rpm 同级
 
 ## 依赖
@@ -314,10 +316,11 @@ tar -czf archive.tar.gz archive/ --atime-preserve
 
 
 ## 6.4、Conch 归档目录
-Conch 代码与发布件保留：构建仍下载 conch archive，server 包包含 conch RPM/wheel 与
-`deploy/conch`。默认 `MODULES` 不调度 conch；需要部署时用 `AGENTOS_MODULES` 显式加入。
-EROFS 另有独立产物 `erofs/<variant>/erofs.ko`，与 Conch 根目录的 `oe2203*/erofs.ko` 并存。
-EROFS 产物由 `build_erofs` 从 Agent-DX OBS 获取，放入 `erofs/<variant>/erofs.ko`。
+构建仍下载 conch archive，用于解析 Conch 依赖及作为 EROFS 离线来源。AgentOS-Server 会删除
+`conch-*.rpm`、`conch-*.whl`、`stratovirt-*.rpm`、`virtiofsd-*.rpm`、`erofs-utils-*.rpm`
+与根级 `oe2203*/erofs.ko`，但保留 `deploy/conch` 代码/脚本。默认 `MODULES` 不调度 conch；
+需要部署时用 `AGENTOS_MODULES` 显式加入（需旧包或独立 conch 子包提供运行时产物）。
+EROFS 只使用独立产物 `erofs/<variant>/erofs.ko`，由 `build_erofs` 从 Agent-DX OBS 获取。
 
 ## 6.5 credential_router归档目录
 1、obs://openjiuwen-ci/credential_router/package/daily/agentos_b050/last_successful_build/archive.tar.gz

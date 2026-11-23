@@ -516,9 +516,12 @@ whl 包来源：`install` 时从 agentos 根目录匹配 `a2x_registry-*-py3-non
 `deploy/jiuwenswarm/.env.custom` 仅保留可选的模型业务参数：
 `MODEL_PROVIDER`、`MODEL_NAME`、`API_BASE`、`API_KEY`，以及 `EMBED_MODEL`、
 `EMBED_API_BASE`、`EMBED_API_KEY`。已有模型、IAM、会话与 workspace 数据保留。
-Conch 代码、配置与发布件保留，但默认 `MODULES` 不调度 conch；需要时用 `AGENTOS_MODULES`
-显式加入 `conch`。`agentos.sh` 会由最终模块列表派生 `AGENTOS_CONCH_MODULE`（内部变量，
-不是用户开关），ADX 配置据此自动裁剪/保留 conch class/socket；不含 conch 时启动不连接 conchd。
+Conch 代码/配置保留，但默认 `MODULES` 不调度 conch；AgentOS-Server 不包含
+conch/stratovirt/virtiofsd/erofs-utils RPM 与根级 `oe2203*/erofs.ko`。需要时用
+`AGENTOS_MODULES` 显式加入 `conch`（需旧包或独立 conch 子包提供运行时产物）。
+`agentos.sh` 会由最终模块列表派生
+`AGENTOS_CONCH_MODULE`（内部变量，不是用户开关），ADX 配置据此自动裁剪/保留
+conch class/socket；不含 conch 时启动不连接 conchd。
 默认 `down/uninstall` 也不会停止/卸载已存在的 conch；如需处理，用
 `AGENTOS_MODULES="... conch ..."` 显式调度，或使用旧包。
 

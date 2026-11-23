@@ -137,7 +137,8 @@ runsc 路径，不将 Supervisor 原生策略标记为等价 N2。Supervisor 的
 ### 工具运行时与历史镜像
 
 `runtime.tool_runtime` 选择新用户默认运行时，默认 runsc；`runtime.tool_runtimes: [runsc, conch]`。
-Conch 代码、配置与发布件保留，但默认 `MODULES` 不调度 conch，因此默认部署不安装/启动 conchd。
+Conch 代码/配置保留，但默认 `MODULES` 不调度 conch，因此默认部署不安装/启动 conchd；
+AgentOS-Server 不包含 conch/stratovirt/virtiofsd/erofs-utils RPM 与根级 `oe2203*/erofs.ko`。
 需要部署 Conch 时，用 `AGENTOS_MODULES` 显式加入 `conch`。`agentos.sh` 由最终模块列表派生
 `AGENTOS_CONCH_MODULE`（内部变量，不是用户开关），ADX 配置据此自动裁剪/保留 conch class/socket；
 不含 conch 时启动路径不会连接 conchd。

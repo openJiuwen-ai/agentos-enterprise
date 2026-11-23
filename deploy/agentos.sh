@@ -45,9 +45,9 @@ EROFS_SH="${SCRIPT_DIR}/erofs.sh"
 # 先安装 etcd，便于存储模块为挂载固化 etcdctl 路径。
 # redis 排在 agent-runtime 之后：redis-server 二进制由 ADX 发布包交付，
 # redis install 钩子校验其可用性（早失败）；服务生命周期由 redis.sh 的 init/deinit 管理。
-# Conch 是可选工具沙箱后端（两后端同样适用）：代码、配置与发布件均保留，但默认 MODULES 不调度它，
-# 因此 install/up/down/restart/status 不会安装/启动/停止 conchd。
-# 需要部署 Conch 时，用 AGENTOS_MODULES 显式加入 conch（需包内带 conch RPM/wheel）：
+# Conch 是可选工具沙箱后端（两后端同样适用）：代码/配置保留，但运行时产物不随 AgentOS-Server 包交付；
+# 默认 MODULES 不调度它，因此 install/up/down/restart/status 不会安装/启动/停止 conchd。
+# 需要部署 Conch 时，用 AGENTOS_MODULES 显式加入 conch（运行时产物需由旧包或独立 Conch 子包提供）：
 #   AGENTOS_MODULES="etcd workspace-storage conch jiuwenbox agent-runtime redis agent-gateway jiuwenswarm" ./agentos.sh install
 # 下面根据最终 MODULES 自动派生 AGENTOS_CONCH_MODULE（内部变量，不是用户开关）：
 #   - 不含 conch：ADX 生成配置时裁掉 conch class/socket，启动不连接 conchd；
@@ -1016,8 +1016,9 @@ Config:
   agent-runtime  固定配置: deploy/agent-runtime/defaults/*.yaml
                Agent DX + Jiuwenbox Supervisor / gVisor（runsc）；
                Conch 代码/配置保留，但默认不由 MODULES 调度；动态绑定由发布包自动准备
-  conch       可选工具沙箱后端：代码、配置与发布件保留，默认不在 MODULES 中。
-              需要时用 AGENTOS_MODULES 显式加入 conch（需包内带 conch RPM/wheel）。
+  conch       可选工具沙箱后端：代码/配置保留，运行时产物不随 AgentOS-Server 包交付。
+              默认不在 MODULES 中；需要时用 AGENTOS_MODULES 显式加入 conch，
+              运行时产物需由旧包或独立 Conch 子包提供。
               ADX 配置按 MODULES 是否包含 conch 自动裁剪/保留 conch class/socket；
               不含 conch 时启动不连接 conchd。默认 down/uninstall 也不处理已存在的
               conch；需停止/卸载时用 AGENTOS_MODULES 显式包含 conch，或使用旧包。

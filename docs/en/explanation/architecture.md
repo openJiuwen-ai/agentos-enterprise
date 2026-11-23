@@ -10,7 +10,7 @@ AgentOS is an **integration and delivery repository** — it implements no funct
 |-----------|--------|------|
 | agent-runtime | Git submodule | distributed agent runtime (faas / sdk / runtime / datasystem / functionsystem) |
 | jiuwenswarm | submodule [jiuwenswarm/](../../../jiuwenswarm/) | agent gateway + web frontend + TUI client |
-| Conch | submodule [Conch/](../../../Conch/) | optional sandbox engine (source/artifacts retained, not deployed by default) |
+| Conch | submodule [Conch/](../../../Conch/) | optional sandbox engine (source retained; runtime artifacts excluded from the server package; not deployed by default) |
 | agent-protocol | submodule [agent-protocol/](../../../agent-protocol/) | A2X protocol and registry (a2x-registry) |
 
 Submodules rather than bare package references keep "source traceability" and "reproducible delivery" together: the main repository records each component's exact commit, while the build scripts pull the corresponding prebuilt artifacts from OBS.

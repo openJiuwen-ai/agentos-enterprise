@@ -554,6 +554,11 @@ pack() {
   done
 
   cp -a "${DEPLOY_DIR}/." "${server_staging}/deploy/"
+  # AgentOS-Server 不交付 Conch 运行时产物；deploy/conch 代码/脚本保留。
+  rm -f "${server_staging}"/conch-*.rpm "${server_staging}"/conch-*.whl \
+        "${server_staging}"/stratovirt-*.rpm "${server_staging}"/virtiofsd-*.rpm \
+        "${server_staging}"/erofs-utils-*.rpm
+  rm -rf "${server_staging}"/oe2203*
   local swarm_deploy_source="${DOWNLOAD_DIR}/jiuwenswarm_src/deploy/adx"
   [[ -d "${swarm_deploy_source}" ]] || swarm_deploy_source="${DOWNLOAD_DIR}/jiuwenswarm_src/deploy/yuanrong"
   cp -a "${swarm_deploy_source}/." "${server_staging}/deploy/jiuwenswarm/"

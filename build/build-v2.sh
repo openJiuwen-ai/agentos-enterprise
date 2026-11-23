@@ -4,7 +4,7 @@ set -e
 
 # AgentOS b050 交付产物打包脚本。详细说明（产物清单/archive 结构/路径规则/重构要点/依赖）见 README-v2.zh.md。
 # daily/release 共用 OBS archive.tar.gz 获取 jiuwenswarm/agent-dx/agent-protocol，client 包不区分架构（含全平台 jiuwenswarm_tui），server 包按 ${ARCH} 打。
-# Conch 代码/脚本与 RPM 随 server 包保留；默认 MODULES 不调度 conch，需要时用 AGENTOS_MODULES 显式启用。
+# Conch 代码/脚本随 server 包保留；Conch 运行时产物（conch/stratovirt/virtiofsd/erofs-utils RPM、根级 oe2203*/erofs.ko）不进入 server 包。
 # EROFS 作为独立产物打入 server 包的 erofs/<variant>/erofs.ko；默认从 Agent-DX OBS erofs.tar.gz 获取。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -506,23 +506,19 @@ pack() {
 
   cp -p "${AGENT_GATEWAY_ARCHIVE_ROOT}"/*.whl "${server_staging}/"
 
-  # conch：平台相关 rpm 从 conch archive ${ARCH} 目录取（build_conch 已校验目录），打入 server 包根目录与各 whl 同级
-  cp -p "${CONCH_ARCHIVE_ROOT}/${ARCH}"/*.rpm "${server_staging}/"
-  # 平台无关（none）rpm 在 archive 根目录，如有则一并打入（当前 conch archive 无 none rpm，跳过）
-  local none_rpm
-  for none_rpm in "${CONCH_ARCHIVE_ROOT}"/*.rpm; do
-    [[ -e "${none_rpm}" ]] || continue
-    cp -p "${none_rpm}" "${server_staging}/"
-  done
-  # erofs.ko 版本目录（oe2203/oe2203sp1~sp4，openEuler 22.03 内核模块）在 ${ARCH} 目录下与 rpm 同级，
-  # 如有则一并打入 server 包根目录（conch_deploy.sh up 按 AGENTOS_ROOT/<版本>/erofs.ko 加载）
-  local erofs_ko_dir
-  for erofs_ko_dir in "${CONCH_ARCHIVE_ROOT}/${ARCH}"/oe2203*/; do
-    [[ -e "${erofs_ko_dir}" ]] || continue
-    cp -a "${erofs_ko_dir}" "${server_staging}/"
-  done
+  # AgentOS-Server 不交付 Conch 运行时产物：
+  #   - conch/stratovirt/virtiofsd/erofs-utils RPM（Conch 及其依赖）；
+  #   - Conch archive 的根级 oe2203*/erofs.ko 副本；
+  #   - deploy/conch 代码/脚本保留；EROFS 只使用独立的 erofs/<variant>/erofs.ko。
+  # build_conch 仍下载 Conch 发布 archive（RPM + 旧 oe2203*/erofs.ko），
+  # 仅作为 build_erofs 的离线 fallback（OBS erofs.tar.gz 不可用时）；
+  # 其 RPM/根级 oe2203* 不会进入 AgentOS-Server。
+  rm -f "${server_staging}"/conch-*.rpm "${server_staging}"/conch-*.whl \
+        "${server_staging}"/stratovirt-*.rpm "${server_staging}"/virtiofsd-*.rpm \
+        "${server_staging}"/erofs-utils-*.rpm
+  rm -rf "${server_staging}"/oe2203*
 
-  # EROFS：独立目录，供 ADX bootstrap 使用；与 Conch 根目录 erofs.ko 并存。
+  # EROFS：独立目录，供 ADX bootstrap 使用；不包含 Conch 根目录 oe2203*/erofs.ko。
   if [[ ! -d "${BUILD_DIR}/erofs" ]]; then
     echo "error: EROFS staging directory not found: ${BUILD_DIR}/erofs" >&2
     return 1
