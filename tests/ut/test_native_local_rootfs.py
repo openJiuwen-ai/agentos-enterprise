@@ -1,5 +1,6 @@
 """Prepared Local sources cross deployment boundaries without a Gateway catalog."""
 import copy
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -196,6 +197,82 @@ def test_operator_inputs_are_preserved_and_shared_by_artifact_preparation(settin
     assert "TOOL_SANDBOX_CPU" in env_file.read_text()
 
 
+@pytest.mark.parametrize("kind", [None, "adx-environment"])
+def test_dotenv_runsc_without_yaml_runtime_uses_the_prepared_image(settings, tmp_path, kind):
+    environment = tmp_path / ".env"
+    environment.write_text("TOOL_SANDBOX_EXECUTOR=runsc\n")
+    reference = "custom:tools"
+    document = {"sandbox": {"image": reference}}
+    if kind:
+        document["sandbox"]["type"] = kind
+    original = copy.deepcopy(document)
+    artifact = {"path": str(tmp_path / "objects/tools/rootfs"), "env": {"IMAGE_MARKER": "retained"}}
+    settings["runtime"]["local_image_bindings"] = {"images": {reference: artifact}}
+    updated = deploy.gateway_config(document, settings, environment)
+    assert updated["sandbox"]["runtime"] == "runsc"
+    assert updated["sandbox"]["image"] == reference
+    assert updated["sandbox"]["rootfs"] == {"type": "local", "path": artifact["path"]}
+    assert updated["sandbox"]["image_env"]["IMAGE_MARKER"] == "retained"
+    assert "executor" not in updated["sandbox"]
+    assert document == original
+    assert environment.read_text() == "TOOL_SANDBOX_EXECUTOR=runsc\n"
+
+
+@pytest.mark.parametrize(("executor", "runtime"), [("runsc", "runsc"), ("docker", "runsc"), ("conch", "conch")])
+@pytest.mark.parametrize("kind", [None, "adx-environment"])
+def test_dotenv_runtime_selection_overrides_a_retained_yaml_runtime(executor, runtime, kind):
+    migration = deploy.migration_module()
+    source = {"runtime": "conch" if runtime == "runsc" else "runsc", "image": "custom:tools"}
+    if kind:
+        source["type"] = kind
+    original = copy.deepcopy(source)
+    normalized = migration.tool_image_source(source, {"TOOL_SANDBOX_EXECUTOR": executor})
+    assert normalized["runtime"] == runtime
+    assert "executor" not in normalized
+    assert normalized["image"] == source["image"]
+    assert migration.tool_source_runtime(normalized) == runtime
+    assert source == original
+
+
+def test_runsc_executor_image_selector_accepts_stored_configs_without_runtime():
+    migration = deploy.migration_module()
+    source = {"type": "adx-environment", "executor": "runsc", "image": "custom:tools"}
+    assert migration.legacy_tool_image(source) == source["image"]
+
+
+@pytest.mark.parametrize("value", [None, "", " "])
+def test_empty_dotenv_runtime_selection_retains_yaml_runtime(value):
+    migration = deploy.migration_module()
+    source = {"type": "adx-environment", "runtime": "conch", "image": "custom:tools"}
+    normalized = migration.tool_image_source(source, {"TOOL_SANDBOX_EXECUTOR": value})
+    assert normalized["runtime"] == "conch"
+    assert normalized["image"] == source["image"]
+
+
+@pytest.mark.parametrize("executor", ["runc", "podman"])
+@pytest.mark.parametrize("sandbox", [
+    {"type": "adx-environment", "runtime": "runsc", "image": "custom:tools"},
+    {"type": "adx-environment", "runtime": "runsc"},
+    {"image": "custom:tools"},
+])
+def test_invalid_dotenv_runtime_names_input_before_image_conversion(settings, tmp_path, executor, sandbox):
+    environment = tmp_path / ".env"
+    text = f"TOOL_SANDBOX_EXECUTOR={executor}\nMODEL_NAME=retained\n"
+    environment.write_text(text)
+    document = {"sandbox": copy.deepcopy(sandbox)}
+    original = copy.deepcopy(document)
+    with pytest.raises(ValueError, match="TOOL_SANDBOX_EXECUTOR must be runsc, conch or docker"):
+        deploy.gateway_config(document, settings, environment)
+    assert document == original
+    assert environment.read_text() == text
+
+
+def test_invalid_legacy_executor_names_its_yaml_field():
+    migration = deploy.migration_module()
+    with pytest.raises(ValueError, match="sandbox.executor must be runsc, conch or docker"):
+        migration.tool_image_source({"type": "adx-environment", "executor": "podman"})
+
+
 @pytest.mark.parametrize(("sandbox", "dotenv_source"), [
     ({"type": "yuanrong", "executor": "conch", "image": "old-conch:v1", "cpu": 700}, None),
     ({"type": "jiuwenbox-conch", "template_name": "old-conch:v1", "cpu": 700}, None),
@@ -246,9 +323,61 @@ def test_disabled_conch_warns_and_configures_runsc(settings, tmp_path, monkeypat
     assert "Conch is absent from AGENTOS_MODULES" in caplog.text
 
 
-@pytest.mark.parametrize(("conch_module", "dotenv_selector"), [("0", False), ("0", True), ("1", False)])
-def test_workspace_migration_uses_default_runsc_when_conch_disabled(
-    settings, tmp_path, monkeypatch, conch_module, dotenv_selector,
+def test_configuration_validates_workspace_after_its_own_tracing_sync(settings, tmp_path, monkeypatch):
+    from jiuwenswarm.extensions.agentos.agentos_router.adx.workspace import MIGRATION_ERROR_FILE
+
+    monkeypatch.setattr(deploy, "check_business", lambda _: None)
+    users = Path(settings["workspace_root"])
+    monkeypatch.setenv("WORKSPACE_STORAGE_ROOT", str(users))
+    config_dir = deploy.data_directory(settings) / "config"
+    config_dir.mkdir(parents=True)
+    user_config = users / "alice/.jiuwenswarm/config/config.yaml"
+    user_config.parent.mkdir(parents=True)
+    text = (
+        "preferred_language: en\nmodels: {defaults: []}\n"
+        "sandbox: {type: adx-environment, runtime: runsc}\n"
+        "telemetry:\n  enabled: false\n  exporter: none\n  endpoint:\n  protocol: grpc\n"
+        "agent_observability:\n  enabled:   false\n  exporter: none\n  endpoint:\n"
+        "team_observability:\n  enabled:   false\n  exporter: none\n  endpoint:\n"
+    )
+    (config_dir / "config.yaml").write_text(text)
+    user_config.write_text(text)
+    user_config.with_name('.env').write_text("MODEL_NAME=retained\n")
+    token = tmp_path / "token"
+    token.write_text("test-token")
+    custom = tmp_path / "operator.env"
+    custom.write_text("TOOL_SANDBOX_EXECUTOR=runsc\n")
+    settings.update(token_file=str(token), business_env_file=str(custom))
+    for _ in range(2):
+        deploy.configure(copy.deepcopy(settings))
+        assert not user_config.with_name(MIGRATION_ERROR_FILE).exists()
+        actual = deploy.read_yaml(user_config)
+        assert actual["sandbox"]["runtime"] == "runsc"
+        assert actual["preferred_language"] == "en"
+        assert actual["models"] == {"defaults": []}
+        assert "MODEL_NAME=retained" in user_config.with_name('.env').read_text()
+
+
+def test_workspace_write_still_preserves_a_real_external_change(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("sandbox: {type: adx-environment, runtime: conch}\npreferred_language: en\n")
+    expected = hashlib.sha256(config.read_bytes()).hexdigest()
+    changed = config.read_text().replace("preferred_language: en", "preferred_language: zh")
+    config.write_text(changed)
+    with pytest.raises(ValueError, match="changed during deployment"):
+        deploy.write_workspace_sandbox(config, {"type": "adx-environment", "runtime": "runsc"},
+                                       expected_digest=expected)
+    assert config.read_text() == changed
+
+
+@pytest.mark.parametrize(("conch_module", "dotenv_selector", "kind"), [
+    ("0", False, "yuanrong"), ("0", True, "yuanrong"),
+    ("1", False, "yuanrong"), ("1", True, "yuanrong"),
+    ("0", True, "adx-environment"), ("1", True, "adx-environment"),
+    ("0", True, None), ("1", True, None),
+])
+def test_workspace_migration_respects_conch_module_selection(
+    settings, tmp_path, monkeypatch, conch_module, dotenv_selector, kind,
 ):
     from jiuwenswarm.extensions.agentos.agentos_router.adx.workspace import MIGRATION_ERROR_FILE
 
@@ -273,6 +402,11 @@ def test_workspace_migration_uses_default_runsc_when_conch_disabled(
         path.with_name(".env").write_text("KEEP_USER_SETTING=yes\n")
     legacy_sandbox = {"type": "yuanrong", "executor": "conch", "image": "legacy-conch:v1",
                       "cpu": 500, "memory": 768, "conch": {"vcpu_num": 2}}
+    if kind != "yuanrong":
+        legacy_sandbox.pop("type")
+        if kind:
+            legacy_sandbox["type"] = kind
+        legacy_sandbox["runtime"] = "runsc"
     if dotenv_selector:
         legacy_sandbox.pop("executor")
         conch_config.with_name(".env").write_text(
@@ -318,7 +452,17 @@ def test_workspace_migration_uses_default_runsc_when_conch_disabled(
         deploy.configure(copy.deepcopy(settings))
         assert deploy.read_yaml(conch_config)["sandbox"]["image"] == "deployment:next"
     else:
-        assert deploy.read_yaml(conch_config)["sandbox"]["runtime"] == "conch"
+        from dotenv import dotenv_values
+        sandbox = deploy.read_yaml(conch_config)["sandbox"]
+        assert sandbox["runtime"] == "conch"
+        assert sandbox["image"] == "legacy-conch:v1"
+        assert "rootfs" not in sandbox and "runtime_identity" not in sandbox
+        if dotenv_selector:
+            environment = dotenv_values(conch_config.with_name(".env"))
+            assert environment["TOOL_SANDBOX_EXECUTOR"] == "conch"
+            assert environment["TOOL_SANDBOX_IMAGE"] == "legacy-conch:v1"
+        deploy.configure(copy.deepcopy(settings))
+        assert deploy.read_yaml(conch_config)["sandbox"] == sandbox
 
 
 @pytest.mark.parametrize("dotenv_image, expected", [("", "custom:v1"), ("custom:v2", "custom:v2")])

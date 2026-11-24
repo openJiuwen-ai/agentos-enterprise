@@ -314,6 +314,25 @@ class LocalImageTests(unittest.TestCase):
             "image": "custom:ignored"}, f"TOOL_SANDBOX_EXECUTOR=conch\nTOOL_SANDBOX_IMAGE={reference}\n")
         self.assertEqual(images.requested_images(settings), {})
 
+    def test_dotenv_runsc_without_yaml_runtime_prepares_the_retained_image(self):
+        reference = "custom:tools"
+        for kind in (None, "adx-environment"):
+            sandbox = {"image": reference}
+            if kind:
+                sandbox["type"] = kind
+            with self.subTest(kind=kind):
+                config, settings = self.historical_settings(sandbox, "TOOL_SANDBOX_EXECUTOR=runsc\n")
+                settings["runtime"]["local_image_root"] = str(self.root / "artifacts")
+                before = config.read_bytes(), config.with_name(".env").read_bytes()
+                self.assertEqual(images.requested_images(settings), {reference: {}})
+                with patch.object(images, "docker", self.docker), patch.object(
+                    images.platform, "machine", return_value="aarch64"
+                ):
+                    result = images.prepare_registry(settings)
+                artifact = result["images"][reference]
+                self.assertEqual((Path(artifact["path"]) / "image-value").read_text(), "hello")
+                self.assertEqual((config.read_bytes(), config.with_name(".env").read_bytes()), before)
+
     def test_unknown_backend_is_not_assumed_to_be_docker(self):
         _, settings = self.historical_settings({"type": "unrecognized", "image": "custom:tools"})
         with self.assertLogs(level='WARNING') as logged:

@@ -25,6 +25,12 @@ workspace 根目录与运行账号沿用 Workspace 组件的 `WORKSPACE_ACCESS_R
 解析结果由镜像准备和应用配置生成共同使用；修改这些部署输入后需要重新部署，
 已经运行的服务和 Environment 不会因文件修改自动改变参数。
 
+对于 ADX 配置，`TOOL_SANDBOX_EXECUTOR` 直接选择 `sandbox.runtime`（`runsc` / `conch`，
+历史 `docker` 值归一为 `runsc`）。非空环境变量优先于 YAML 的 `sandbox.runtime`；
+未配置或空值保留 YAML 值，因此 YAML 无需重复填写 `runtime`。
+旧 YAML 的 `sandbox.executor` 在缺少 `runtime` 时仍可作为兼容输入；合并后的 ADX 配置
+使用 `runtime`，镜像准备与配置迁移共享同一份归一化规则。镜像引用和 Local rootfs 保持各自用途。
+
 ## 发布包与安装
 
 Server 包交付 Core、Swarm wheel、ADX release 和统一部署脚本。Core 必须包含

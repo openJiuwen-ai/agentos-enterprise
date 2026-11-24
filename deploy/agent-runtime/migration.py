@@ -16,7 +16,7 @@ def tool_source_runtime(sandbox: dict, default: str = 'runsc') -> str:
         return 'conch'
     if kind == 'yuanrong':
         return 'runsc'
-    if kind == 'adx-environment' and sandbox.get('runtime') in ('conch', 'runsc'):
+    if kind in ('', 'adx-environment') and sandbox.get('runtime') in ('conch', 'runsc'):
         return sandbox['runtime']
     return default
 
@@ -28,9 +28,8 @@ def tool_image_source(sandbox: dict, environment: dict | None = None) -> dict:
     result = copy.deepcopy(sandbox)
     values = environment or {}
 
-    for name, key in (("TOOL_SANDBOX_TYPE", "type"), ("TOOL_SANDBOX_EXECUTOR", "executor")):
-        if values.get(name):
-            result[key] = values[name].strip()
+    if values.get("TOOL_SANDBOX_TYPE"):
+        result["type"] = values["TOOL_SANDBOX_TYPE"].strip()
     if values.get("TOOL_SANDBOX_ENABLE"):
         enabled = values["TOOL_SANDBOX_ENABLE"].strip().lower()
         if enabled not in ("true", "false", "1", "0"):
@@ -54,6 +53,19 @@ def tool_image_source(sandbox: dict, environment: dict | None = None) -> dict:
                 'cpu', 'cpu_limit', 'memory', 'mem_limit', 'idle_timeout', 'workdir', 'mounts', 'rootfs', 'restart_policy'):
         if key in result:
             result[key] = resolve(result[key])
+    executor = (values.get("TOOL_SANDBOX_EXECUTOR") or "").strip()
+    if str(result.get("type") or "").strip().lower() in ("", "adx-environment"):
+        selector = executor or (result.get("executor") if not result.get("runtime") else None)
+        if selector:
+            runtime = str(selector).strip().lower()
+            if runtime not in ("runsc", "conch", "docker"):
+                source = "TOOL_SANDBOX_EXECUTOR" if executor else "sandbox.executor"
+                raise ValueError(f"{source} must be runsc, conch or docker")
+            result["runtime"] = "runsc" if runtime == "docker" else runtime
+        result.pop("executor", None)
+    elif executor:
+        # Legacy runners still need their source selector during image classification.
+        result["executor"] = executor.strip()
     for key in ('cpu', 'cpu_limit', 'memory', 'mem_limit', 'idle_timeout'):
         if isinstance(result.get(key), str):
             result[key] = int(result[key]) if result[key] else None
@@ -120,11 +132,11 @@ def legacy_tool_image(sandbox: dict, default_conch_images=()) -> str | None:
     elif kind == "jiuwenbox":
         # The original local runner did not consume an image reference.
         return None
-    elif kind == "adx-environment" and sandbox.get("runtime"):
+    elif kind in ("", "adx-environment") and sandbox.get("runtime"):
         runtime = str(sandbox["runtime"]).strip().lower()
         executor = "docker" if runtime == "runsc" else runtime
     elif kind in ("", "adx-environment"):
-        executor = executor or "docker"
+        executor = "docker" if executor in ("", "runsc") else executor
     else:
         raise ValueError(f"Cannot determine historical image backend for sandbox.type={kind}")
     if executor == "conch":

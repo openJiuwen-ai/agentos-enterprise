@@ -222,10 +222,6 @@ def normalize_tool_inputs(settings):
     sandbox = (read_yaml(config).get("sandbox") or {}) if config.is_file() else {}
     migration = migration_module()
     selector = migration.tool_image_source(sandbox, values)
-    if not selector.get("type"):
-        selector["type"] = "adx-environment"
-    if values.get("TOOL_SANDBOX_EXECUTOR"):
-        selector["runtime"] = "conch" if values["TOOL_SANDBOX_EXECUTOR"].strip() == "conch" else "runsc"
     default = runtime.get("tool_runtime", "runsc")
     selected = migration.tool_source_runtime(selector, default)
     fallback = selected == "conch" and not conch_module_enabled()
@@ -782,7 +778,6 @@ def configure(settings):
     if options.get("instance_name"):
         environment["JIUWENSWARM_DATA_DIR"] = str(data)
     failures = {}
-    user_updates = validate_user_configs(settings, failures=failures)
     fresh = not config.exists()
     if fresh:
         subprocess.run([settings["python"], "-m", "jiuwenswarm.init_workspace"],
@@ -808,6 +803,7 @@ def configure(settings):
         apply_deployment_tracing(config, Path(__file__).resolve().parents[1] / "config.yaml",
                                  users_root=Path(os.environ.get("WORKSPACE_STORAGE_ROOT", "/home/agentos/.users")))
         value = read_yaml(config)
+    user_updates = validate_user_configs(settings, failures=failures)
     template = write_user_template(value, settings)
     settings.setdefault("gateway", {})["agentos"] = value["gateway"]["agentos"]
     if fresh or not env_file.exists():
