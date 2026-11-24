@@ -40,7 +40,8 @@ EROFS_SH="${SCRIPT_DIR}/erofs.sh"
 #   autofs-nfs — workspace-storage（NFS + autofs，交付基线；配置 workspace_storage.conf）
 #   afs        — AFS(OwnerFs)（deploy/afs/，配置 deploy/afs/afs.conf；显式指定才启用）
 # 注意: deploy/moosefs/ 与 deploy/workspace-storage/ 目录均保留，仅供拆旧时动态加载:
-#       moosefs   → _teardown_legacy_moosefs（历史遗留）
+#       moosefs           → _teardown_legacy_moosefs（历史遗留）
+#       workspace-storage → _teardown_workspace_storage_residue（切到 afs 后的残留）
 # etcd 仅安装独立二进制；服务生命周期仍由 etcd.sh 的 init/deinit 管理。
 # 先安装 etcd，便于存储模块为挂载固化 etcdctl 路径。
 # redis 排在 agent-runtime 之后：redis-server 二进制由 ADX 发布包交付，
@@ -647,6 +648,8 @@ deploy_down() {
     info "Modules (reverse): $(modules_for_hook down)"
     run_hooks down
     _teardown_legacy_moosefs down
+    # 顺序是契约：afs 必须先撤导出，之后才能停 nfs-server，否则 exportfs 在 nfsd 已停时刷新
+    _teardown_workspace_storage_residue down
     _print_summary down
 }
 
@@ -683,6 +686,7 @@ deploy_uninstall() {
     info "Python version: ${PYTHON_VERSION}"
     run_hooks uninstall
     _teardown_legacy_moosefs uninstall
+    _teardown_workspace_storage_residue uninstall
     if [ -r "${EROFS_SH}" ]; then
         bash "${EROFS_SH}" uninstall || warning "EROFS cleanup reported errors; continuing"
     fi
@@ -745,6 +749,41 @@ _teardown_legacy_moosefs() {
         moosefs_down 2>&1 || warning "moosefs_down reported errors, continuing"
     else
         moosefs_uninstall 2>&1 || warning "moosefs_uninstall reported errors, continuing"
+    fi
+}
+
+# ===== 旧 workspace-storage 拆旧（切到 afs 后的残留） =====
+# 残留的 agentos-workspace 占着 127.0.0.1:18889（与 afs 的 workspace API 同端口），
+# autofs 会持续把 egress 根重新挂回 NFS，两者都使 afs up 的就绪门禁失败。
+_has_workspace_storage_residue() {
+    # 只有 afs 后端才视其为残留。autofs-nfs 后端下 MODULES 不含它还有另一种成因：
+    # AGENTOS_MODULES 裁剪（如只 down agent-runtime），此时它仍在正常服务，拆掉会中断
+    # 本机 workspace 与跨节点 NFS 挂载。
+    [ "${AGENTOS_STORAGE_BACKEND:-autofs-nfs}" = "afs" ] || return 1
+    [ -f "${SCRIPT_DIR}/workspace-storage/module.sh" ] || return 1
+    # 显式列入 AGENTOS_MODULES 时由 run_hooks 调度，不重复拆
+    if modules_include MODULES workspace-storage; then
+        return 1
+    fi
+    # 判据用 install 产物而非运行态：autofs/nfs-server 是宿主机通用服务，可能被别的组件使用
+    [ -f /etc/systemd/system/agentos-workspace.service ] && return 0
+    [ -f /etc/exports.d/workspace-storage.exports ] && return 0
+    [ -f /etc/auto.workspace-storage ] && return 0
+    return 1
+}
+
+_teardown_workspace_storage_residue() {
+    local phase="$1"   # down / uninstall
+    if ! _has_workspace_storage_residue; then
+        return 0
+    fi
+    info "Detected legacy workspace-storage, tearing down (${phase})"
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/workspace-storage/module.sh"
+    if [ "${phase}" = "down" ]; then
+        workspace-storage_down 2>&1 || warning "workspace-storage_down reported errors, continuing"
+    else
+        workspace-storage_uninstall 2>&1 || warning "workspace-storage_uninstall reported errors, continuing"
     fi
 }
 
@@ -1013,9 +1052,12 @@ Config:
                            → down → uninstall(保留 data/tls/bin)
               AFS 不再提供 migrate/rollback：已有目录由 afs-node 启动扫描原地认领
               （[ownerfs] adopt_on_startup，零拷贝），部署面不搬运数据。
-              切换后端统一走: down → uninstall → 改 AGENTOS_STORAGE_BACKEND → install → up
-              （两个后端各自闭环：AFS 的 up 会卸载 egress 残留层后重挂 tmpfs，
-                互不依赖对方的探测；切换前按上述流程先停旧后端即可）
+              切换后端统一走（完整拆除）: down → deinit → uninstall
+              → 改 AGENTOS_STORAGE_BACKEND → install → init → up
+              必须走完 uninstall，不能只 down 后改环境变量再 up：down 只 stop 不 disable，
+              agentos-afs-node 仍是 enabled，下次开机其 ExecStartPre 会卸载 egress 上的
+              autofs 并重挂 tmpfs，同时抢回 18889（agentos-workspace 的对外端口）。
+              uninstall 才会 disable 并删除 afs unit。
   jiuwenbox   配置文件: deploy/jiuwenbox/default-policy.yaml (含 extensions 目录占位符)
               jiuwenbox-server 随 jiuwenswarm whl 包安装，无需单独 install
   etcd        install 按本机 x86_64/aarch64 从 OBS 下载 etcd 3.5.24，校验 SHA256 和架构

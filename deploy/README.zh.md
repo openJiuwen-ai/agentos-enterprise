@@ -357,6 +357,31 @@ workspace 目录通过 NFS + autofs 共享，归属记录存放在 etcd 单键�
 
 AFS（OwnerFs）workspace 存储模块：`AGENTOS_STORAGE_BACKEND=afs` 时启用，顶替 `workspace-storage`（autofs + NFS）成为 workspace 后端。`install` 校验 ADX release 包 `manifest.json` 的 `with_afs` 标记（`true` 才放行），并把包内 `bin/{afs-meta,afs-node}` 装到 `${AFS_ROOT}/bin`（默认 `/opt/agentos/afs`）——逐字节比对后**内容不同才覆盖**，换新 release 包重装即完成二进制升级；包内无 AFS 载荷（离线重跑、未打 AFS 的包）时保留现有二进制并告警，首次安装则会硬失败。TLS 证书脚本不在 deploy 侧留存，直接取包内 `etc/examples/afs/prepare-local-tls.sh`。`up` 幂等重渲染 unit 与 `afs-wait-ready.sh` 后启动 `agentos-afs-meta` / `agentos-afs-node`（systemd 托管，ExecStartPre 幂等准备 outlet 目录与 egress tmpfs）；unit 内容有变化且服务已在跑时会 restart 使之生效。
 
+**切回 autofs-nfs 后端必须走完整拆除链路 `down → deinit → uninstall`，不能只 `down` 后改环境变量再 `up`。**
+
+`afs_do_down` 只 `systemctl stop`，不 `disable`，`agentos-afs-node` 与 `agentos-afs-meta` 仍是开机自启（`WantedBy=multi-user.target`，`up` 时 `enable --now`）。只 `down` 就改回 `autofs-nfs` 执行 `up`，两套 unit 会并存，重启后互相争抢两处互斥资源：
+
+- **egress 根**（`/home/agentos/users`）：`agentos-afs-node` 的 `ExecStartPre` 调用 `afs-prepare-outlets.sh`，遇到 `autofs`/`autofs4` 会先 `umount -l` 再挂 tmpfs，autofs 的挂载面随之失效；
+- **`127.0.0.1:18889`**：既是 `AFS_WORKSPACE_API_LISTEN` 也是 `WORKSPACE_API_LISTEN`，两者不能同时绑定。
+
+`agentos-workspace` 是 `Type=simple` 且与 afs unit 无 `After`/`Before` 约束，谁先起不保证。无论哪种结果都不健康：afs 先起则 autofs 挂载被拆、`agentos-workspace` 绑不上端口；workspace-storage 先起则 afs-node 的就绪门禁失败。`uninstall` 会 `disable` 并删除 unit，从根上消除并存。
+
+完整切换流程（每个节点执行，按生命周期逆序拆除）：
+
+```bash
+AGENTOS_STORAGE_BACKEND=afs bash deploy/agentos.sh down
+AGENTOS_STORAGE_BACKEND=afs bash deploy/agentos.sh deinit       # 停 etcd + redis
+AGENTOS_STORAGE_BACKEND=afs bash deploy/agentos.sh uninstall   # 关键：disable 并删除 afs unit
+# 确认 /etc/systemd/system/agentos-afs-{node,meta}.service 已不存在
+AGENTOS_STORAGE_BACKEND=autofs-nfs bash deploy/agentos.sh install
+AGENTOS_STORAGE_BACKEND=autofs-nfs bash deploy/agentos.sh init
+AGENTOS_STORAGE_BACKEND=autofs-nfs bash deploy/agentos.sh up
+```
+
+`deinit` 与随后的 `init` 对称：停掉 etcd + redis 并删 unit、保留数据，确认旧后端不依赖它们后再以新后端 bootstrap。
+
+`uninstall` 保留 AFS 的 data/tls/bin，回切 afs 后端无需重新准备数据。
+
 #### jiuwenbox
 
 - 配置文件：`deploy/jiuwenbox/default-policy.yaml`（`__JIUWENSWARM_EXTENSIONS_DIR__` 在各机启动时按该机已安装的 `jiuwenswarm` 模块路径替换）
