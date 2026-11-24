@@ -171,7 +171,8 @@ runsc 路径，不将 Supervisor 原生策略标记为等价 N2。Supervisor 的
 本地没有时执行 `docker pull`，pull 失败则中止部署。
 
 Docker executor 使用 runsc。离线用户镜像先通过 `docker load -i <archive.tar>` 导入本节点 Docker store；
-准备过程用 `docker create --pull=never --network none` 和 export 构建 Local rootfs。
+准备过程用 `docker create --network none` 和 export 构建 Local rootfs；创建时引用本地镜像 ID，
+Docker 不会隐式拉取，因此不使用 `--pull` 参数，兼容 18.09 等旧版 Docker。
 准备结果包含实际 Local 路径、镜像环境和启动信息，由 Gateway/Core 直接构造创建参数。
 缺失本地镜像/归档时明确报错，不执行 registry pull。已准备的 rootfs 可在 Docker 不可用时复用。
 部署准备会读取 Workspace API 的运维列表，包含未激活的 autofs 用户键；用户 YAML 和原模板不重写。
@@ -267,7 +268,7 @@ ADXlet 在目标节点临时归一化该选项，避免 runsc 对 NFS/FUSE 自�
 `up` 时执行 load → inspect → pull → export。Agent/用户镜像仍只使用本地已有内容，绝不 pull。
 历史用户的 `sandbox.image` 保留。`agentos.sh up` 会读取 Gateway 和用户 YAML 中的镜像引用，
 并在部署节点将本地 Docker 镜像转换成独立的 Local rootfs 制品；转换时只创建未启动的临时
-容器（`docker create --pull=never`），导出后回收临时容器及其匿名卷，不启动镜像中的程序。
+容器（`docker create`，引用本地镜像 ID，不触发拉取），导出后回收临时容器及其匿名卷，不启动镜像中的程序。
 默认部署需要 Docker 来完成工具镜像准备。默认工具离线包位于
 `/root/resources/MindAgent-image/<arch>/tool-sandbox_latest.tar`；其他离线镜像请先在各节点
 执行 `docker load -i <archive.tar>`。

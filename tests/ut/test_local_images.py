@@ -31,7 +31,7 @@ class LocalImageTests(unittest.TestCase):
                 "Cmd": ["--serve"], "WorkingDir": "/app", "User": "1001:1002"}}]
             return subprocess.CompletedProcess(args, 0, json.dumps(value), "")
         if args[1] == "create":
-            self.assertIn("--pull=never", args)
+            self.assertNotIn("--pull=never", args)
             return subprocess.CompletedProcess(args, 0, "fixture-container\n", "")
         if args[1] == "export":
             path = Path(args[args.index("--output") + 1])

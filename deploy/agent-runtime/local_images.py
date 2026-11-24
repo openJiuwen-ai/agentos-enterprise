@@ -199,7 +199,9 @@ def prepare_image(reference, options, root, *, allow_pull=False, default_archive
         container = "agentos-rootfs-export-" + uuid.uuid4().hex
         completed = False
         try:
-            docker(["docker", "create", "--pull=never", "--network", "none", "--name", container,
+            # The reference is a local image ID, which Docker never pulls
+            # implicitly, so --pull is unnecessary and unsupported below 19.03.
+            docker(["docker", "create", "--network", "none", "--name", container,
                     "--entrypoint", "/__agentos_export_only__", image_id])
             docker(["docker", "export", "--output", str(exported), container])
             validate_export(exported)
